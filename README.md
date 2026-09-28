@@ -36,19 +36,17 @@ as a user message instead.
 
 ## Install
 
-Install it as a Pi package, which loads the bundled `index.ts` (and its `tasks.ts`) without
+Install it from npm as a Pi package, which loads the bundled `index.ts` (and its `tasks.ts`) without
 managing symlinks:
 
 ```bash
-pi install ./pi-always              # from a local copy of this repo
-pi install git:github.com/aginies/pi-always   # from the git repo
+pi install npm:pi-do-always
 ```
 
-(It is not on npm yet; once published it will be `pi install npm:pi-do-always`.)
-
 Manage it with `pi list` (to see installed sources) and `pi remove <source>` using the same
-source you installed with (e.g. `pi remove git:github.com/aginies/pi-always`). Alternatively, it is auto-discovered from
-the extensions directory, so you can symlink it instead:
+source you installed with (e.g. `pi remove npm:pi-do-always`).
+
+Alternatively, you can install from the git repo or symlink a local checkout for development:
 
 ```bash
 ln -s "$PWD" ~/.pi/agent/extensions/do-always   # uninstall with: rm that symlink

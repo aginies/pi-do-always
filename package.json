@@ -39,7 +39,11 @@
 	"scripts": {
 		"dev": "pi --extension ./index.ts",
 		"typecheck": "tsc --noEmit",
-		"test": "node --import tsx --test test/**/*.test.ts"
+		"test": "node --import tsx --test test/**/*.test.ts",
+		"prepublishOnly": "npm run typecheck && npm test"
+	},
+	"publishConfig": {
+		"access": "public"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
