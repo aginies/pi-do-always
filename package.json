@@ -27,12 +27,14 @@
 		"index.ts",
 		"tasks.ts",
 		"do-always.json",
-		"README.md"
+		"README.md",
+		"pi.image.png"
 	],
 	"pi": {
 		"extensions": [
 			"./index.ts"
-		]
+		],
+		"image": "pi.image.png"
 	},
 	"scripts": {
 		"dev": "pi --extension ./index.ts",
