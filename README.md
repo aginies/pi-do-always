@@ -19,6 +19,8 @@ the task's prompt is **filled into the input editor**. Review it, tweak it, pres
 └───────────────────────────────────────────────────────────────────┘
 ```
 
+![do-always — the numbered task selector](pi.image.png)
+
 ## Usage
 
 |Command|What it does|
