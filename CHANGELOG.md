@@ -4,13 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-28
+
+### Added
+
+- Gallery publication metadata in `package.json`: `author` (aginies
+  <antoine@ginies.org>), an MIT `LICENSE` file, and gallery-discovery
+  keywords (`pi`, `pi-coding-agent`).
+- `pi.image.png` gallery preview image, wired up via the `pi.image` field
+  and referenced in the README.
 
 ### Changed
 
-- Package metadata for the npm / Pi package gallery publication: added
-  `author`, an MIT `LICENSE` file, and gallery-discovery keywords
-  (`pi`, `pi-coding-agent`).
+- Documented in the README which `package.json` fields the Pi package
+  gallery page is built from, and the optional `pi.image` / `pi.video`
+  preview fields.
 
 ## [0.1.0] - 2026-09-28
 
