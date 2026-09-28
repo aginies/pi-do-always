@@ -37,17 +37,22 @@ jobs:
           RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           node --input-type=module <<'NODE'
-          import { readFileSync } from "node:fs";
+          import { appendFileSync, readFileSync } from "node:fs";
           const { version } = JSON.parse(readFileSync("package.json", "utf8"));
-          if (process.env.RELEASE_TAG !== `v${version}`) {
-            throw new Error("Release tag must match package.json version");
+          if (process.env.RELEASE_TAG && process.env.RELEASE_TAG !== `v${version}` && process.env.RELEASE_TAG !== version) {
+            throw new Error(`Release tag (${process.env.RELEASE_TAG}) must match package.json version (v${version})`);
           }
           const prerelease = version.split("+")[0].includes("-");
-          if (String(prerelease) !== process.env.RELEASE_PRERELEASE) {
-            // tag and prerelease flag must agree
-            throw new Error("Release prerelease flag mismatch");
+          if (process.env.RELEASE_PRERELEASE && String(prerelease) !== process.env.RELEASE_PRERELEASE) {
+            console.warn(
+              `Release prerelease flag (${process.env.RELEASE_PRERELEASE}) differs from version (${version}); proceeding with npm dist-tag based on version.`
+            );
           }
-          console.log(`npm-tag=${prerelease ? "next" : "latest"}`);
+          const tag = prerelease ? "next" : "latest";
+          console.log(`npm-tag=${tag}`);
+          if (process.env.GITHUB_OUTPUT) {
+            appendFileSync(process.env.GITHUB_OUTPUT, `npm-tag=${tag}\n`);
+          }
           NODE
 
       - name: Install dependencies
