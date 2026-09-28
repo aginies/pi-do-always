@@ -36,7 +36,8 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
-          git merge-base --is-ancestor HEAD origin/main
+          # The release must be cut from the default branch (master).
+          git merge-base --is-ancestor HEAD origin/master
           node --input-type=module <<'NODE'
           import { readFileSync } from "node:fs";
           const { version } = JSON.parse(readFileSync("package.json", "utf8"));
