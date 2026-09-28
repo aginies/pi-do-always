@@ -3,8 +3,14 @@
 	"version": "0.2.0",
 	"type": "module",
 	"description": "Pi extension: /do-always — pick a common task by number, it fills your prompt",
+	"author": {
+		"name": "aginies",
+		"email": "antoine@ginies.org"
+	},
 	"keywords": [
 		"pi-package",
+		"pi",
+		"pi-coding-agent",
 		"pi-extensions",
 		"do-always"
 	],

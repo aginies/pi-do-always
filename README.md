@@ -115,3 +115,7 @@ npm publish
 `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` are declared as `peerDependencies`
 with a `"*"` range and are **not** bundled — Pi supplies them to extensions. The `pi-package`
 keyword makes this package eligible for the [Pi package gallery](https://pi.dev/packages).
+
+The gallery page is built from `package.json` (name, description, author, version, license,
+repository, `pi` manifest) plus the README. Optional `pi.image` / `pi.video` fields in
+`package.json` add a gallery preview if you want one.

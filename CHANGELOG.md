@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Package metadata for the npm / Pi package gallery publication: added
+  `author`, an MIT `LICENSE` file, and gallery-discovery keywords
+  (`pi`, `pi-coding-agent`).
+
 ## [0.1.0] - 2026-09-28
 
 ### Added
