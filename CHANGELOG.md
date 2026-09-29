@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-09-29
+
+### Changed
+
+- No functional changes. Version bump to re-trigger publication (0.4.3
+  was already published to npm with identical contents).
+
 ## [0.4.3] - 2026-09-29
 
 ### Changed
