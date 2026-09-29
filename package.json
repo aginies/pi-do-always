@@ -27,22 +27,22 @@
 		"url": "https://github.com/aginies/pi-do-always/issues"
 	},
 	"files": [
-		"index.ts",
-		"tasks.ts",
-		"do-always.json",
+		"extensions/pi-do-always/index.ts",
+		"extensions/pi-do-always/tasks.ts",
+		"extensions/pi-do-always/do-always.json",
 		"README.md",
 		"pi.image.png"
 	],
 	"pi": {
 		"extensions": [
-			"./index.ts"
+			"./extensions/pi-do-always/index.ts"
 		],
 		"image": "pi.image.png"
 	},
 	"scripts": {
-		"dev": "pi --extension ./index.ts",
+		"dev": "pi --extension ./extensions/pi-do-always/index.ts",
 		"typecheck": "tsc --noEmit",
-		"test": "node --import tsx --test test/*.test.ts",
+		"test": "node --import tsx --test extensions/pi-do-always/test/*.test.ts",
 		"prepublishOnly": "npm run typecheck && npm test"
 	},
 	"publishConfig": {

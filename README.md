@@ -76,7 +76,7 @@ Alternatively, you can install from the git repo or symlink a local checkout for
 ln -s "$PWD" ~/.pi/agent/extensions/do-always   # uninstall with: rm that symlink
 ```
 
-For development you can also load it explicitly: `npm run dev` (runs `pi --extension ./index.ts`).
+For development you can also load it explicitly: `npm run dev` (runs `pi --extension ./extensions/pi-do-always/index.ts`).
 
 ## Tasks configuration
 
@@ -88,7 +88,7 @@ Tasks are read from JSON files (an array of tasks, or the object form `{"tasks":
 |`<project>/.pi/do-always.json`|Project-local; overrides global tasks with the same `name`|
 
 If neither file exists, the built-in defaults (Review, Cleanup, Security, Performance, Propose features, Build, Tests, Readme, Release, Commit) are used.
-This repo ships a sample in [`do-always.json`](./do-always.json) — copy it to one of the
+This repo ships a sample in [`do-always.json`](./extensions/pi-do-always/do-always.json) — copy it to one of the
 locations above to make it your own:
 
 ```json
@@ -147,5 +147,5 @@ npm test           # run the unit tests (node:test + tsx, in test/)
 ```
 
 The pure task logic (`parseConfig`, `mergeTasks`, `renderPrompt`, `resolveTask`, `formatList`) lives in
-[`tasks.ts`](./tasks.ts) with no Pi dependencies, so it is unit-tested independently of the
-Pi runtime. The extension (`index.ts`) imports that logic and adds only the Pi UI.
+[`tasks.ts`](./extensions/pi-do-always/tasks.ts) with no Pi dependencies, so it is unit-tested independently of the
+Pi runtime. The extension (`extensions/pi-do-always/index.ts`) imports that logic and adds only the Pi UI.

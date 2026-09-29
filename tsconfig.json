@@ -9,5 +9,5 @@
 		"esModuleInterop": true,
 		"forceConsistentCasingInFileNames": true
 	},
-	"include": ["index.ts"]
+	"include": ["extensions/pi-do-always/index.ts"]
 }
