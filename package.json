@@ -17,11 +17,11 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/aginies/pi-always"
+		"url": "https://github.com/aginies/pi-do-always"
 	},
-	"homepage": "https://github.com/aginies/pi-always",
+	"homepage": "https://github.com/aginies/pi-do-always",
 	"bugs": {
-		"url": "https://github.com/aginies/pi-always/issues"
+		"url": "https://github.com/aginies/pi-do-always/issues"
 	},
 	"files": [
 		"index.ts",
