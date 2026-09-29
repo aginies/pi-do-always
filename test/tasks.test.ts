@@ -4,12 +4,14 @@ import {
 	DEFAULT_CATEGORY_ORDER,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
+	PROMPT_CONTEXT_KEYS,
 	formatList,
 	groupTasksByCategory,
 	isValidKeyId,
 	mergeTasks,
 	parseConfig,
 	orderTasksByCategory,
+	renderPrompt,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
@@ -389,4 +391,73 @@ test("DEFAULT_TASKS is non-empty and internally consistent", () => {
 		assert.equal(t.autoRun, undefined, `default task "${t.name}" has no explicit autoRun`);
 	}
 	assert.equal(shouldAutoRun(DEFAULT_TASKS[0]), true, "first default (Review, Plan) auto-runs");
+});
+
+// ---------------------------------------------------------------------------
+// renderPrompt
+// ---------------------------------------------------------------------------
+
+test("renderPrompt substitutes known keys", () => {
+	assert.equal(renderPrompt("On {{branch}}", { branch: "fix/login" }), "On fix/login");
+});
+
+test("renderPrompt substitutes every occurrence of a key", () => {
+	assert.equal(renderPrompt("{{x}} and {{x}}", { x: "1" }), "1 and 1");
+});
+
+test("renderPrompt leaves unknown keys as-is", () => {
+	const out = renderPrompt("a {{nope}} b {{a-b}} c {{a.b}} d {{}} e", { x: "1" });
+	assert.equal(out, "a {{nope}} b {{a-b}} c {{a.b}} d {{}} e");
+});
+
+test("renderPrompt tolerates whitespace inside braces", () => {
+	assert.equal(renderPrompt("{{ branch }}", { branch: "main" }), "main");
+});
+
+test("renderPrompt blanks a key present with an empty value", () => {
+	assert.equal(renderPrompt("[{{x}}]", { x: "" }), "[]");
+});
+
+test("renderPrompt leaves a template without placeholders unchanged", () => {
+	const t = "No placeholders here, just {braces} and }} text";
+	assert.equal(renderPrompt(t, { x: "1" }), t);
+});
+
+test("DEFAULT_TASKS prompts only use known context keys", () => {
+	const known = new Set<string>(PROMPT_CONTEXT_KEYS);
+	for (const t of DEFAULT_TASKS) {
+		for (const m of t.prompt.matchAll(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g)) {
+			assert.ok(known.has(m[1]), `"${t.name}" uses unknown placeholder {{${m[1]}}}`);
+		}
+	}
+});
+
+test("rendering every default prompt with a full context leaves no placeholders", () => {
+	const ctx: Record<string, string> = {
+		cwd: "/tmp/proj",
+		date: "2026-09-29",
+		branch: "fix/login-null",
+		last_commit: "Fix null check in login",
+		files_changed: "auth.ts, login.ts, test/auth.test.ts",
+		files_changed_count: "3",
+		user: "Agine",
+	};
+	for (const t of DEFAULT_TASKS) {
+		assert.doesNotMatch(renderPrompt(t.prompt, ctx), /\{\{/, t.name);
+	}
+});
+
+test("rendering default prompts with a fallback (non-git) context leaves no placeholders", () => {
+	const ctx: Record<string, string> = {
+		cwd: "/tmp/notgit",
+		date: "2026-09-29",
+		branch: "unknown",
+		last_commit: "unknown",
+		files_changed: "none",
+		files_changed_count: "0",
+		user: "unknown",
+	};
+	for (const t of DEFAULT_TASKS) {
+		assert.doesNotMatch(renderPrompt(t.prompt, ctx), /\{\{/, t.name);
+	}
 });

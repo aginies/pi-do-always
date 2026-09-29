@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Context-aware prompt templating: task prompts support `{{placeholders}}`
+  (`{{cwd}}`, `{{date}}`, `{{branch}}`, `{{last_commit}}`, `{{files_changed}}`,
+  `{{files_changed_count}}`, `{{user}}`) that are filled in from the current
+  directory at selection time. Unknown placeholders are left as-is and prompts
+  without placeholders are unchanged. The selector preview and `list-details`
+  show the rendered prompt (what you see is what gets injected). The built-in
+  Review, Commit, and Release tasks now use the git placeholders.
 - Prompt preview in the selector: pause on a task for two seconds and its full
   prompt is shown below the list, so you can see exactly what will be injected
   before running it. Moving the selection or typing hides it and restarts the

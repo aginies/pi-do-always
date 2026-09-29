@@ -41,6 +41,25 @@ export interface ParsedDoAlwaysConfig {
 	shortcut: string | null | undefined;
 }
 
+/**
+ * The set of context keys the extension can inject into prompts (see
+ * `renderPrompt`). `index.ts` is responsible for supplying all of them (with
+ * neutral fallbacks when a fact is unavailable); tests use this to check that
+ * default prompts only reference known keys.
+ */
+export const PROMPT_CONTEXT_KEYS = [
+	"cwd",
+	"date",
+	"branch",
+	"last_commit",
+	"files_changed",
+	"files_changed_count",
+	"user",
+] as const;
+
+/** A fully populated prompt context: one entry per PROMPT_CONTEXT_KEYS. */
+export type PromptContext = Record<(typeof PROMPT_CONTEXT_KEYS)[number], string>;
+
 /** Used when neither config file defines any task. */
 export const DEFAULT_TASKS: DoAlwaysTask[] = [
 	{
@@ -48,7 +67,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		category: "Plan",
 		description: "Review code and double-check changes (Plan)",
 		prompt:
-			"Review the recent code changes in this project. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes if needed. Do a summary of your findings",
+			"Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). Last commit: {{last_commit}}. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes if needed. Do a summary of your findings",
 	},
 	{
 		name: "Cleanup",
@@ -97,14 +116,14 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		category: "Ops",
 		description: "Prepare a release (version, changelog, tag)",
 		prompt:
-			"Prepare a release for this project: check `git log` since the last tag, update the version in package.json (or the equivalent location), add a changelog entry summarizing the changes, and create a git tag if git present. Do not push.",
+			"Prepare a release for this project (branch {{branch}}): check `git log` since the last tag, update the version in package.json (or the equivalent location), add a changelog entry summarizing the changes, and create a git tag if git present. Do not push.",
 	},
 	{
 		name: "Commit",
 		category: "Ops",
 		description: "Prepare a clean commit",
 		prompt:
-			"Prepare the working tree for a clean commit: review `git status` and `git diff`, stage the relevant changes, and write a clear commit message describing what changed and why. Do not push.",
+			"Prepare the working tree on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}) for a clean commit: review `git status` and `git diff`, stage the relevant changes, and write a clear commit message describing what changed and why. Do not push.",
 	},
 	{
 		name: "Propose features",
@@ -293,6 +312,22 @@ export function resolveTask(tasks: DoAlwaysTask[], arg: string): DoAlwaysTask | 
 		return n >= 1 && n <= tasks.length ? tasks[n - 1] : undefined;
 	}
 	return tasks.find((t) => t.name.toLowerCase() === a.toLowerCase());
+}
+
+/** Matches a `{{key}}` placeholder: key is [A-Za-z0-9_]+, optional inner whitespace. */
+const PLACEHOLDER_RE = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
+
+/**
+ * Substitute `{{key}}` placeholders in `template` with values from `ctx`.
+ * A key that is not present in `ctx` is left as-is, so missing context stays
+ * visible instead of silently blanking the sentence; a key present with an
+ * empty-string value renders as empty. Templates without placeholders are
+ * returned unchanged, so existing plain prompts keep working.
+ */
+export function renderPrompt(template: string, ctx: Record<string, string>): string {
+	return template.replace(PLACEHOLDER_RE, (match, key: string) =>
+		Object.prototype.hasOwnProperty.call(ctx, key) ? ctx[key] : match,
+	);
 }
 
 /**

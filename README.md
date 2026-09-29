@@ -27,9 +27,9 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
  10. Commit               Prepare a clean commit
 
   Review — prompt:
-  Review the recent code changes in this project. Check `git status` and `git diff`
-  to see what changed, then double-check the changes for bugs, edge cases, security
-  issues, and consistency with the rest of the codebase. Do a plan proposal for …
+  Review the changes on branch fix/login-null (3 changed files: auth.ts, login.ts,
+  test/auth.test.ts). Last commit: Fix null check in login. Check `git status` and
+  `git diff` to see what changed, then double-check the changes for bugs, edge …
 
   1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel  •  ⚡ auto-runs
 ```
@@ -44,7 +44,7 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
 |`/do-always 2`|Fill the prompt for task #2 directly|
 |`/do-always review`|Fill the prompt for the task named `review` (task names autocomplete after `/do-always`)|
 |`/do-always list`|Print the task list|
-|`/do-always list-details`|Show the full prompt text each task will inject|
+|`/do-always list-details`|Show the full rendered prompt text each task will inject|
 
 The selector supports direct number-pick (1-9), live type-to-filter, arrow/Enter navigation,
 mouse-wheel scrolling, and click-to-select. While a filter is active, typed digits refine the
@@ -97,7 +97,7 @@ locations above to make it your own:
     "name": "review",
     "category": "Plan",
     "description": "Review code and double-check changes",
-    "prompt": "Review the recent code changes in this project. Check `git status` and `git diff` ..."
+    "prompt": "Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). Last commit: {{last_commit}}. Check `git status` and `git diff` ..."
   }
 ]
 ```
@@ -107,7 +107,7 @@ Fields:
 - `name` (required) — short unique id, used for `/do-always <name>`
 - `category` (optional) — group header the task is shown under in the selector (e.g. `"Plan"`, `"Do"`). Matching is case-insensitive and the header is title-cased, so `"plan"` and `"Plan"` land in the same `Plan` group. Tasks without a category fall under `Other`. The built-in defaults are grouped into `Plan`, `Do`, `Docs`, and `Ops`.
 - `description` (optional) — one-line label shown in the selector
-- `prompt` (required) — the text filled into the editor
+- `prompt` (required) — the text filled into the editor (supports `{{placeholders}}` — see [Prompt placeholders](#prompt-placeholders))
 - `autoRun` (optional) — when `true`, selecting the task sends its prompt immediately instead of filling the editor; when `false`, it always fills the editor. When omitted, the default is derived from the category: `Plan` tasks auto-run, everything else fills the editor. Auto-run tasks are marked `⚡` in the selector.
 
 In the object form you can also configure the selector shortcut:
@@ -115,6 +115,28 @@ In the object form you can also configure the selector shortcut:
 - `shortcut` (optional) — key that opens the selector, e.g. `"f4"` or `"ctrl+shift+p"`. Set to `null` to disable the shortcut. Defaults to `F4`. The project file's value wins over the global one.
 
 Reload Pi (or start a new session) after editing a config file.
+
+## Prompt placeholders
+
+Task prompts support `{{placeholders}}` that are filled in from the current
+directory when a task is selected — so `/do-always review` on a hotfix branch
+injects “Review the changes on branch `fix/login-null` (3 changed files:
+`auth.ts`, `login.ts`, `test/auth.test.ts`) …” instead of a generic nudge.
+
+|Placeholder|Value|
+|---|---|
+|`{{cwd}}`|Absolute path of the working directory|
+|`{{date}}`|Local date (`YYYY-MM-DD`)|
+|`{{branch}}`|Current git branch (`unknown` outside a git repo)|
+|`{{last_commit}}`|Subject of the latest commit (`unknown` if unavailable, e.g. empty repo)|
+|`{{files_changed}}`|Changed files from `git status` — comma-separated, capped at 20 entries (`none` when clean or not a git repo)|
+|`{{files_changed_count}}`|Number of changed files (`0` when clean or not a git repo)|
+|`{{user}}`|`git config user.name` (`unknown` when unset)|
+
+Unknown placeholders are left as-is, and a prompt without placeholders is
+injected unchanged, so existing configs keep working. The selector preview and
+`/do-always list-details` show the rendered prompt — what you see is what gets
+injected.
 
 ## Development
 
@@ -124,6 +146,6 @@ npm run typecheck  # tsc --noEmit
 npm test           # run the unit tests (node:test + tsx, in test/)
 ```
 
-The pure task logic (`parseConfig`, `mergeTasks`, `resolveTask`, `formatList`) lives in
+The pure task logic (`parseConfig`, `mergeTasks`, `renderPrompt`, `resolveTask`, `formatList`) lives in
 [`tasks.ts`](./tasks.ts) with no Pi dependencies, so it is unit-tested independently of the
 Pi runtime. The extension (`index.ts`) imports that logic and adds only the Pi UI.

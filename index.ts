@@ -33,6 +33,7 @@
  * If no config file exists, built-in default tasks are used.
  */
 
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -55,10 +56,12 @@ import {
 	mergeTasks,
 	parseConfig,
 	orderTasksByCategory,
+	renderPrompt,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
 	type DoAlwaysTask,
+	type PromptContext,
 	type TaskGroup,
 } from "./tasks";
 
@@ -83,6 +86,71 @@ function loadConfig(cwd: string): { tasks: DoAlwaysTask[]; shortcut: string | nu
 		// `/do-always <n>`, and `list` all share one consistent order.
 		tasks: orderTasksByCategory(mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS)),
 		shortcut: resolveShortcut(global.shortcut, project.shortcut),
+	};
+}
+
+/**
+ * Run a git command in `cwd` and return its trimmed stdout.
+ * Returns undefined on any failure (not a git repo, git not installed,
+ * empty repo, …) so callers can fall back to a neutral value.
+ * No shell is involved (argument array), so file names cannot inject commands.
+ */
+function git(cwd: string, args: string[]): string | undefined {
+	try {
+		const out = execFileSync("git", args, {
+			cwd,
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		const trimmed = out.trim();
+		return trimmed === "" ? undefined : trimmed;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Max number of file paths listed in `files_changed` (the count stays exact). */
+const MAX_FILES_LISTED = 20;
+
+/**
+ * Build the prompt context for `renderPrompt`. Always contains every
+ * PROMPT_CONTEXT_KEYS entry: git facts fall back to neutral values when
+ * unavailable (non-git dir, no git, empty repo) so default prompts read
+ * cleanly in any directory.
+ */
+function buildContext(cwd: string): PromptContext {
+	const branch = git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]) ?? "unknown";
+	const lastCommit = git(cwd, ["log", "-1", "--format=%s"]) ?? "unknown";
+	const user = git(cwd, ["config", "user.name"]) ?? "unknown";
+
+	const files: string[] = [];
+	const status = git(cwd, ["status", "--porcelain"]);
+	if (status) {
+		for (const line of status.split("\n")) {
+			// Porcelain v1 lines are "XY <path>" (X = index, Y = worktree).
+			if (line.length < 4) continue;
+			const path = line.slice(3);
+			if (path && !files.includes(path)) files.push(path);
+		}
+		files.sort();
+	}
+	let listed: string;
+	if (files.length === 0) {
+		listed = "none";
+	} else if (files.length > MAX_FILES_LISTED) {
+		listed = [...files.slice(0, MAX_FILES_LISTED), `… (+${files.length - MAX_FILES_LISTED} more)`].join(", ");
+	} else {
+		listed = files.join(", ");
+	}
+
+	return {
+		cwd,
+		date: new Date().toLocaleDateString("en-CA"), // local YYYY-MM-DD
+		branch,
+		last_commit: lastCommit,
+		files_changed: listed,
+		files_changed_count: String(files.length),
+		user,
 	};
 }
 
@@ -112,16 +180,19 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 	/** Put the task prompt into the editor (TUI) or send it as a user message (other modes). */
 	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext): Promise<void> {
+		// Render the prompt with the current context (branch, changed files, …)
+		// so the injected text matches this directory at this moment.
+		const prompt = renderPrompt(task.prompt, buildContext(ctx.cwd));
 		if (shouldAutoRun(task)) {
-			await pi.sendUserMessage(task.prompt);
+			await pi.sendUserMessage(prompt);
 			ctx.ui.notify(`do-always: auto-ran "${task.name}"`, "info");
 			return;
 		}
 		if (ctx.mode === "tui") {
-			ctx.ui.setEditorText(task.prompt);
+			ctx.ui.setEditorText(prompt);
 			ctx.ui.notify(`do-always: prompt for "${task.name}" filled — press Enter to run`, "info");
 		} else {
-			await pi.sendUserMessage(task.prompt);
+			await pi.sendUserMessage(prompt);
 		}
 	}
 
@@ -130,6 +201,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * number, type to filter, or navigate with arrows + Enter, Esc to cancel.
 	 */
 	async function showSelector(ctx: ExtensionContext): Promise<void> {
+		// Build the context once per selector session (never inside the render
+		// loop — no process spawning per frame). fillPrompt re-renders at
+		// selection time, so a few seconds of drift is acceptable.
+		const context = buildContext(ctx.cwd);
 		const selected = await ctx.ui.custom<number | null>((tui, theme, _kb, done) => {
 			let settled = false;
 			let previewVisible = false;
@@ -270,7 +345,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					const sel = itemRows[selectedIndex];
 					if (sel) {
 						const wrapWidth = Math.max(10, width - 4);
-						const wrapped = wrapTextWithAnsi(sel.task.prompt, wrapWidth);
+						// Show the rendered prompt — exactly what will be injected.
+						const wrapped = wrapTextWithAnsi(renderPrompt(sel.task.prompt, context), wrapWidth);
 						const shown = wrapped.slice(0, PREVIEW_MAX_LINES);
 						const truncated = wrapped.length > PREVIEW_MAX_LINES;
 						lines.push("");
@@ -435,12 +511,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 		if (arg.toLowerCase() === "list-details") {
 			// Display only — the description is metadata; selecting a task injects just its prompt.
+			// Render with the current context so what is shown is what gets injected.
+			const context = buildContext(ctx.cwd);
 			const details = tasks
 				.map((t, i) => {
 					const lines = [`${i + 1}. ${t.name}`];
 					if (t.description) lines.push(`   description: ${t.description}`);
 					lines.push("   prompt (this is what gets injected on select):");
-					for (const line of t.prompt.split("\n")) lines.push(`   ${line}`);
+					for (const line of renderPrompt(t.prompt, context).split("\n")) lines.push(`   ${line}`);
 					return lines.join("\n");
 				})
 				.join("\n\n");
