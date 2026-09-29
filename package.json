@@ -9,8 +9,6 @@
 	},
 	"keywords": [
 		"pi-package",
-		"pi",
-		"pi-coding-agent",
 		"pi-extension",
 		"do-always"
 	],
@@ -20,7 +18,8 @@
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/aginies/pi-do-always"
+		"url": "https://github.com/aginies/pi-do-always",
+		"directory": "extensions/pi-do-always"
 	},
 	"homepage": "https://github.com/aginies/pi-do-always",
 	"bugs": {
@@ -53,8 +52,6 @@
 		"@earendil-works/pi-tui": "*"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "^0.87.1",
-		"@earendil-works/pi-tui": "^0.87.1",
 		"@types/node": "^22.0.0",
 		"tsx": "^4.19.0",
 		"typescript": "^5.5.0"
