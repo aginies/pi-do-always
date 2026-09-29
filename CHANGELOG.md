@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-29
+
+### Changed
+
+- Moved the extension source under `extensions/pi-do-always/`; the package
+  manifest now declares `pi.extensions` pointing at
+  `./extensions/pi-do-always/index.ts` (install behavior is unchanged: `pi
+  install npm:pi-do-always` still works).
+
+### Fixed
+
+- Removed the duplicate `pi-extensions` npm keyword.
+
 ## [0.4.1] - 2026-09-29
 
 ### Changed
