@@ -2,12 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.2] - 2026-09-28
+## [0.2.2] - 2026-09-29
 
 ### Changed
 
 - Bumped the version to `0.2.2` in `package.json` and `package-lock.json` for
   npm publication.
+
+### Added
+
+- New **Build** task: runs the project build script (e.g. `npm run build`) and
+  type check, diagnoses and fixes failures, and re-builds until green.
+
+### Fixed
+
+- Use a POSIX-compatible glob pattern in the test script so `npm test` runs
+  correctly across shells.
+- CI: fixed release prerelease validation and branch triggers.
+
+### Other
+
+- Reorganized the built-in default tasks in `tasks.ts`: task names are now
+  capitalized (e.g. `review` → `Review`) and reordered, with the new Build task
+  placed alongside the other actionable tasks.
+- Updated the README.
 
 ## [0.2.0] - 2026-09-28
 
