@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-29
+
+### Changed
+
+- Declared `engines.node >=22.19.0` (matching pi's own requirement) and added
+  the `pi-extension` keyword for npm discoverability.
+- Tightened the built-in Commit task prompt wording.
+
 ## [0.4.0] - 2026-09-29
 
 ### Added
