@@ -1,12 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+	DEFAULT_CATEGORY_ORDER,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
 	formatList,
+	groupTasksByCategory,
 	isValidKeyId,
 	mergeTasks,
 	parseConfig,
+	orderTasksByCategory,
 	resolveShortcut,
 	resolveTask,
 	type DoAlwaysTask,
@@ -171,6 +174,105 @@ test("mergeTasks falls back when nothing is defined", () => {
 });
 
 // ---------------------------------------------------------------------------
+// orderTasksByCategory
+// ---------------------------------------------------------------------------
+
+test("orderTasksByCategory groups by category in the configured order", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "review", category: "Plan", prompt: "r" },
+		{ name: "readme", category: "Docs", prompt: "m" },
+		{ name: "build", category: "Do", prompt: "b" },
+		{ name: "commit", category: "Ops", prompt: "c" },
+		{ name: "cleanup", category: "Plan", prompt: "cl" },
+	];
+	const out = orderTasksByCategory(tasks);
+	assert.deepEqual(
+		out.map((t) => t.name),
+		["review", "cleanup", "build", "readme", "commit"],
+	);
+});
+
+test("orderTasksByCategory preserves original order within a group", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "b", category: "Do", prompt: "" },
+		{ name: "a", category: "Plan", prompt: "" },
+		{ name: "c", category: "Do", prompt: "" },
+		{ name: "d", category: "Plan", prompt: "" },
+	];
+	const out = orderTasksByCategory(tasks);
+	assert.deepEqual(
+		out.map((t) => t.name),
+		["a", "d", "b", "c"],
+	);
+});
+
+test("orderTasksByCategory puts uncategorized tasks under Other, last", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "x", prompt: "" },
+		{ name: "y", category: "Plan", prompt: "" },
+		{ name: "z", prompt: "" },
+	];
+	const out = orderTasksByCategory(tasks);
+	assert.deepEqual(
+		out.map((t) => t.name),
+		["y", "x", "z"],
+	);
+});
+
+test("orderTasksByCategory places unknown categories after the known ones", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "a", category: "Zeta", prompt: "" },
+		{ name: "b", category: "Plan", prompt: "" },
+		{ name: "c", category: "Alpha", prompt: "" },
+	];
+	const out = orderTasksByCategory(tasks);
+	assert.deepEqual(
+		out.map((t) => t.name),
+		["b", "c", "a"],
+	);
+});
+
+test("orderTasksByCategory uses DEFAULT_CATEGORY_ORDER by default", () => {
+	const out = orderTasksByCategory(DEFAULT_TASKS);
+	// First group is the first entry of DEFAULT_CATEGORY_ORDER ("Plan"); the very
+	// first task is the first Plan task.
+	assert.equal(DEFAULT_CATEGORY_ORDER[0], "Plan");
+	assert.equal(out[0].name, "Review");
+	assert.equal(out[0].category, "Plan");
+	// All tasks are preserved.
+	assert.equal(out.length, DEFAULT_TASKS.length);
+	assert.deepEqual(new Set(out.map((t) => t.name)), new Set(DEFAULT_TASKS.map((t) => t.name)));
+});
+
+test("orderTasksByCategory groups case-insensitively", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "a", prompt: "p", category: "plan" },
+		{ name: "b", prompt: "p", category: "Plan" },
+		{ name: "c", prompt: "p", category: "PLAN" },
+	];
+	const out = orderTasksByCategory(tasks);
+	// All three are the same category, so they stay together in input order.
+	assert.deepEqual(out.map((t) => t.name), ["a", "b", "c"]);
+});
+
+test("groupTasksByCategory returns title-cased, ordered groups", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "a", prompt: "p", category: "docs" },
+		{ name: "b", prompt: "p", category: "Plan" },
+		{ name: "c", prompt: "p" }, // uncategorized -> Other
+	];
+	const groups = groupTasksByCategory(tasks);
+	assert.deepEqual(
+		groups.map((g) => [g.name, g.items.map((t) => t.name)]),
+		[
+			["Plan", ["b"]],
+			["Docs", ["a"]],
+			["Other", ["c"]],
+		],
+	);
+});
+
+// ---------------------------------------------------------------------------
 // resolveTask
 // ---------------------------------------------------------------------------
 
@@ -211,6 +313,25 @@ test("formatList shows an empty label when a task has no description", () => {
 	assert.equal(formatList([{ name: "x", prompt: "p" }]), "1. x — ");
 });
 
+test("formatList emits a header per category when tasks span multiple groups", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "review", prompt: "p", description: "Review code", category: "Plan" },
+		{ name: "build", prompt: "p", description: "Build it", category: "Do" },
+	];
+	assert.equal(
+		formatList(tasks),
+		"PLAN\n1. review — Review code\nDO\n2. build — Build it",
+	);
+});
+
+test("formatList omits headers when all tasks share one category", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "a", prompt: "p", description: "A", category: "Plan" },
+		{ name: "b", prompt: "p", description: "B", category: "Plan" },
+	];
+	assert.equal(formatList(tasks), "1. a — A\n2. b — B");
+});
+
 // ---------------------------------------------------------------------------
 // DEFAULT_TASKS
 // ---------------------------------------------------------------------------
@@ -221,7 +342,7 @@ test("DEFAULT_TASKS is non-empty and internally consistent", () => {
 		assert.ok(typeof t.name === "string" && t.name.length > 0, `task "${t.name}" has a name`);
 		assert.ok(typeof t.prompt === "string" && t.prompt.length > 0, `"${t.name}" has a prompt`);
 	}
-	// The first default should be review, and resolvable by number.
-	assert.equal(DEFAULT_TASKS[0].name, "review");
-	assert.equal(resolveTask(DEFAULT_TASKS, "1")?.name, "review");
+	// The first default should be Review, and resolvable by number.
+	assert.equal(DEFAULT_TASKS[0].name, "Review");
+	assert.equal(resolveTask(DEFAULT_TASKS, "1")?.name, "Review");
 });

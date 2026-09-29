@@ -37,17 +37,27 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Container, type KeyId, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import {
+	type KeyId,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
+	getKeybindings,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import {
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
 	formatList,
+	groupTasksByCategory,
 	isValidKeyId,
 	mergeTasks,
 	parseConfig,
+	orderTasksByCategory,
 	resolveShortcut,
 	resolveTask,
 	type DoAlwaysTask,
+	type TaskGroup,
 } from "./tasks";
 
 /**
@@ -67,9 +77,21 @@ function loadConfig(cwd: string): { tasks: DoAlwaysTask[]; shortcut: string | nu
 		: { tasks: [], shortcut: undefined };
 
 	return {
-		tasks: mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS),
+		// Order the merged list by category so the selector numbers, digit-pick,
+		// `/do-always <n>`, and `list` all share one consistent order.
+		tasks: orderTasksByCategory(mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS)),
 		shortcut: resolveShortcut(global.shortcut, project.shortcut),
 	};
+}
+
+/** Find the group (among `groups`) that contains a task. */
+function findGroupOf(task: DoAlwaysTask, groups: TaskGroup[]): TaskGroup | undefined {
+	return groups.find((g) => g.items.includes(task));
+}
+
+/** True for a single printable ASCII character (used for filter typing). */
+function isPrintable(data: string): boolean {
+	return data.length === 1 && data >= " " && data <= "~";
 }
 
 export default function doAlwaysExtension(pi: ExtensionAPI) {
@@ -91,14 +113,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	/** Numbered selector: press 1-9 to pick, or arrows + Enter, Esc to cancel. */
+	/**
+	 * Numbered selector with categorized sections. Press 1-9 to pick by global
+	 * number, type to filter, or navigate with arrows + Enter, Esc to cancel.
+	 */
 	async function showSelector(ctx: ExtensionContext): Promise<void> {
-		const items: SelectItem[] = tasks.map((t, i) => ({
-			value: String(i),
-			label: `${i + 1}. ${t.name}`,
-			description: t.description,
-		}));
-
 		const selected = await ctx.ui.custom<number | null>((tui, theme, _kb, done) => {
 			let settled = false;
 			const finish = (value: number | null) => {
@@ -107,36 +126,181 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				done(value);
 			};
 
-			const container = new Container();
-			container.addChild(new Text(theme.fg("accent", theme.bold("do-always — pick a task"))));
+			// Group tasks under category headers, in a stable order.
+			const groups = groupTasksByCategory(tasks);
 
-			const selectList = new SelectList(items, Math.min(items.length, 10), {
-				selectedPrefix: (text) => theme.fg("accent", text),
-				selectedText: (text) => theme.fg("accent", text),
-				description: (text) => theme.fg("muted", text),
-				scrollInfo: (text) => theme.fg("dim", text),
-				noMatch: (text) => theme.fg("warning", text),
-			});
-			selectList.onSelect = (item) => finish(Number(item.value));
-			selectList.onCancel = () => finish(null);
-			container.addChild(selectList);
-			container.addChild(new Text(theme.fg("dim", "1-9 pick by number  •  ↑↓ navigate  •  enter select  •  esc cancel")));
+			const kb = getKeybindings();
+			const maxVisible = 12;
+			let filter = "";
+			let selectedIndex = 0;
+			let mousePressedIndex: number | null = null;
+
+			const matchesFilter = (t: DoAlwaysTask) => {
+				if (!filter) return true;
+				const f = filter.toLowerCase();
+				return (
+					t.name.toLowerCase().includes(f) ||
+					(t.description ?? "").toLowerCase().includes(f) ||
+					(t.category ?? "").toLowerCase().includes(f)
+				);
+			};
+
+			// Recompute the visible (filtered, grouped) rows on every render so
+			// filter typing updates the list live.
+			function getVisible() {
+				const visibleGroups = groups
+					.map((g) => ({ name: g.name, items: g.items.filter(matchesFilter) }))
+					.filter((g) => g.items.length > 0);
+				const rows: Array<
+					| { kind: "header"; name: string }
+					| { kind: "item"; task: DoAlwaysTask; group: string }
+				> = [];
+				for (const g of visibleGroups) {
+					rows.push({ kind: "header", name: g.name });
+					for (const t of g.items) rows.push({ kind: "item", task: t, group: g.name });
+				}
+				const itemRows = rows.filter((r): r is (typeof rows)[number] & { kind: "item" } => r.kind === "item");
+				// Clamp selection to the visible item count.
+				selectedIndex = Math.max(0, Math.min(selectedIndex, Math.max(0, itemRows.length - 1)));
+				// Visible item window with scrolling.
+				const winStart = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), Math.max(0, itemRows.length - maxVisible)));
+				const visibleItemKeys = new Set(itemRows.slice(winStart, winStart + maxVisible).map((r) => r.task));
+				const visibleHeaderNames = new Set([...visibleItemKeys].map((t) => findGroupOf(t, visibleGroups)?.name ?? ""));
+				return { rows, itemRows, visibleItemKeys, visibleHeaderNames };
+			}
+
+			const labelCol = 26;
+
+			function renderLabel(task: DoAlwaysTask, globalIndex: number, isSelected: boolean, width: number): string {
+				const prefix = isSelected ? "▸ " : "  ";
+				const label = `${prefix}${globalIndex + 1}. ${task.name}`;
+				if (!task.description) {
+					const line = truncateToWidth(label, Math.max(1, width - 2), "");
+					return isSelected ? theme.fg("accent", theme.bold(line)) : line;
+				}
+				// Width-aware two-column layout; fall back to label-only when the
+				// terminal is too narrow to fit a description column.
+				const effCol = Math.max(1, Math.min(labelCol, width - 8));
+				const nameOnly = truncateToWidth(label, effCol, "");
+				const pad = " ".repeat(Math.max(1, effCol - visibleWidth(nameOnly)));
+				const remaining = width - visibleWidth(nameOnly) - pad.length - 2;
+				if (remaining < 10) {
+					const line = truncateToWidth(label, Math.max(1, width - 2), "");
+					return isSelected ? theme.fg("accent", theme.bold(line)) : line;
+				}
+				const desc = truncateToWidth(task.description, remaining, "");
+				if (isSelected) {
+					return theme.fg("accent", theme.bold(`${nameOnly}${pad}${desc}`));
+				}
+				return `${nameOnly}${pad}${theme.fg("muted", desc)}`;
+			}
+
+			// Build the full selector output for a width, plus a map from line
+			// index to task for the item rows (used by mouse handling).
+			function buildRender(width: number) {
+				const { rows, itemRows, visibleItemKeys, visibleHeaderNames } = getVisible();
+				const lines: string[] = [];
+				const itemLine = new Map<number, DoAlwaysTask>();
+				lines.push(theme.fg("accent", theme.bold("  do-always — pick a task")));
+				lines.push("");
+				if (itemRows.length === 0) {
+					lines.push(theme.fg("warning", "  No matching tasks"));
+				} else {
+					for (const row of rows) {
+						if (row.kind === "header") {
+							if (!visibleHeaderNames.has(row.name)) continue;
+							lines.push(theme.fg("accent", theme.bold(`  ${row.name.toUpperCase()}`)));
+							continue;
+						}
+						if (!visibleItemKeys.has(row.task)) continue;
+						const globalIndex = tasks.indexOf(row.task);
+						const isSelected = row.task === itemRows[selectedIndex].task;
+						lines.push(renderLabel(row.task, globalIndex, isSelected, width));
+						itemLine.set(lines.length - 1, row.task);
+					}
+					if (itemRows.length > maxVisible) {
+						const hint = `  (${selectedIndex + 1}/${itemRows.length})`;
+						lines.push(theme.fg("dim", truncateToWidth(hint, width - 2, "")));
+					}
+				}
+				lines.push("");
+				lines.push(
+					theme.fg(
+						"dim",
+						truncateToWidth("  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel", width - 2, ""),
+					),
+				);
+				return { lines, itemLine, itemRows };
+			}
 
 			return {
 				render(width: number) {
-					return container.render(width);
+					return buildRender(width).lines;
 				},
-				invalidate() {
-					container.invalidate();
-				},
+				invalidate() {},
 				handleInput(data: string) {
-					// Direct pick by number (1-9)
-					if (/^[1-9]$/.test(data) && Number(data) <= tasks.length) {
+					// Direct pick by number (1-9) — only when not filtering, so
+					// digits can be typed into the filter otherwise.
+					if (!filter && /^[1-9]$/.test(data) && Number(data) <= tasks.length) {
 						finish(Number(data) - 1);
 						return;
 					}
-					selectList.handleInput(data);
-					tui.requestRender();
+					// Filter typing.
+					if (kb.matches(data, "tui.editor.deleteCharBackward")) {
+						filter = filter.slice(0, -1);
+						selectedIndex = 0;
+						tui.requestRender();
+						return;
+					}
+					if (isPrintable(data)) {
+						filter += data;
+						selectedIndex = 0;
+						tui.requestRender();
+						return;
+					}
+					// Navigation / confirmation.
+					const { itemRows } = getVisible();
+					if (kb.matches(data, "tui.select.up")) {
+						selectedIndex = selectedIndex === 0 ? itemRows.length - 1 : selectedIndex - 1;
+						tui.requestRender();
+					}
+					else if (kb.matches(data, "tui.select.down")) {
+						selectedIndex = selectedIndex === itemRows.length - 1 ? 0 : selectedIndex + 1;
+						tui.requestRender();
+					}
+					else if (kb.matches(data, "tui.select.confirm")) {
+						const chosen = itemRows[selectedIndex];
+						if (chosen) finish(tasks.indexOf(chosen.task));
+					}
+					else if (kb.matches(data, "tui.select.cancel")) {
+						finish(null);
+					}
+				},
+				handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+					if (event.type === "wheel" && event.wheelDelta) {
+						const { itemRows } = getVisible();
+						if (itemRows.length === 0) return undefined;
+						const delta = event.wheelDelta < 0 ? -1 : 1;
+						const prev = selectedIndex;
+						selectedIndex = Math.max(0, Math.min(itemRows.length - 1, selectedIndex + delta));
+						return { handled: true, render: selectedIndex !== prev };
+					}
+					if (event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
+					const { itemLine, itemRows } = buildRender(event.width);
+					const task = itemLine.get(event.y);
+					if (!task) return undefined;
+					const idx = itemRows.findIndex((r) => r.task === task);
+					if (idx < 0) return undefined;
+					if (event.type === "press") {
+						mousePressedIndex = idx;
+						selectedIndex = idx;
+						return { handled: true, focus: true, render: true };
+					}
+					const clicked = mousePressedIndex ?? idx;
+					mousePressedIndex = null;
+					const chosen = itemRows[clicked];
+					if (chosen) finish(tasks.indexOf(chosen.task));
+					return { handled: true };
 				},
 			};
 		});

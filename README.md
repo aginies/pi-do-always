@@ -3,8 +3,9 @@
 A [Pi](https://github.com/earendil-works/pi) extension that gives you a `/do-always` command for your
 repeated "do the usual" prompts.
 
-Type `/do-always` → a numbered list of tasks appears → press a number (or arrows + Enter) →
-the task's prompt is **filled into the input editor**. Review it, tweak it, press Enter to run.
+Type `/do-always` → a numbered list of tasks appears, grouped by category → press a number,
+type to filter, scroll or click, or navigate with arrows + Enter → the task's prompt is
+**filled into the input editor**. Review it, tweak it, press Enter to run.
 
 ```text
 ┌ do-always — pick a task                                           ┐
@@ -30,6 +31,10 @@ the task's prompt is **filled into the input editor**. Review it, tweak it, pres
 |`/do-always review`|Fill the prompt for the task named `review` (task names autocomplete after `/do-always`)|
 |`/do-always list`|Print the task list|
 |`/do-always list-details`|Show the full prompt text each task will inject|
+
+The selector supports direct number-pick (1-9), live type-to-filter, arrow/Enter navigation,
+mouse-wheel scrolling, and click-to-select. While a filter is active, typed digits refine the
+filter instead of picking by number; clear the filter (backspace) to use number-pick again.
 
 In non-interactive modes (no TUI) there is no editor to fill, so the selected prompt is sent
 as a user message instead.
@@ -80,6 +85,7 @@ locations above to make it your own:
 Fields:
 
 - `name` (required) — short unique id, used for `/do-always <name>`
+- `category` (optional) — group header the task is shown under in the selector (e.g. `"Plan"`, `"Do"`). Matching is case-insensitive and the header is title-cased, so `"plan"` and `"Plan"` land in the same `Plan` group. Tasks without a category fall under `Other`. The built-in defaults are grouped into `Plan`, `Do`, `Docs`, and `Ops`.
 - `description` (optional) — one-line label shown in the selector
 - `prompt` (required) — the text filled into the editor
 

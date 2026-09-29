@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- New built-in **Propose features** task: reviews the project and proposes new
+  features (problem solved, user benefit, rough approach), prioritized by
+  impact and effort.
+- Optional `category` field on tasks. Tasks are shown in the selector grouped
+  under category headers (`Plan`, `Do`, `Docs`, `Ops`, `Other`).
+- Mouse support in the selector: wheel to scroll and left-click to select a
+  task.
+
+### Changed
+
+- The `/do-always` selector now groups tasks by category instead of a flat
+  numbered list. It also supports typing to filter the list live, in addition
+  to picking by number (1-9) or navigating with arrows + Enter.
+- Category grouping is now case-insensitive with title-cased headers, so
+  `"plan"` and `"Plan"` land in the same `Plan` group.
+- The task list is ordered by category, so the selector numbers tasks
+  sequentially across groups and number-pick, `/do-always <n>`, `list`, and
+  autocompletion all agree on the same numbering.
+- The non-TUI `/do-always list` now prints a header per category when tasks
+  span more than one group (matching the selector).
+- The selector renders a width-aware two-column layout and falls back to a
+  label-only line on narrow terminals instead of overflowing.
+
+### Fixed
+
+- Number-pick (1-9) is disabled while a filter is active, so typed digits
+  refine the filter instead of selecting a task.
+
 ## [0.2.2] - 2026-09-29
 
 ### Changed
