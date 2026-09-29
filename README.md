@@ -100,22 +100,3 @@ npm test           # run the unit tests (node:test + tsx, in test/)
 The pure task logic (`parseConfig`, `mergeTasks`, `resolveTask`, `formatList`) lives in
 [`tasks.ts`](./tasks.ts) with no Pi dependencies, so it is unit-tested independently of the
 Pi runtime. The extension (`index.ts`) imports that logic and adds only the Pi UI.
-
-No build step is needed — Pi loads the TypeScript directly via jiti.
-
-## Publishing
-
-To publish on npm:
-
-```bash
-npm login
-npm publish
-```
-
-`@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` are declared as `peerDependencies`
-with a `"*"` range and are **not** bundled — Pi supplies them to extensions. The `pi-package`
-keyword makes this package eligible for the [Pi package gallery](https://pi.dev/packages).
-
-The gallery page is built from `package.json` (name, description, author, version, license,
-repository, `pi` manifest) plus the README. Optional `pi.image` / `pi.video` fields in
-`package.json` add a gallery preview if you want one.
