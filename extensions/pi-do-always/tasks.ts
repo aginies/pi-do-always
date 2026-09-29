@@ -127,9 +127,9 @@ import { join } from "node:path";
 /** Used when neither config file defines any task. */
 export const DEFAULT_TASKS: DoAlwaysTask[] = [
 	{
-		name: "Review",
+		name: "Review changes",
 		category: "Plan",
-		description: "Review code and double-check changes (Plan)",
+		description: "Review the current code changes (Plan)",
 		requireDirty: true,
 		prompt:
 			"Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). " +
@@ -137,6 +137,14 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 			"Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, " +
 			"edge cases, security issues, and consistency with the rest of the codebase. " +
 			"Do a plan proposal for the fixes if needed. Do a summary of your findings",
+	},
+	{
+		name: "Review code",
+		category: "Plan",
+		description: "Review the whole project's code quality (Plan)",
+		prompt:
+			"Review this project's code holistically: identify code smells, dead code, duplication, awkward architecture or patterns, maintainability issues, inconsistencies, and missing or unclear documentation. " +
+			"Prioritize by impact, propose a plan for the fixes, and summarize your findings. Do not make any changes yet.",
 	},
 	{
 		name: "Cleanup",

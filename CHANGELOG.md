@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-09-29
+
+### Added
+
+- Split the built-in `Review` task into two distinct tasks, since reviewing the
+  working-tree diff and reviewing the codebase as a whole are different jobs:
+  - `Review changes` (renamed from `Review`, keeping `requireDirty`) reviews the
+    current working-tree changes.
+  - `Review code` (new) reviews the whole project's code quality holistically
+    (smells, dead code, duplication, architecture/patterns, maintainability,
+    docs) without requiring a dirty tree.
+
+### Changed
+
+- The built-in default task list now starts with `Review changes` then
+  `Review code` (previously a single `Review`), so the selector shows both
+  review modes. The README and sample config reflect the new names.
+
 ## [0.7.0] - 2026-09-29
 
 ### Added

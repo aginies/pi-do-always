@@ -327,7 +327,7 @@ test("orderTasksByCategory uses DEFAULT_CATEGORY_ORDER by default", () => {
 	// First group is the first entry of DEFAULT_CATEGORY_ORDER ("Plan"); the very
 	// first task is the first Plan task.
 	assert.equal(DEFAULT_CATEGORY_ORDER[0], "Plan");
-	assert.equal(out[0].name, "Review");
+	assert.equal(out[0].name, "Review changes");
 	assert.equal(out[0].category, "Plan");
 	// All tasks are preserved.
 	assert.equal(out.length, DEFAULT_TASKS.length);
@@ -717,10 +717,12 @@ JSON.stringify([{ name: "x", prompt: "p", guards: { type: "requireBranch" } }]),
 	assert.equal(errors.length, 1);
 });
 
-test("DEFAULT_TASKS marks Review and Commit as requireDirty", () => {
+test("DEFAULT_TASKS marks Review changes and Commit as requireDirty", () => {
 	const byName = new Map(DEFAULT_TASKS.map((t) => [t.name, t]));
-	assert.equal(byName.get("Review")?.requireDirty, true);
+	assert.equal(byName.get("Review changes")?.requireDirty, true);
 	assert.equal(byName.get("Commit")?.requireDirty, true);
+	assert.equal(byName.get("Review")?.requireDirty, undefined, "the old 'Review' name no longer exists");
+	assert.ok(byName.has("Review code"), "the new 'Review code' task exists");
 });
 
 test("DEFAULT_TASKS is non-empty and internally consistent", () => {
@@ -729,15 +731,15 @@ test("DEFAULT_TASKS is non-empty and internally consistent", () => {
 		assert.ok(typeof t.name === "string" && t.name.length > 0, `task "${t.name}" has a name`);
 		assert.ok(typeof t.prompt === "string" && t.prompt.length > 0, `"${t.name}" has a prompt`);
 	}
-	// The first default should be Review, and resolvable by number.
-	assert.equal(DEFAULT_TASKS[0].name, "Review");
-	assert.equal(resolveTask(DEFAULT_TASKS, "1")?.name, "Review");
+	// The first default should be Review changes, and resolvable by number.
+	assert.equal(DEFAULT_TASKS[0].name, "Review changes");
+	assert.equal(resolveTask(DEFAULT_TASKS, "1")?.name, "Review changes");
 	// No default task sets an explicit autoRun; the default is derived from the
 	// category (Plan tasks auto-run, the rest fill the editor).
 	for (const t of DEFAULT_TASKS) {
 		assert.equal(t.autoRun, undefined, `default task "${t.name}" has no explicit autoRun`);
 	}
-	assert.equal(shouldAutoRun(DEFAULT_TASKS[0]), true, "first default (Review, Plan) auto-runs");
+	assert.equal(shouldAutoRun(DEFAULT_TASKS[0]), true, "first default (Review changes, Plan) auto-runs");
 });
 
 // ---------------------------------------------------------------------------

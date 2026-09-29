@@ -12,21 +12,22 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
   do-always — pick a task
 
   PLAN
-▸ 1. ⚡ Review             Review code and double-check changes (Plan)
-  2. ⚡ Cleanup            Clean up dead code and duplicates (Plan)
-  3. ⚡ Security           Security audit (Plan)
-  4. ⚡ Performance        Performance review (Plan)
-  5. ⚡ Propose features   Propose new features (Plan)
+▸ 1. ⚡ Review changes       Review the current code changes (Plan)
+  2. ⚡ Review code          Review the whole project's code quality (Plan)
+  3. ⚡ Cleanup              Clean up dead code and duplicates (Plan)
+  4. ⚡ Security             Security audit (Plan)
+  5. ⚡ Performance          Performance review (Plan)
+  6. ⚡ Propose features     Propose new features (Plan)
   DO
-  6. Build                Test build is ok and fix issues
-  7. Tests                Run tests and fix failures
+  7. Build                  Test build is ok and fix issues
+  8. Tests                  Run tests and fix failures
   DOCS
-  8. Readme               Update the README.md
+  9. Readme                 Update the README.md
   OPS
-  9. Release              Prepare a release (version, changelog, tag)
- 10. Commit               Prepare a clean commit
+ 10. Release               Prepare a release (version, changelog, tag)
+ 11. Commit                Prepare a clean commit
 
-  Review — prompt:
+  Review changes — prompt:
   Review the changes on branch fix/login-null (3 changed files: auth.ts, login.ts,
   test/auth.test.ts). Last commit: Fix null check in login. Check `git status` and
   `git diff` to see what changed, then double-check the changes for bugs, edge …
@@ -42,7 +43,7 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
 |---|---|
 |`/do-always` or the shortcut key (default `F4`)|Show the numbered task selector|
 |`/do-always 2`|Fill the prompt for task #2 directly|
-|`/do-always review`|Fill the prompt for the task named `review` (task names autocomplete after `/do-always`)|
+|`/do-always review changes`|Fill the prompt for the task named `review changes` (task names autocomplete after `/do-always`)|
 |`/do-always list`|Print the task list|
 |`/do-always list-details`|Show the full rendered prompt text each task will inject|
 
@@ -87,7 +88,7 @@ Tasks are read from JSON files (an array of tasks, or the object form `{"tasks":
 |`~/.pi/agent/do-always.json`|Global (all projects)|
 |`<project>/.pi/do-always.json`|Project-local; overrides global tasks with the same `name`|
 
-If neither file exists, the built-in defaults (Review, Cleanup, Security, Performance, Propose features, Build, Tests, Readme, Release, Commit) are used.
+If neither file exists, the built-in defaults (Review changes, Review code, Cleanup, Security, Performance, Propose features, Build, Tests, Readme, Release, Commit) are used.
 This repo ships a sample in [`do-always.json`](./extensions/pi-do-always/do-always.json) — copy it to one of the
 locations above to make it your own:
 
@@ -133,7 +134,7 @@ Reload Pi (or start a new session) after editing a config file.
 ## Prompt placeholders
 
 Task prompts support `{{placeholders}}` that are filled in from the current
-directory when a task is selected — so `/do-always review` on a hotfix branch
+directory when a task is selected — so `/do-always review changes` on a hotfix branch
 injects “Review the changes on branch `fix/login-null` (3 changed files:
 `auth.ts`, `login.ts`, `test/auth.test.ts`) …” instead of a generic nudge.
 
