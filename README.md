@@ -8,16 +8,24 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
 **filled into the input editor**. Review it, tweak it, press Enter to run.
 
 ```text
-┌ do-always — pick a task                                           ┐
-│ 1. review   — Review code and double-check changes                │
-│ 2. readme   — Update the README                                   │
-│ 3. tests    — Run tests and fix failures                          │
-│ 4. commit   — Prepare a clean commit                              │
-│ 5. cleanup  — Propose a plan to clean up dead code and duplicates │
-│ 6. release  — Prepare a release (version, changelog, tag)         │
-│ 7. security — Security audit — plan proposal                      │
-│ 8. perf     — Performance review — plan proposal                  │
-└───────────────────────────────────────────────────────────────────┘
+  do-always — pick a task
+
+  PLAN
+▸ 1. Review               Review code and double-check changes (Plan)
+  2. Cleanup              Clean up dead code and duplicates (Plan)
+  3. Security             Security audit (Plan)
+  4. Performance          Performance review (Plan)
+  5. Propose features     Propose new features (Plan)
+  DO
+  6. Build                Test build is ok and fix issues
+  7. Tests                Run tests and fix failures
+  DOCS
+  8. Readme               Update the README.md
+  OPS
+  9. Release              Prepare a release (version, changelog, tag)
+ 10. Commit               Prepare a clean commit
+
+  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel
 ```
 
 ![do-always — the numbered task selector](pi.image.png)
@@ -68,7 +76,7 @@ Tasks are read from JSON files (an array of tasks, or the object form `{"tasks":
 |`~/.pi/agent/do-always.json`|Global (all projects)|
 |`<project>/.pi/do-always.json`|Project-local; overrides global tasks with the same `name`|
 
-If neither file exists, the built-in defaults (review, readme, tests, commit, cleanup, release, security, perf) are used.
+If neither file exists, the built-in defaults (Review, Cleanup, Security, Performance, Propose features, Build, Tests, Readme, Release, Commit) are used.
 This repo ships a sample in [`do-always.json`](./do-always.json) — copy it to one of the
 locations above to make it your own:
 
@@ -76,6 +84,7 @@ locations above to make it your own:
 [
   {
     "name": "review",
+    "category": "Plan",
     "description": "Review code and double-check changes",
     "prompt": "Review the recent code changes in this project. Check `git status` and `git diff` ..."
   }
