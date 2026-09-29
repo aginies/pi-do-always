@@ -32,8 +32,17 @@ export interface DoAlwaysTask {
  * A config file can be a bare array of tasks, or {"tasks": [...], "shortcut": ...}.
  * `shortcut` is a key id string (e.g. "f4", "ctrl+shift+p"), or null to disable
  * the keyboard shortcut.
+ * `merge` controls how project tasks combine with global tasks:
+ * `override` (default) replaces a global task with the same name;
+ * `append` keeps globals and only adds new project task names (a cascade).
  */
-export type DoAlwaysConfig = DoAlwaysTask[] | { tasks: DoAlwaysTask[]; shortcut?: string | null };
+export type DoAlwaysConfig =
+	| DoAlwaysTask[]
+	| {
+			tasks: DoAlwaysTask[];
+			shortcut?: string | null;
+			merge?: "append" | "override";
+		};
 
 /** Shortcut used when neither config file specifies one. */
 export const DEFAULT_SHORTCUT = "f4";
@@ -46,6 +55,11 @@ export interface ParsedDoAlwaysConfig {
 	 * disabled, undefined when the file does not set one.
 	 */
 	shortcut: string | null | undefined;
+	/**
+	 * The `merge` field, if present: "append" or "override", undefined when the
+	 * file does not set one.
+	 */
+	merge?: "append" | "override" | undefined;
 }
 
 /**
@@ -196,14 +210,18 @@ export function parseConfig(
 	}
 
 	let shortcut: string | null | undefined;
+	let merge: "append" | "override" | undefined;
 	if (!Array.isArray(data) && "shortcut" in data) {
 		const s = data.shortcut;
 		if (s === null) shortcut = null;
 		else if (typeof s === "string") shortcut = s.trim() === "" ? null : s.trim();
 		else onError(`do-always: ignoring invalid "shortcut" in ${path} (expected a key string or null)`);
 	}
+	if (!Array.isArray(data) && "merge" in data) {
+		merge = parseMerge(data.merge, path, onError);
+	}
 
-	return { tasks, shortcut };
+	return { tasks, shortcut, merge };
 }
 
 const KEY_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -243,11 +261,52 @@ export function resolveShortcut(
 }
 
 /**
+ * Parse the optional `merge` field: "append" or "override" (case-insensitive),
+ * or undefined when absent. A non-string or unrecognized value is ignored with
+ * a warning, so it never silently changes behavior.
+ */
+function parseMerge(
+	raw: unknown,
+	path: string,
+	onError: (message: string) => void,
+): "append" | "override" | undefined {
+	if (raw === undefined) return undefined;
+	if (typeof raw !== "string") {
+		onError(`do-always: ignoring invalid "merge" in ${path} (expected "append" or "override")`);
+		return undefined;
+	}
+	const v = raw.trim().toLowerCase();
+	if (v === "append" || v === "override") return v;
+	onError(`do-always: ignoring invalid "merge" in ${path} (expected "append" or "override")`);
+	return undefined;
+}
+
+/**
  * Merge project-local tasks over global tasks.
- * A project task with a name matching a global task replaces it; new names are appended.
+ *
+ * When `mode` is "override" (default), a project task with a name matching a
+ * global task replaces it; new names are appended. When "append", globals are
+ * kept as-is and only new (non-duplicate) project task names are appended.
  * Returns fallback when the merged result is empty.
  */
-export function mergeTasks(globalTasks: DoAlwaysTask[], projectTasks: DoAlwaysTask[], fallback: DoAlwaysTask[]): DoAlwaysTask[] {
+export function mergeTasks(
+	globalTasks: DoAlwaysTask[],
+	projectTasks: DoAlwaysTask[],
+	fallback: DoAlwaysTask[],
+	mode: "append" | "override" = "override",
+): DoAlwaysTask[] {
+	if (mode === "append") {
+		const merged = [...globalTasks];
+		const names = new Set(merged.map((t) => t.name));
+		for (const task of projectTasks) {
+			if (!names.has(task.name)) {
+				merged.push(task);
+				names.add(task.name);
+			}
+		}
+		return merged.length > 0 ? merged : fallback;
+	}
+
 	const merged = [...globalTasks];
 	for (const task of projectTasks) {
 		const idx = merged.findIndex((t) => t.name === task.name);

@@ -132,6 +132,31 @@ test("parseConfig ignores a non-string, non-null shortcut and reports it", () =>
 	assert.match(errors[0], /invalid \"shortcut\"/);
 });
 
+test("parseConfig reads a valid merge field", () => {
+	assert.equal(parseConfig(JSON.stringify({ tasks: [], merge: "append" }), "test.json").merge, "append");
+	assert.equal(parseConfig(JSON.stringify({ tasks: [], merge: "override" }), "test.json").merge, "override");
+});
+
+test("parseConfig accepts a case-insensitive merge field", () => {
+	assert.equal(parseConfig(JSON.stringify({ tasks: [], merge: "APPEND" }), "test.json").merge, "append");
+});
+
+test("parseConfig ignores an invalid merge field and reports it", () => {
+	const errors: string[] = [];
+	const out = parseConfig(JSON.stringify({ tasks: [], merge: "nope" }), "test.json", (m) => errors.push(m));
+	assert.equal(out.merge, undefined);
+	assert.equal(errors.length, 1);
+	assert.match(errors[0], /invalid \"merge\"/);
+});
+
+test("parseConfig ignores a non-string merge field and reports it", () => {
+	const errors: string[] = [];
+	const out = parseConfig(JSON.stringify({ tasks: [], merge: 42 }), "test.json", (m) => errors.push(m));
+	assert.equal(out.merge, undefined);
+	assert.equal(errors.length, 1);
+	assert.match(errors[0], /invalid \"merge\"/);
+});
+
 // ---------------------------------------------------------------------------
 // isValidKeyId
 // ---------------------------------------------------------------------------
@@ -191,6 +216,45 @@ test("mergeTasks falls back when nothing is defined", () => {
 	const fallback: DoAlwaysTask[] = [{ name: "fallback", prompt: "fb" }];
 	const out = mergeTasks([], [], fallback);
 	assert.deepEqual(out, fallback);
+});
+
+test("mergeTasks append keeps globals and only adds new names", () => {
+	const global: DoAlwaysTask[] = [{ name: "review", prompt: "r" }];
+	const project: DoAlwaysTask[] = [
+		{ name: "review", prompt: "should be dropped" }, // duplicate name
+		{ name: "lint", prompt: "l" }, // new
+	];
+	const out = mergeTasks(global, project, [], "append");
+	assert.deepEqual(out.map((t) => [t.name, t.prompt]), [
+		["review", "r"],
+		["lint", "l"],
+	]);
+});
+
+test("mergeTasks append preserves global order and drops duplicate names", () => {
+	const global: DoAlwaysTask[] = [
+		{ name: "a", prompt: "a" },
+		{ name: "b", prompt: "b" },
+	];
+	const project: DoAlwaysTask[] = [
+		{ name: "b", prompt: "x" }, // dropped (already exists)
+		{ name: "c", prompt: "c" },
+	];
+	const out = mergeTasks(global, project, [], "append");
+	assert.deepEqual(out.map((t) => t.name), ["a", "b", "c"]);
+});
+
+test("mergeTasks falls back when nothing is defined in append mode", () => {
+	const fallback: DoAlwaysTask[] = [{ name: "fallback", prompt: "fb" }];
+	const out = mergeTasks([], [], fallback, "append");
+	assert.deepEqual(out, fallback);
+});
+
+test("mergeTasks defaults to override when mode is omitted", () => {
+	const global: DoAlwaysTask[] = [{ name: "review", prompt: "old" }];
+	const project: DoAlwaysTask[] = [{ name: "review", prompt: "new" }];
+	const out = mergeTasks(global, project, []);
+	assert.deepEqual(out, [{ name: "review", prompt: "new" }]);
 });
 
 // ---------------------------------------------------------------------------

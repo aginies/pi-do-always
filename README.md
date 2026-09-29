@@ -113,6 +113,18 @@ Fields:
 In the object form you can also configure the selector shortcut:
 
 - `shortcut` (optional) — key that opens the selector, e.g. `"f4"`. Set to `null` to disable the shortcut. Defaults to `F4`. The project file's value wins over the global one.
+- `merge` (optional) — how project tasks combine with the global tasks: `"override"` (default) replaces a global task with the same `name`; `"append"` keeps the global tasks and only adds new project task names (a cascade, like CSS). The project file's value wins over the global one; when neither sets it, the default is `override` (the historical behavior).
+
+Example project file that only *adds* tasks without overriding the global set:
+
+```json
+{
+  "merge": "append",
+  "tasks": [
+    { "name": "deploy", "category": "Ops", "prompt": "Deploy this project to staging." }
+  ]
+}
+```
 
 Reload Pi (or start a new session) after editing a config file.
 

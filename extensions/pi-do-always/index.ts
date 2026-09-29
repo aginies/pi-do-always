@@ -71,22 +71,31 @@ import {
  * Project-local tasks override global tasks with the same name; new ones are appended.
  * Falls back to DEFAULT_TASKS when nothing is defined.
  */
-function loadConfig(cwd: string): { tasks: DoAlwaysTask[]; shortcut: string | null } {
+function loadConfig(cwd: string): {
+	tasks: DoAlwaysTask[];
+	shortcut: string | null;
+	merge: "append" | "override";
+} {
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
 
 	const global = existsSync(globalPath)
 		? parseConfig(readFileSync(globalPath, "utf-8"), globalPath)
-		: { tasks: [], shortcut: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined };
 	const project = existsSync(projectPath)
 		? parseConfig(readFileSync(projectPath, "utf-8"), projectPath)
-		: { tasks: [], shortcut: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined };
+
+	// The project file's merge mode wins; otherwise the global value; otherwise
+	// override (the historical behavior), so existing configs are unaffected.
+	const mode = project.merge ?? global.merge ?? "override";
 
 	return {
 		// Order the merged list by category so the selector numbers, digit-pick,
 		// `/do-always <n>`, and `list` all share one consistent order.
-		tasks: orderTasksByCategory(mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS)),
+		tasks: orderTasksByCategory(mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS, mode)),
 		shortcut: resolveShortcut(global.shortcut, project.shortcut),
+		merge: mode,
 	};
 }
 

@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-09-29
+
+### Added
+
+- Merge mode for config files: the object form now accepts `"merge": "append"`,
+  which keeps the global tasks and only adds new project task names (a cascade),
+  instead of overriding global tasks by name. `"override"` (the default) keeps the
+  historical behavior where a project task replaces the global task with the same
+  `name`. The project file's value wins over the global one; when neither sets it,
+  the default is `override`, so existing configs are unaffected. The pure
+  `mergeTasks` helper gains a `mode` parameter and is covered by new unit tests.
+
 ## [0.4.5] - 2026-09-29
 
 ### Added
