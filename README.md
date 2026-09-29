@@ -109,6 +109,8 @@ Fields:
 - `description` (optional) — one-line label shown in the selector
 - `prompt` (required) — the text filled into the editor (supports `{{placeholders}}` — see [Prompt placeholders](#prompt-placeholders))
 - `autoRun` (optional) — when `true`, selecting the task sends its prompt immediately instead of filling the editor; when `false`, it always fills the editor. When omitted, the default is derived from the category: `Plan` tasks auto-run, everything else fills the editor. Auto-run tasks are marked `⚡` in the selector.
+- `when` (optional) — a condition that hides the task from the selector and lists when it is not met (see [Conditionals](#conditionals)).
+- `guards` (optional) — an array of selection-time guards that block the task (with a message, not a hide) when a condition is unmet (see [Guards](#guards)). The legacy `requireDirty` (boolean) still works and is combined with any `guards`.
 
 In the object form you can also configure the selector shortcut:
 
@@ -149,6 +151,71 @@ Unknown placeholders are left as-is, and a prompt without placeholders is
 injected unchanged, so existing configs keep working. The selector preview and
 `/do-always list-details` show the rendered prompt — what you see is what gets
 injected.
+
+## Conditionals
+
+A task's `when` field controls whether it is shown in the selector and in
+`/do-always list` / `list-details`. When the condition is not met the task is
+hidden everywhere (including when picked by number or name), so it can never
+be selected into a no-op. Omitting `when` always shows the task.
+
+The string form is a single condition:
+
+- `"git"` — shown only inside a git working tree.
+- `"!git"` — shown only outside a git working tree.
+
+The object form is a set of conditions that must **all** hold (logical AND):
+
+| Key | Meaning |
+|---|---|
+| `"git": boolean` | `true` inside a git repo, `false` outside |
+| `"branch": string` | current branch equals the given name (exact match) |
+| `"file": string` | path exists (file or directory) relative to the working tree |
+| `"repo": string` | equals the git-remote basename context value |
+
+```json
+[
+  { "name": "review", "category": "Plan", "prompt": "Review the changes…", "when": "git" },
+  { "name": "deploy-staging", "category": "Ops", "prompt": "Deploy to staging.", "when": { "branch": "main" } },
+  { "name": "lint-js", "category": "Do", "prompt": "Lint the JavaScript.", "when": { "file": "package.json" } }
+]
+```
+
+An invalid `when` (wrong type, unknown key) is ignored with a warning and the
+task is shown, so a typo never silently hides a task. Reload Pi (or start a new
+session) after editing a config file.
+
+## Guards
+
+Guards keep low-value round-trips down: the task stays visible, but selecting it
+notifies with the reason instead of injecting a no-op prompt. Guards are
+evaluated against the current prompt context, so a task is only injected when
+**every** guard is met. `requireDirty` (boolean, the historical guard) is
+combined with any `guards` array.
+
+The `guards` array accepts these guard objects (all must pass):
+
+| `type` | `value` | Blocks when… |
+|---|---|---|
+| `requireDirty` | none | the working tree is clean (`files_changed_count === 0`) |
+| `requireBranch` | branch name | the current branch is not the given name |
+| `requireRepo` | repo name | the git-remote basename context value is not the given name |
+| `requireFilePattern` | glob | no changed file matches the glob |
+
+For `requireFilePattern`, `*` matches within a path segment, `**` crosses
+segments, `?` matches one non-separator character, and other regex
+metacharacters are literal.
+
+```json
+[
+  { "name": "deploy-staging", "category": "Ops", "prompt": "Deploy to staging.", "guards": [ { "type": "requireBranch", "value": "main" } ] },
+  { "name": "lint-tests", "category": "Do", "prompt": "Run the test suite.", "guards": [ { "type": "requireFilePattern", "value": "**/*.test.ts" } ] }
+]
+```
+
+An invalid guard (unknown `type`, missing `value`, or a non-array `guards`)
+is ignored with a warning, so a typo never silently disables a guard. Reload Pi
+(or start a new session) after editing a config file.
 
 ## Development
 

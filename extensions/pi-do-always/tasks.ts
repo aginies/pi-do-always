@@ -26,7 +26,43 @@ export interface DoAlwaysTask {
 	 * against the current prompt context (see `evaluateGuards`).
 	 */
 	requireDirty?: boolean;
+	/**
+	 * Environment condition controlling whether the task is shown in the
+	 * selector and lists. A string is a single condition ("git" | "!git"); an
+	 * object is a set of conditions that must all hold (logical AND):
+	 *   "git": boolean   — inside a git repo (true) or not (false)
+	 *   "branch": string — current branch equals the given name (exact match)
+	 *   "file": string   — a path that must exist in the working tree
+	 *   "repo": string   — equals the git-remote basename context value
+	 * Omitted/undefined always shows the task. Evaluated by `evaluateWhen`.
+	 */
+	when?: string | Record<string, unknown>;
+	/**
+	 * Extra selection-time guards, evaluated alongside the legacy `requireDirty`
+	 * (see `evaluateGuards`). Each guard blocks the task (with a message, not a
+	 * hide) when its condition is not met. `requireDirty` is kept for backward
+	 * compatibility; new guards use this array so the set is extensible.
+	 */
+	guards?: Guard[];
 }
+
+/**
+ * A selection-time guard that blocks a task when its condition is not met.
+ * The task stays visible but selecting it notifies instead of injecting.
+ * `requireDirty` needs no `value`; the others require a string `value`.
+ */
+export interface Guard {
+	type: "requireDirty" | "requireBranch" | "requireRepo" | "requireFilePattern";
+	value?: string;
+}
+
+/** The set of known guard types (used for validation at parse time). */
+export const GUARD_TYPES = [
+	"requireDirty",
+	"requireBranch",
+	"requireRepo",
+	"requireFilePattern",
+] as const;
 
 /**
  * A config file can be a bare array of tasks, or {"tasks": [...], "shortcut": ...}.
@@ -84,6 +120,9 @@ export const PROMPT_CONTEXT_KEYS = [
 
 /** A fully populated prompt context: one entry per PROMPT_CONTEXT_KEYS. */
 export type PromptContext = Record<(typeof PROMPT_CONTEXT_KEYS)[number], string>;
+
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 
 /** Used when neither config file defines any task. */
 export const DEFAULT_TASKS: DoAlwaysTask[] = [
@@ -145,6 +184,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		name: "Release",
 		category: "Ops",
 		description: "Prepare a release (version, changelog, tag)",
+		when: "git",
 		prompt:
 			"Prepare a release for this project (branch {{branch}}): check `git log` since the last tag, update the version in package.json (or the equivalent location), add a changelog entry summarizing the changes, and create a git tag if git present. Do not push.",
 	},
@@ -153,6 +193,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		category: "Ops",
 		description: "Prepare a clean commit",
 		requireDirty: true,
+		when: "git",
 		prompt:
 			"Prepare the working tree on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}) for a clean commit: stage the relevant changes, and write a clear commit message describing what changed and why. Do not push.",
 	},
@@ -199,11 +240,30 @@ export function parseConfig(
 				name: t.name,
 				prompt: t.prompt,
 			};
-			if (typeof t.description === "string") task.description = t.description;
-			if (typeof t.category === "string" && t.category.trim() !== "") task.category = t.category.trim();
+				if (typeof t.description === "string") task.description = t.description;
+				if (typeof t.category === "string" && t.category.trim() !== "") task.category = t.category.trim();
 				if (typeof t.autoRun === "boolean") task.autoRun = t.autoRun;
 				if (typeof t.requireDirty === "boolean") task.requireDirty = t.requireDirty;
-				tasks.push(task);
+				if (t.guards !== undefined) {
+					if (Array.isArray(t.guards)) {
+						const guards: Guard[] = [];
+						for (const g of t.guards) {
+							const parsed = parseGuard(g, path, onError);
+							if (parsed) guards.push(parsed);
+						}
+						if (guards.length > 0) task.guards = guards;
+					} else {
+						onError(`do-always: ignoring invalid "guards" in ${path} (expected an array of guards)`);
+					}
+				}
+				if (t.when !== undefined) {
+				if (isValidWhen(t.when)) {
+					task.when = t.when;
+				} else {
+					onError(`do-always: ignoring invalid "when" in ${path} (expected "git"/"!git" or an object of git|branch|file|repo conditions)`);
+				}
+			}
+			tasks.push(task);
 		} else {
 			onError(`do-always: skipping invalid task in ${path} (each task needs "name" and "prompt")`);
 		}
@@ -316,6 +376,102 @@ export function mergeTasks(
 	return merged.length > 0 ? merged : fallback;
 }
 
+/**
+ * Validate the shape of a `when` condition: the string "git" or "!git", or an
+ * object whose entries are all known condition keys with matching value types
+ * (`git` -> boolean; `branch`/`file`/`repo` -> string). Used by `parseConfig`
+ * to reject malformed conditions with a warning instead of silently changing
+ * behavior.
+ */
+export function isValidWhen(when: unknown): boolean {
+	if (typeof when === "string") {
+		return when === "git" || when === "!git";
+	}
+	if (typeof when !== "object" || when === null || Array.isArray(when)) {
+		return false;
+	}
+	for (const [key, value] of Object.entries(when as Record<string, unknown>)) {
+		switch (key) {
+			case "git":
+				if (typeof value !== "boolean") return false;
+				break;
+			case "branch":
+			case "file":
+			case "repo":
+				if (typeof value !== "string") return false;
+				break;
+			default:
+				return false; // unknown condition key
+		}
+	}
+	return true;
+}
+
+/**
+ * True when the current directory is inside a git working tree. The `branch`
+ * context falls back to "unknown" outside a repo (and on an empty repo), so a
+ * non-"unknown" branch is the git-repo signal.
+ */
+function isGitRepo(ctx: PromptContext): boolean {
+	return ctx.branch !== "unknown";
+}
+
+/** True when `relativePath` exists (as file or directory) under `cwd`. */
+function pathExists(cwd: string, relativePath: string): boolean {
+	try {
+		return existsSync(join(cwd, relativePath));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Evaluate a single `when` object entry against the current prompt context.
+ * Unknown keys are treated as no-ops (permissive) so a typo never hides a task
+ * at runtime (parse time rejects them with a warning instead).
+ */
+function evaluateWhenEntry(key: string, value: unknown, ctx: PromptContext): boolean {
+	switch (key) {
+		case "git":
+			return typeof value === "boolean" ? isGitRepo(ctx) === value : false;
+		case "branch":
+			return typeof value === "string" && ctx.branch === value;
+		case "file":
+			return typeof value === "string" && pathExists(ctx.cwd, value);
+		case "repo":
+			return typeof value === "string" && ctx.repo === value;
+		default:
+			return true;
+	}
+}
+
+/**
+ * Evaluate a task's `when` condition against the current prompt context.
+ * Returns true when the task should be shown, false when its condition is not
+ * met. An omitted/undefined condition always shows the task.
+ *
+ * The string form is a single condition ("git" | "!git"). The object form is a
+ * set of conditions that must all hold (logical AND): `git`, `branch`, `file`,
+ * or `repo` (see the `DoAlwaysTask.when` field).
+ */
+export function evaluateWhen(task: DoAlwaysTask, ctx: PromptContext): boolean {
+	const when = task.when;
+	if (when === undefined || when === null) return true;
+	if (typeof when === "string") {
+		const negated = when.startsWith("!");
+		const key = negated ? when.slice(1) : when;
+		if (key === "git") return negated ? !isGitRepo(ctx) : isGitRepo(ctx);
+		return true; // an invalid string condition is rejected at parse time
+	}
+	if (typeof when === "object") {
+		for (const [key, value] of Object.entries(when as Record<string, unknown>)) {
+			if (!evaluateWhenEntry(key, value, ctx)) return false;
+		}
+		return true;
+	}
+	return true;
+}
+
 /** Default order for category headers in the selector. */
 export const DEFAULT_CATEGORY_ORDER = ["Plan", "Do", "Docs", "Ops", "Other"];
 
@@ -387,10 +543,115 @@ export function shouldAutoRun(task: DoAlwaysTask): boolean {
  * Commit on a clean tree so the agent is never asked to inspect nothing.
  */
 export function evaluateGuards(task: DoAlwaysTask, ctx: PromptContext): string | null {
-	if (task.requireDirty && ctx.files_changed_count === "0") {
-		return "working tree is clean — nothing to review";
+	// Legacy `requireDirty` is folded into the guard table so the set of guards
+	// is extensible without touching this function's callers.
+	const guards: Guard[] = [];
+	if (task.requireDirty) guards.push({ type: "requireDirty" });
+	guards.push(...(task.guards ?? []));
+	for (const g of guards) {
+		const message = guardFailureMessage(g, ctx);
+		if (message) return message;
 	}
 	return null;
+}
+
+/**
+ * The blocking message a guard produces when its condition is unmet, or null
+ * when the guard passes. All guards are evaluated against the current prompt
+ * context, so a task is only injected when every guard is met.
+ */
+function guardFailureMessage(g: Guard, ctx: PromptContext): string | null {
+	switch (g.type) {
+		case "requireDirty":
+			return ctx.files_changed_count === "0" ? "working tree is clean — nothing to review" : null;
+		case "requireBranch":
+			return ctx.branch === g.value ? null : `not on branch "${g.value}" (currently ${ctx.branch})`;
+		case "requireRepo":
+			return ctx.repo === g.value ? null : `not in repo "${g.value}" (currently ${ctx.repo})`;
+		case "requireFilePattern":
+			return filesMatchPattern(ctx, g.value!) ? null : `no changed files match "${g.value}"`;
+		default:
+			return null; // an unknown type is rejected at parse time
+	}
+}
+
+/**
+ * The changed files for `ctx`, split on commas (matching how `files_changed`
+ * is rendered). Empty on a clean tree or outside a git repo.
+ */
+function changedFiles(ctx: PromptContext): string[] {
+	if (ctx.files_changed_count === "0" || ctx.files_changed === "none") return [];
+	return ctx.files_changed.split(",");
+}
+
+/**
+ * Whether any changed file matches `pattern`, treated as a glob: `*` matches
+ * within a path segment, `**` crosses segments, `?` matches one non-separator
+ * character, and other regex metacharacters are literal.
+ */
+function filesMatchPattern(ctx: PromptContext, pattern: string): boolean {
+	const re = globToRegex(pattern);
+	return changedFiles(ctx).some((f) => re.test(f.trim()));
+}
+
+/** Regex metacharacters that must be escaped when matching a literal path char. */
+const METACHARACTERS = ".+^${}()|[]";
+
+/** Convert a glob to an anchored RegExp (`**` -> `.*`, `*` -> `[^/]*`, `?` -> `[^/]`). */
+function globToRegex(pattern: string): RegExp {
+	let out = "";
+	let i = 0;
+	while (i < pattern.length) {
+		const c = pattern[i];
+		if (c === "*") {
+			let stars = 0;
+			while (i < pattern.length && pattern[i] === "*") {
+				stars++;
+				i++;
+			}
+			out += stars >= 2 ? ".*" : "[^/]*"; // `**` crosses path separators
+		} else if (c === "?") {
+			out += "[^/]";
+			i++;
+		} else {
+			out += METACHARACTERS.includes(c) ? "\\" + c : c;
+			i++;
+		}
+	}
+	return new RegExp(`^${out}$`);
+}
+
+/**
+ * Validate and normalize a single `guards` entry. Returns undefined (after
+ * warning) for an invalid entry so it is skipped rather than changing behavior.
+ */
+export function parseGuard(
+	raw: unknown,
+	path: string,
+	onError: (message: string) => void = () => {},
+): Guard | undefined {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		onError(`do-always: ignoring invalid guard in ${path} (expected an object)`);
+		return undefined;
+	}
+	const { type } = raw as Record<string, unknown>;
+	if (typeof type !== "string" || !GUARD_TYPES.includes(type as Guard["type"])) {
+		const known = GUARD_TYPES.join(", ");
+		onError(
+			`do-always: ignoring invalid "type" in guard ${path} (expected one of: ${known})`,
+		);
+		return undefined;
+	}
+	const guard: Guard = { type: type as Guard["type"] };
+	if (type !== "requireDirty") {
+		const { value } = raw as Record<string, unknown>;
+		if (typeof value !== "string") {
+			onError(`do-always: guard "${type}" in ${path} requires a string "value"`);
+			return undefined;
+		}
+		guard.value = value;
+	}
+	return guard;
 }
 
 /**

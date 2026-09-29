@@ -58,6 +58,7 @@ import {
 	orderTasksByCategory,
 	renderPrompt,
 	evaluateGuards,
+	evaluateWhen,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
@@ -232,6 +233,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// loop — no process spawning per frame). fillPrompt re-renders at
 		// selection time, so a few seconds of drift is acceptable.
 		const context = buildContext(ctx.cwd);
+		// Filter by the `when` condition once per session, so hidden tasks never
+		// appear, are never numbered, and can't be picked.
+		const visibleTasks = tasks.filter((t) => evaluateWhen(t, context));
 		const selected = await ctx.ui.custom<number | null>((tui, theme, _kb, done) => {
 			let settled = false;
 			let previewVisible = false;
@@ -244,11 +248,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			const finish = (value: number | null) => {
+			// `finish` receives the chosen task (or null) and translates it to the
+			// full index `tasks[selected]` expects. Reference-based, so it stays
+			// correct while a text filter is active (itemRows is then a subset of
+			// visibleTasks and positional indices would point at the wrong task).
+			const finish = (task: DoAlwaysTask | null) => {
 				if (settled) return;
 				settled = true;
 				clearPreviewTimer();
-				done(value);
+				done(task ? tasks.indexOf(task) : null);
 			};
 
 			// The prompt preview appears only after the selection has been stable
@@ -266,7 +274,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			}
 
 			// Group tasks under category headers, in a stable order.
-			const groups = groupTasksByCategory(tasks);
+			const groups = groupTasksByCategory(visibleTasks);
 
 			const kb = getKeybindings();
 			const maxVisible = 12;
@@ -356,7 +364,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							continue;
 						}
 						if (!visibleItemKeys.has(row.task)) continue;
-						const globalIndex = tasks.indexOf(row.task);
+						const globalIndex = visibleTasks.indexOf(row.task);
 						const isSelected = row.task === itemRows[selectedIndex].task;
 						lines.push(renderLabel(row.task, globalIndex, isSelected, width));
 						itemLine.set(lines.length - 1, row.task);
@@ -400,10 +408,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				},
 				invalidate() {},
 				handleInput(data: string) {
-					// Direct pick by number (1-9) — only when not filtering, so
-					// digits can be typed into the filter otherwise.
-					if (!filter && /^[1-9]$/.test(data) && Number(data) <= tasks.length) {
-						finish(Number(data) - 1);
+					// Direct pick by number (1-9) — only when not filtering, and within
+					// the visible set, so digits pick a visible task by its number.
+					if (!filter && /^[1-9]$/.test(data) && Number(data) <= visibleTasks.length) {
+						finish(visibleTasks[Number(data) - 1]);
 						return;
 					}
 					// Filter typing.
@@ -435,7 +443,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					}
 					else if (kb.matches(data, "tui.select.confirm")) {
 						const chosen = itemRows[selectedIndex];
-						if (chosen) finish(tasks.indexOf(chosen.task));
+						if (chosen) finish(chosen.task);
 					}
 					else if (kb.matches(data, "tui.select.cancel")) {
 						finish(null);
@@ -468,7 +476,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					const clicked = mousePressedIndex ?? idx;
 					mousePressedIndex = null;
 					const chosen = itemRows[clicked];
-					if (chosen) finish(tasks.indexOf(chosen.task));
+					if (chosen) finish(chosen.task);
 					return { handled: true };
 				},
 			};
@@ -526,13 +534,17 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			if (ctx.mode === "tui") {
 				await showSelector(ctx);
 			} else {
-				ctx.ui.notify(`do-always tasks (use /do-always <number|name>):\n${formatList(tasks)}`, "info");
+				const context = buildContext(ctx.cwd);
+				const visible = tasks.filter((t) => evaluateWhen(t, context));
+				ctx.ui.notify(`do-always tasks (use /do-always <number|name>):\n${formatList(visible)}`, "info");
 			}
 			return;
 		}
 
 		if (arg.toLowerCase() === "list") {
-			ctx.ui.notify(formatList(tasks), "info");
+			const context = buildContext(ctx.cwd);
+			const visible = tasks.filter((t) => evaluateWhen(t, context));
+			ctx.ui.notify(formatList(visible), "info");
 			return;
 		}
 
@@ -540,7 +552,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			// Display only — the description is metadata; selecting a task injects just its prompt.
 			// Render with the current context so what is shown is what gets injected.
 			const context = buildContext(ctx.cwd);
-			const details = tasks
+			const visible = tasks.filter((t) => evaluateWhen(t, context));
+			const details = visible
 				.map((t, i) => {
 					const lines = [`${i + 1}. ${t.name}`];
 					if (t.description) lines.push(`   description: ${t.description}`);
@@ -557,10 +570,21 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		const task = resolveTask(tasks, arg);
+		// Numbers index the VISIBLE list (what the user sees in the selector and
+		// `list`); names resolve against the full set so picking a hidden task by
+		// name gets an explanatory message below instead of "unknown task".
+		const context = buildContext(ctx.cwd);
+		const visible = tasks.filter((t) => evaluateWhen(t, context));
+		const task = resolveTask(/^\d+$/.test(arg) ? visible : tasks, arg);
 		if (!task) {
-			const available = tasks.map((t, i) => `${i + 1}=${t.name}`).join(", ");
+			const available = visible.map((t, i) => `${i + 1}=${t.name}`).join(", ");
 			ctx.ui.notify(`do-always: unknown task "${arg}". Available: ${available}`, "error");
+			return;
+		}
+		// Respect the task's `when` condition: never inject a task hidden for the
+		// current environment (the selector and lists already hide it).
+		if (!evaluateWhen(task, context)) {
+			ctx.ui.notify(`do-always: "${task.name}" is hidden by its "when" condition`, "info");
 			return;
 		}
 		await fillPrompt(task, ctx);

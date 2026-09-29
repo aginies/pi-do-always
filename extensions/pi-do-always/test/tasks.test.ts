@@ -1,14 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	DEFAULT_CATEGORY_ORDER,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
 	PROMPT_CONTEXT_KEYS,
 	evaluateGuards,
+	evaluateWhen,
 	formatList,
+	parseGuard,
 	groupTasksByCategory,
 	isValidKeyId,
+	isValidWhen,
 	mergeTasks,
 	parseConfig,
 	orderTasksByCategory,
@@ -442,6 +448,118 @@ test("shouldAutoRun lets an explicit flag override the category default", () => 
 	assert.equal(shouldAutoRun({ name: "c", autoRun: true, prompt: "p" }), true);
 });
 
+test("parseConfig reads a valid when condition and omits it when absent", () => {
+	const withString = parseConfig(JSON.stringify([{ name: "x", prompt: "p", when: "git" }]), "test.json");
+	assert.equal(withString.tasks[0].when, "git");
+	const withObject = parseConfig(JSON.stringify([{ name: "x", prompt: "p", when: { git: true } }]), "test.json");
+	assert.deepEqual(withObject.tasks[0].when, { git: true });
+	const absent = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
+	assert.equal(absent.tasks[0].when, undefined);
+	assert.ok(!("when" in absent.tasks[0]), "when key omitted when not set");
+});
+
+test("parseConfig ignores a non-string, non-object when and reports it", () => {
+	const out = parseConfig(JSON.stringify([{ name: "x", prompt: "p", when: 42 }]), "test.json");
+	assert.equal(out.tasks[0].when, undefined);
+});
+
+test("parseConfig ignores an invalid when object and reports it", () => {
+	const errors: string[] = [];
+	const out = parseConfig(
+		JSON.stringify([{ name: "x", prompt: "p", when: { nope: true } }]),
+		"test.json",
+		(m) => errors.push(m),
+	);
+	assert.equal(out.tasks[0].when, undefined);
+	assert.ok(!("when" in out.tasks[0]), "when omitted when invalid");
+	assert.equal(errors.length, 1);
+	assert.match(errors[0], /invalid "when"/);
+});
+
+// ---------------------------------------------------------------------------
+// isValidWhen
+// ---------------------------------------------------------------------------
+
+test("isValidWhen accepts the git string conditions", () => {
+	assert.equal(isValidWhen("git"), true);
+	assert.equal(isValidWhen("!git"), true);
+});
+
+test("isValidWhen rejects other string conditions", () => {
+	assert.equal(isValidWhen("branch"), false);
+	assert.equal(isValidWhen("f4"), false);
+	assert.equal(isValidWhen("!branch"), false);
+});
+
+test("isValidWhen accepts a valid when object", () => {
+	assert.equal(isValidWhen({ git: true }), true);
+	assert.equal(isValidWhen({ branch: "main", file: "package.json", repo: "x" }), true);
+	assert.equal(isValidWhen({ git: false, branch: "dev" }), true);
+});
+
+test("isValidWhen rejects an invalid when object", () => {
+	assert.equal(isValidWhen({ git: "yes" }), false); // git must be boolean
+	assert.equal(isValidWhen({ branch: 5 }), false); // branch must be a string
+	assert.equal(isValidWhen({ file: 5 }), false); // file must be a string
+	assert.equal(isValidWhen({ repo: null }), false); // repo must be a string
+	assert.equal(isValidWhen({ unknown: true }), false); // unknown key
+	assert.equal(isValidWhen([]), false); // arrays are not valid objects here
+	assert.equal(isValidWhen(null), false);
+	assert.equal(isValidWhen(42), false);
+});
+
+// ---------------------------------------------------------------------------
+// evaluateWhen
+// ---------------------------------------------------------------------------
+
+test("evaluateWhen shows a task when no when condition is set", () => {
+	assert.equal(evaluateWhen({ name: "a", prompt: "p" }, dirtyCtx), true);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: undefined }, dirtyCtx), true);
+});
+
+test("evaluateWhen honors the git string condition", () => {
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: "git" }, dirtyCtx), true);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: "git" }, nonGitCtx), false);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: "!git" }, dirtyCtx), false);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: "!git" }, nonGitCtx), true);
+});
+
+test("evaluateWhen honors the object git condition", () => {
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { git: true } }, dirtyCtx), true);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { git: true } }, nonGitCtx), false);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { git: false } }, dirtyCtx), false);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { git: false } }, nonGitCtx), true);
+});
+
+test("evaluateWhen honors the branch condition", () => {
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { branch: "main" } }, dirtyCtx), true);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { branch: "dev" } }, dirtyCtx), false);
+});
+
+test("evaluateWhen honors the repo condition", () => {
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { repo: "proj" } }, dirtyCtx), true);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { repo: "other" } }, dirtyCtx), false);
+});
+
+test("evaluateWhen honors the file condition against the working tree", () => {
+	const dir = mkdtempSync(tmpdir() + "/do-always-when-");
+	writeFileSync(join(dir, "keep.txt"), "x");
+	const ctx: PromptContext = { ...dirtyCtx, cwd: dir };
+	try {
+		assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { file: "keep.txt" } }, ctx), true);
+		assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { file: "missing.txt" } }, ctx), false);
+	} finally {
+		rmdirSync(dir, { recursive: true });
+	}
+});
+
+test("evaluateWhen ANDs multiple object conditions", () => {
+	const gitAndBranch = { git: true, branch: "main" };
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: gitAndBranch }, dirtyCtx), true);
+	const conflicting = { git: false, branch: "main" };
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: conflicting }, dirtyCtx), false);
+});
+
 test("parseConfig reads a boolean requireDirty and omits it when absent", () => {
 	const on = parseConfig(JSON.stringify([{ name: "x", prompt: "p", requireDirty: true }]), "test.json");
 	assert.equal(on.tasks[0].requireDirty, true);
@@ -471,6 +589,17 @@ const dirtyCtx: PromptContext = {
 	unstaged_files: "a.ts",
 };
 const cleanCtx: PromptContext = { ...dirtyCtx, files_changed: "none", files_changed_count: "0" };
+// A non-git directory: branch falls back to "unknown" outside a repo.
+const nonGitCtx: PromptContext = {
+	...dirtyCtx,
+	branch: "unknown",
+	last_commit: "unknown",
+	files_changed: "none",
+	files_changed_count: "0",
+	repo: "notgit",
+	staged_files: "none",
+	unstaged_files: "none",
+};
 
 test("evaluateGuards lets a task through when no guard is set", () => {
 	assert.equal(evaluateGuards({ name: "a", prompt: "p" }, cleanCtx), null);
@@ -480,6 +609,112 @@ test("evaluateGuards blocks a requireDirty task only on a clean tree", () => {
 	const guarded = { name: "a", prompt: "p", requireDirty: true };
 	assert.equal(evaluateGuards(guarded, dirtyCtx), null, "dirty tree passes");
 	assert.equal(evaluateGuards(guarded, cleanCtx), "working tree is clean — nothing to review");
+});
+
+test("evaluateGuards honors requireBranch", () => {
+	const onBranch = { name: "a", prompt: "p", guards: [{ type: "requireBranch", value: "main" }] };
+	const otherBranch = { name: "a", prompt: "p", guards: [{ type: "requireBranch", value: "release" }] };
+	assert.equal(evaluateGuards(onBranch, dirtyCtx), null, "branch passes");
+	assert.match(evaluateGuards(otherBranch, dirtyCtx), /not on branch "release"/);
+});
+
+test("evaluateGuards honors requireRepo", () => {
+	const thisRepo = { name: "a", prompt: "p", guards: [{ type: "requireRepo", value: "proj" }] };
+	const otherRepo = { name: "a", prompt: "p", guards: [{ type: "requireRepo", value: "elsewhere" }] };
+	assert.equal(evaluateGuards(thisRepo, dirtyCtx), null, "repo passes");
+	assert.match(evaluateGuards(otherRepo, dirtyCtx), /not in repo "elsewhere"/);
+});
+
+test("evaluateGuards honors requireFilePattern within a segment", () => {
+	const tsMatch = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "*.ts" }] };
+	const jsOnly = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "*.js" }] };
+	assert.equal(evaluateGuards(tsMatch, dirtyCtx), null, "matching file passes");
+	assert.match(evaluateGuards(jsOnly, dirtyCtx), /no changed files match "\*\.js"/);
+});
+
+test("evaluateGuards honors requireFilePattern with a ** glob across segments", () => {
+	const ctx: PromptContext = { ...dirtyCtx, files_changed: "src/deep/nested/util.ts" };
+	const anyTs = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "**/*.ts" }] };
+	const deepOnly = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "src/**" }] };
+	const noMatch = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "**/*.py" }] };
+	assert.equal(evaluateGuards(anyTs, ctx), null, "** matches across segments");
+	assert.equal(evaluateGuards(deepOnly, ctx), null, "prefix glob passes");
+	assert.match(evaluateGuards(noMatch, ctx), /no changed files match "\*\*\/\*\.py"/);
+});
+
+test("evaluateGuards combines legacy requireDirty with new guards", () => {
+	// Dirty tree + branch matches -> passes even though requireDirty is set.
+	const combined = {
+name: "a",
+prompt: "p",
+requireDirty: true,
+guards: [{ type: "requireBranch", value: "main" }],
+	};
+	assert.equal(evaluateGuards(combined, dirtyCtx), null);
+	// Clean tree -> legacy requireDirty still blocks first.
+	assert.equal(evaluateGuards(combined, cleanCtx), "working tree is clean — nothing to review");
+	// Dirty but wrong branch -> the new guard blocks.
+	const otherCtx: PromptContext = { ...dirtyCtx, branch: "dev" };
+	assert.match(evaluateGuards(combined, otherCtx), /not on branch "main"/);
+});
+
+test("parseGuard accepts a valid guard of each kind", () => {
+	assert.deepEqual(parseGuard({ type: "requireDirty" }, "t.json"), { type: "requireDirty" });
+	assert.deepEqual(parseGuard({ type: "requireBranch", value: "main" }, "t.json"), {
+type: "requireBranch",
+value: "main",
+	});
+	assert.deepEqual(parseGuard({ type: "requireRepo", value: "x" }, "t.json"), {
+type: "requireRepo",
+value: "x",
+	});
+	assert.deepEqual(parseGuard({ type: "requireFilePattern", value: "**/*.ts" }, "t.json"), {
+type: "requireFilePattern",
+value: "**/*.ts",
+	});
+});
+
+test("parseGuard rejects an invalid guard and reports it", () => {
+	const errors: string[] = [];
+	const onError = (m: string) => errors.push(m);
+	assert.equal(parseGuard(42, "t.json", onError), undefined);
+	assert.equal(parseGuard({ type: "nope" }, "t.json", onError), undefined);
+	assert.equal(parseGuard({ type: "requireBranch" }, "t.json", onError), undefined);
+	assert.equal(errors.length, 3);
+});
+
+test("parseConfig parses a guards array and drops invalid entries", () => {
+	const on = parseConfig(
+JSON.stringify([{ name: "x", prompt: "p", guards: [{ type: "requireBranch", value: "main" }] }]),
+"test.json",
+	);
+	assert.deepEqual(on.tasks[0].guards, [{ type: "requireBranch", value: "main" }]);
+	// An invalid entry is skipped with a warning, but valid ones survive.
+	const errors: string[] = [];
+	const off = parseConfig(
+JSON.stringify([
+{
+name: "x",
+prompt: "p",
+guards: [{ type: "requireBranch", value: "main" }, { type: "nope" }],
+},
+]),
+"test.json",
+(m) => errors.push(m),
+	);
+	assert.deepEqual(off.tasks[0].guards, [{ type: "requireBranch", value: "main" }]);
+	assert.equal(errors.length, 1);
+});
+
+test("parseConfig warns on a non-array guards value", () => {
+	const errors: string[] = [];
+	const out = parseConfig(
+JSON.stringify([{ name: "x", prompt: "p", guards: { type: "requireBranch" } }]),
+"test.json",
+(m) => errors.push(m),
+	);
+	assert.equal(out.tasks[0].guards, undefined);
+	assert.equal(errors.length, 1);
 });
 
 test("DEFAULT_TASKS marks Review and Commit as requireDirty", () => {

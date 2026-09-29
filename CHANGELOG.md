@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-09-29
+
+### Added
+
+- Extended task guards: a new `guards` array on tasks generalizes the
+  `requireDirty` guard into a small table of selection-time guards. Each guard
+  blocks the task (with a message, not a hide) when its condition is unmet, and
+  all guards must pass for the task to be injected. New guards: `requireBranch`
+  (only on a given branch), `requireRepo` (only in a specific repo), and
+  `requireFilePattern` (only when a glob matches a changed file — `*` stays in a
+  segment, `**` crosses segments, `?` matches one non-separator character).
+  `requireDirty` (boolean) still works and is combined with any `guards`. An
+  invalid guard is ignored with a warning. Covered by unit tests.
+
+## [0.6.0] - 2026-09-29
+
+### Added
+
+- Task `when` condition: a task is shown in the selector and in `list` /
+  `list-details` only when its `when` condition is met, and hidden everywhere
+  (including when picked by number or name) otherwise, so context-irrelevant
+  tasks never become no-ops. The string form is a single condition (`"git"` /
+  `"!git"`); the object form is a set of conditions that must all hold (logical
+  AND) — `"git"` (boolean), `"branch"` (exact match), `"file"` (path exists),
+  or `"repo"` (git-remote basename). An invalid `when` is ignored with a
+  warning (the task is shown), so a typo never silently hides a task. The pure
+  `evaluateWhen` / `isValidWhen` helpers cover it with unit tests.
+
+### Changed
+
+- The built-in `Release` and `Commit` tasks now require a git repo (`when: "git"`),
+  matching the git-only nature of those commands.
+
 ## [0.5.0] - 2026-09-29
 
 ### Added
