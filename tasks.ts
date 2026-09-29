@@ -123,7 +123,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		category: "Ops",
 		description: "Prepare a clean commit",
 		prompt:
-			"Prepare the working tree on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}) for a clean commit: review `git status` and `git diff`, stage the relevant changes, and write a clear commit message describing what changed and why. Do not push.",
+			"Prepare the working tree on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}) for a clean commit: stage the relevant changes, and write a clear commit message describing what changed and why. Do not push.",
 	},
 	{
 		name: "Propose features",
