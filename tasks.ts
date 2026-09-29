@@ -36,50 +36,56 @@ export interface ParsedDoAlwaysConfig {
 /** Used when neither config file defines any task. */
 export const DEFAULT_TASKS: DoAlwaysTask[] = [
 	{
-		name: "review",
-		description: "Review code and double-check changes",
+		name: "Review",
+		description: "Review code and double-check changes (Plan)",
 		prompt:
-			"Review the recent code changes in this project. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes.",
+			"Review the recent code changes in this project. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes if needed. Do a summary of your findings",
 	},
 	{
-		name: "readme",
-		description: "Update the README",
+		name: "Cleanup",
+		description: "Propose a plan to clean up dead code and duplicates (Plan)",
 		prompt:
-			"Update the README to match the current state of the project. Check the code, scripts, and configuration, then update the README sections that are now out of date (description, installation, usage, configuration). Keep it concise and accurate.",
+			"Scan the project for dead code, unused imports, commented-out blocks, and duplicated logic. Do a plan proposal for the removals and consolidations, keeping behavior unchanged. Do not make any changes yet.",
 	},
 	{
-		name: "tests",
+		name: "Readme",
+		description: "Update the README.md",
+		prompt:
+			"Update the README.md to match the current state of the project. Check the code, scripts, and configuration, then update the README.md sections that are now out of date (description, installation, usage, configuration). Keep it concise and accurate.",
+	},
+	{
+		name: "Build",
+		description: "Test build is ok and fix issues",
+		prompt:
+			"Build the project (run the build script, e.g. `npm run build`, plus type check if available). If the build fails, diagnose the errors and fix them, then re-build until it succeeds. Summarize what was broken and what you changed.",
+	},
+	{
+		name: "Tests",
 		description: "Run tests and fix failures",
 		prompt:
 			"Run the project's test suite (and type check / lint if available). If anything fails, diagnose and fix the failures, then re-run until green. Summarize the results.",
 	},
 	{
-		name: "commit",
+		name: "Release",
+		description: "Prepare a release (version, changelog, tag)",
+		prompt:
+			"Prepare a release for this project: check `git log` since the last tag, update the version in package.json (or the equivalent location), add a changelog entry summarizing the changes, and create a git tag if git present. Do not push.",
+	},
+	{
+		name: "Commit",
 		description: "Prepare a clean commit",
 		prompt:
 			"Prepare the working tree for a clean commit: review `git status` and `git diff`, stage the relevant changes, and write a clear commit message describing what changed and why. Do not push.",
 	},
 	{
-		name: "cleanup",
-		description: "Propose a plan to clean up dead code and duplicates",
-		prompt:
-			"Scan the project for dead code, unused imports, commented-out blocks, and duplicated logic. Do a plan proposal for the removals and consolidations, keeping behavior unchanged. Do not make any changes yet.",
-	},
-	{
-		name: "release",
-		description: "Prepare a release (version, changelog, tag)",
-		prompt:
-			"Prepare a release for this project: check `git log` since the last tag, update the version in package.json (or the equivalent location), add a changelog entry summarizing the changes, and create a git tag. Do not push.",
-	},
-	{
-		name: "security",
-		description: "Security audit — plan proposal",
+		name: "Security",
+		description: "Security audit (Plan)",
 		prompt:
 			"Audit this project for security issues: hardcoded secrets or credentials, unsafe patterns (injection, path traversal, unsafe deserialization), and vulnerable or outdated dependencies. Do a plan proposal for the fixes. Do not make any changes yet.",
 	},
 	{
-		name: "perf",
-		description: "Performance review — plan proposal",
+		name: "Performance",
+		description: "Performance review (Plan)",
 		prompt:
 			"Review this project for likely performance bottlenecks: inefficient algorithms, redundant I/O or computation, missing caching, and memory leaks. Do a plan proposal for the optimizations, prioritized by impact. Do not make any changes yet.",
 	},
