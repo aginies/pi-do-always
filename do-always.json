@@ -10,6 +10,7 @@
 		{
 			"name": "Cleanup",
 			"category": "Plan",
+			"autoRun": false,
 			"description": "Clean up dead code and duplicates (Plan)",
 			"prompt": "Scan the project for dead code, unused imports, commented-out blocks, and duplicated logic. Do a plan proposal for the removals and consolidations, keeping behavior unchanged. Do not make any changes yet."
 		},

@@ -13,6 +13,12 @@ export interface DoAlwaysTask {
 	description?: string;
 	/** Prompt filled into the editor when the task is selected */
 	prompt: string;
+	/**
+	 * Whether selecting the task sends its prompt immediately (auto-run) instead
+	 * of filling the editor. When omitted, the default is derived from the
+	 * category: "Plan" tasks auto-run, everything else fills the editor.
+	 */
+	autoRun?: boolean;
 }
 
 /**
@@ -145,6 +151,7 @@ export function parseConfig(
 			};
 			if (typeof t.description === "string") task.description = t.description;
 			if (typeof t.category === "string" && t.category.trim() !== "") task.category = t.category.trim();
+			if (typeof t.autoRun === "boolean") task.autoRun = t.autoRun;
 			tasks.push(task);
 		} else {
 			onError(`do-always: skipping invalid task in ${path} (each task needs "name" and "prompt")`);
@@ -262,6 +269,17 @@ export function orderTasksByCategory(
 	order: string[] = DEFAULT_CATEGORY_ORDER,
 ): DoAlwaysTask[] {
 	return groupTasksByCategory(tasks, order).flatMap((g) => g.items);
+}
+
+/**
+ * Whether selecting a task should auto-run it (send its prompt immediately)
+ * instead of filling the editor. An explicit `autoRun` flag wins; otherwise the
+ * default is derived from the category — "Plan" tasks auto-run, everything else
+ * fills the editor.
+ */
+export function shouldAutoRun(task: DoAlwaysTask): boolean {
+	if (typeof task.autoRun === "boolean") return task.autoRun;
+	return (task.category ?? "").trim().toLowerCase() === "plan";
 }
 
 /**

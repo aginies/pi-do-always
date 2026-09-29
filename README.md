@@ -5,17 +5,18 @@ repeated "do the usual" prompts.
 
 Type `/do-always` → a numbered list of tasks appears, grouped by category → press a number,
 type to filter, scroll or click, or navigate with arrows + Enter → the task's prompt is
-**filled into the input editor**. Review it, tweak it, press Enter to run.
+**filled into the input editor**. Review it, tweak it, press Enter to run. Tasks marked `⚡`
+(the `Plan` category by default) auto-run on selection instead — see `autoRun` below.
 
 ```text
   do-always — pick a task
 
   PLAN
-▸ 1. Review               Review code and double-check changes (Plan)
-  2. Cleanup              Clean up dead code and duplicates (Plan)
-  3. Security             Security audit (Plan)
-  4. Performance          Performance review (Plan)
-  5. Propose features     Propose new features (Plan)
+▸ 1. ⚡ Review             Review code and double-check changes (Plan)
+  2. ⚡ Cleanup            Clean up dead code and duplicates (Plan)
+  3. ⚡ Security           Security audit (Plan)
+  4. ⚡ Performance        Performance review (Plan)
+  5. ⚡ Propose features   Propose new features (Plan)
   DO
   6. Build                Test build is ok and fix issues
   7. Tests                Run tests and fix failures
@@ -25,7 +26,12 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
   9. Release              Prepare a release (version, changelog, tag)
  10. Commit               Prepare a clean commit
 
-  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel
+  Review — prompt:
+  Review the recent code changes in this project. Check `git status` and `git diff`
+  to see what changed, then double-check the changes for bugs, edge cases, security
+  issues, and consistency with the rest of the codebase. Do a plan proposal for …
+
+  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel  •  ⚡ auto-runs
 ```
 
 ![do-always — the numbered task selector](pi.image.png)
@@ -43,6 +49,11 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
 The selector supports direct number-pick (1-9), live type-to-filter, arrow/Enter navigation,
 mouse-wheel scrolling, and click-to-select. While a filter is active, typed digits refine the
 filter instead of picking by number; clear the filter (backspace) to use number-pick again.
+Pause on a task for two seconds and its full prompt is previewed below the list, so you can
+see exactly what will be injected before running it; moving the selection or typing hides it
+and restarts the delay. A task marked `⚡` runs immediately on selection (its prompt is sent,
+not filled): the `Plan` category does this by default, and any task can opt in or out via the
+`autoRun` field.
 
 In non-interactive modes (no TUI) there is no editor to fill, so the selected prompt is sent
 as a user message instead.
@@ -97,6 +108,7 @@ Fields:
 - `category` (optional) — group header the task is shown under in the selector (e.g. `"Plan"`, `"Do"`). Matching is case-insensitive and the header is title-cased, so `"plan"` and `"Plan"` land in the same `Plan` group. Tasks without a category fall under `Other`. The built-in defaults are grouped into `Plan`, `Do`, `Docs`, and `Ops`.
 - `description` (optional) — one-line label shown in the selector
 - `prompt` (required) — the text filled into the editor
+- `autoRun` (optional) — when `true`, selecting the task sends its prompt immediately instead of filling the editor; when `false`, it always fills the editor. When omitted, the default is derived from the category: `Plan` tasks auto-run, everything else fills the editor. Auto-run tasks are marked `⚡` in the selector.
 
 In the object form you can also configure the selector shortcut:
 

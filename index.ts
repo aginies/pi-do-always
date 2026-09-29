@@ -44,6 +44,7 @@ import {
 	getKeybindings,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_SHORTCUT,
@@ -56,6 +57,7 @@ import {
 	orderTasksByCategory,
 	resolveShortcut,
 	resolveTask,
+	shouldAutoRun,
 	type DoAlwaysTask,
 	type TaskGroup,
 } from "./tasks";
@@ -94,6 +96,11 @@ function isPrintable(data: string): boolean {
 	return data.length === 1 && data >= " " && data <= "~";
 }
 
+/** Delay before the selector reveals the selected task's prompt preview. */
+const PREVIEW_DELAY_MS = 2000;
+/** Max lines of the prompt shown in the selector preview. */
+const PREVIEW_MAX_LINES = 3;
+
 export default function doAlwaysExtension(pi: ExtensionAPI) {
 	let tasks: DoAlwaysTask[] = [];
 	let loadedCwd = ""; // cwd the cached `tasks` were loaded for
@@ -105,6 +112,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 	/** Put the task prompt into the editor (TUI) or send it as a user message (other modes). */
 	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext): Promise<void> {
+		if (shouldAutoRun(task)) {
+			await pi.sendUserMessage(task.prompt);
+			ctx.ui.notify(`do-always: auto-ran "${task.name}"`, "info");
+			return;
+		}
 		if (ctx.mode === "tui") {
 			ctx.ui.setEditorText(task.prompt);
 			ctx.ui.notify(`do-always: prompt for "${task.name}" filled — press Enter to run`, "info");
@@ -120,11 +132,36 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	async function showSelector(ctx: ExtensionContext): Promise<void> {
 		const selected = await ctx.ui.custom<number | null>((tui, theme, _kb, done) => {
 			let settled = false;
+			let previewVisible = false;
+			let previewTimer: ReturnType<typeof setTimeout> | null = null;
+
+			function clearPreviewTimer() {
+				if (previewTimer) {
+					clearTimeout(previewTimer);
+					previewTimer = null;
+				}
+			}
+
 			const finish = (value: number | null) => {
 				if (settled) return;
 				settled = true;
+				clearPreviewTimer();
 				done(value);
 			};
+
+			// The prompt preview appears only after the selection has been stable
+			// for PREVIEW_DELAY_MS; any change hides it and restarts the delay.
+			function resetPreview() {
+				previewVisible = false;
+				clearPreviewTimer();
+				previewTimer = setTimeout(() => {
+					previewTimer = null;
+					if (!settled) {
+						previewVisible = true;
+						tui.requestRender();
+					}
+				}, PREVIEW_DELAY_MS);
+			}
 
 			// Group tasks under category headers, in a stable order.
 			const groups = groupTasksByCategory(tasks);
@@ -134,6 +171,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			let filter = "";
 			let selectedIndex = 0;
 			let mousePressedIndex: number | null = null;
+
+			// Arm the preview timer for the initial selection.
+			resetPreview();
 
 			const matchesFilter = (t: DoAlwaysTask) => {
 				if (!filter) return true;
@@ -173,7 +213,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 			function renderLabel(task: DoAlwaysTask, globalIndex: number, isSelected: boolean, width: number): string {
 				const prefix = isSelected ? "▸ " : "  ";
-				const label = `${prefix}${globalIndex + 1}. ${task.name}`;
+				const marker = shouldAutoRun(task) ? "⚡ " : "";
+				const label = `${prefix}${globalIndex + 1}. ${marker}${task.name}`;
 				if (!task.description) {
 					const line = truncateToWidth(label, Math.max(1, width - 2), "");
 					return isSelected ? theme.fg("accent", theme.bold(line)) : line;
@@ -223,13 +264,30 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						lines.push(theme.fg("dim", truncateToWidth(hint, width - 2, "")));
 					}
 				}
+				// Prompt preview: revealed after the selection has been stable for
+				// PREVIEW_DELAY_MS, showing exactly what will be injected.
+				if (previewVisible) {
+					const sel = itemRows[selectedIndex];
+					if (sel) {
+						const wrapWidth = Math.max(10, width - 4);
+						const wrapped = wrapTextWithAnsi(sel.task.prompt, wrapWidth);
+						const shown = wrapped.slice(0, PREVIEW_MAX_LINES);
+						const truncated = wrapped.length > PREVIEW_MAX_LINES;
+						lines.push("");
+						lines.push(theme.fg("dim", theme.bold(`  ${sel.task.name} — prompt:`)));
+						shown.forEach((ln, i) => {
+							const isLast = i === shown.length - 1;
+							const text = isLast && truncated ? truncateToWidth(`${ln} …`, wrapWidth, "") : ln;
+							lines.push(theme.fg("muted", `  ${text}`));
+						});
+					}
+				}
 				lines.push("");
-				lines.push(
-					theme.fg(
-						"dim",
-						truncateToWidth("  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel", width - 2, ""),
-					),
-				);
+				const anyAutoRun = itemRows.some((r) => shouldAutoRun(r.task));
+				const footer = anyAutoRun
+					? "  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel  •  ⚡ auto-runs"
+					: "  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel";
+				lines.push(theme.fg("dim", truncateToWidth(footer, width - 2, "")));
 				return { lines, itemLine, itemRows };
 			}
 
@@ -249,12 +307,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					if (kb.matches(data, "tui.editor.deleteCharBackward")) {
 						filter = filter.slice(0, -1);
 						selectedIndex = 0;
+						resetPreview();
 						tui.requestRender();
 						return;
 					}
 					if (isPrintable(data)) {
 						filter += data;
 						selectedIndex = 0;
+						resetPreview();
 						tui.requestRender();
 						return;
 					}
@@ -262,10 +322,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					const { itemRows } = getVisible();
 					if (kb.matches(data, "tui.select.up")) {
 						selectedIndex = selectedIndex === 0 ? itemRows.length - 1 : selectedIndex - 1;
+						resetPreview();
 						tui.requestRender();
 					}
 					else if (kb.matches(data, "tui.select.down")) {
 						selectedIndex = selectedIndex === itemRows.length - 1 ? 0 : selectedIndex + 1;
+						resetPreview();
 						tui.requestRender();
 					}
 					else if (kb.matches(data, "tui.select.confirm")) {
@@ -283,6 +345,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const delta = event.wheelDelta < 0 ? -1 : 1;
 						const prev = selectedIndex;
 						selectedIndex = Math.max(0, Math.min(itemRows.length - 1, selectedIndex + delta));
+						if (selectedIndex !== prev) resetPreview();
 						return { handled: true, render: selectedIndex !== prev };
 					}
 					if (event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
@@ -293,7 +356,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					if (idx < 0) return undefined;
 					if (event.type === "press") {
 						mousePressedIndex = idx;
-						selectedIndex = idx;
+						if (selectedIndex !== idx) {
+							selectedIndex = idx;
+							resetPreview();
+						}
 						return { handled: true, focus: true, render: true };
 					}
 					const clicked = mousePressedIndex ?? idx;

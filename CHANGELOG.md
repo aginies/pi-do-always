@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Prompt preview in the selector: pause on a task for two seconds and its full
+  prompt is shown below the list, so you can see exactly what will be injected
+  before running it. Moving the selection or typing hides it and restarts the
+  delay.
+- Opt-in auto-run for tasks: a task marked `⚡` sends its prompt immediately on
+  selection instead of filling the editor. The `Plan` category auto-runs by
+  default; any task can opt in or out with the new `autoRun` field (`true`/
+  `false`).
+
 ## [0.3.0] - 2026-09-29
 
 ### Added

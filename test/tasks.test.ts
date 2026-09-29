@@ -12,6 +12,7 @@ import {
 	orderTasksByCategory,
 	resolveShortcut,
 	resolveTask,
+	shouldAutoRun,
 	type DoAlwaysTask,
 } from "../tasks";
 
@@ -86,6 +87,21 @@ test("parseConfig skips invalid entries and reports each", () => {
 test("parseConfig keeps a valid but missing description as undefined", () => {
 	const out = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
 	assert.equal(out.tasks[0].description, undefined);
+});
+
+test("parseConfig reads a boolean autoRun and omits it when absent", () => {
+	const on = parseConfig(JSON.stringify([{ name: "x", prompt: "p", autoRun: true }]), "test.json");
+	assert.equal(on.tasks[0].autoRun, true);
+	const off = parseConfig(JSON.stringify([{ name: "x", prompt: "p", autoRun: false }]), "test.json");
+	assert.equal(off.tasks[0].autoRun, false);
+	const absent = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
+	assert.equal(absent.tasks[0].autoRun, undefined);
+	assert.ok(!("autoRun" in absent.tasks[0]), "autoRun key omitted when not set");
+});
+
+test("parseConfig ignores a non-boolean autoRun", () => {
+	const out = parseConfig(JSON.stringify([{ name: "x", prompt: "p", autoRun: "yes" }]), "test.json");
+	assert.equal(out.tasks[0].autoRun, undefined);
 });
 
 test("parseConfig reads a string shortcut from the object form", () => {
@@ -336,6 +352,28 @@ test("formatList omits headers when all tasks share one category", () => {
 // DEFAULT_TASKS
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// shouldAutoRun
+// ---------------------------------------------------------------------------
+
+test("shouldAutoRun defaults Plan-category tasks to true", () => {
+	assert.equal(shouldAutoRun({ name: "a", category: "Plan", prompt: "p" }), true);
+	assert.equal(shouldAutoRun({ name: "b", category: "plan", prompt: "p" }), true);
+	assert.equal(shouldAutoRun({ name: "c", category: "  PLAN  ", prompt: "p" }), true);
+});
+
+test("shouldAutoRun defaults non-Plan and uncategorized tasks to false", () => {
+	assert.equal(shouldAutoRun({ name: "a", category: "Do", prompt: "p" }), false);
+	assert.equal(shouldAutoRun({ name: "b", category: "Ops", prompt: "p" }), false);
+	assert.equal(shouldAutoRun({ name: "c", prompt: "p" }), false);
+});
+
+test("shouldAutoRun lets an explicit flag override the category default", () => {
+	assert.equal(shouldAutoRun({ name: "a", category: "Plan", autoRun: false, prompt: "p" }), false);
+	assert.equal(shouldAutoRun({ name: "b", category: "Do", autoRun: true, prompt: "p" }), true);
+	assert.equal(shouldAutoRun({ name: "c", autoRun: true, prompt: "p" }), true);
+});
+
 test("DEFAULT_TASKS is non-empty and internally consistent", () => {
 	assert.ok(DEFAULT_TASKS.length > 0, "has at least one default task");
 	for (const t of DEFAULT_TASKS) {
@@ -345,4 +383,10 @@ test("DEFAULT_TASKS is non-empty and internally consistent", () => {
 	// The first default should be Review, and resolvable by number.
 	assert.equal(DEFAULT_TASKS[0].name, "Review");
 	assert.equal(resolveTask(DEFAULT_TASKS, "1")?.name, "Review");
+	// No default task sets an explicit autoRun; the default is derived from the
+	// category (Plan tasks auto-run, the rest fill the editor).
+	for (const t of DEFAULT_TASKS) {
+		assert.equal(t.autoRun, undefined, `default task "${t.name}" has no explicit autoRun`);
+	}
+	assert.equal(shouldAutoRun(DEFAULT_TASKS[0]), true, "first default (Review, Plan) auto-runs");
 });
