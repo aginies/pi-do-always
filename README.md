@@ -112,7 +112,7 @@ Fields:
 
 In the object form you can also configure the selector shortcut:
 
-- `shortcut` (optional) — key that opens the selector, e.g. `"f4"` or `"ctrl+shift+p"`. Set to `null` to disable the shortcut. Defaults to `F4`. The project file's value wins over the global one.
+- `shortcut` (optional) — key that opens the selector, e.g. `"f4"`. Set to `null` to disable the shortcut. Defaults to `F4`. The project file's value wins over the global one.
 
 Reload Pi (or start a new session) after editing a config file.
 

@@ -30,7 +30,7 @@
 			"name": "Propose features",
 			"category": "Plan",
 			"description": "Propose new features (Plan)",
-			"prompt": "Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet."
+			"prompt": "Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in term of changes, if this will breaks API, compatibility issue."
 		},
 		{
 			"name": "Build",

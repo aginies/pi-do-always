@@ -19,6 +19,13 @@ export interface DoAlwaysTask {
 	 * category: "Plan" tasks auto-run, everything else fills the editor.
 	 */
 	autoRun?: boolean;
+	/**
+	 * Whether the task should be blocked when the working tree is clean
+	 * (`files_changed_count === 0`). When set and unmet, the extension notifies
+	 * instead of injecting, avoiding a no-op round-trip. Guards are evaluated
+	 * against the current prompt context (see `evaluateGuards`).
+	 */
+	requireDirty?: boolean;
 }
 
 /**
@@ -55,6 +62,10 @@ export const PROMPT_CONTEXT_KEYS = [
 	"files_changed",
 	"files_changed_count",
 	"user",
+	"diff_stat", // NEW: "3 files changed, 41 insertions(+), 7 deletions(-)"
+	"repo", // NEW: basename of cwd or git remote (disambiguates monorepos)
+	"staged_files", // NEW: files staged for commit
+	"unstaged_files", // NEW: modified-but-unstaged files
 ] as const;
 
 /** A fully populated prompt context: one entry per PROMPT_CONTEXT_KEYS. */
@@ -66,8 +77,13 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		name: "Review",
 		category: "Plan",
 		description: "Review code and double-check changes (Plan)",
+		requireDirty: true,
 		prompt:
-			"Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). Last commit: {{last_commit}}. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes if needed. Do a summary of your findings",
+			"Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). " +
+			"Change summary: {{diff_stat}}. Last commit: {{last_commit}}. " +
+			"Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, " +
+			"edge cases, security issues, and consistency with the rest of the codebase. " +
+			"Do a plan proposal for the fixes if needed. Do a summary of your findings",
 	},
 	{
 		name: "Cleanup",
@@ -122,6 +138,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		name: "Commit",
 		category: "Ops",
 		description: "Prepare a clean commit",
+		requireDirty: true,
 		prompt:
 			"Prepare the working tree on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}) for a clean commit: stage the relevant changes, and write a clear commit message describing what changed and why. Do not push.",
 	},
@@ -130,7 +147,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		category: "Plan",
 		description: "Propose new features (Plan)",
 		prompt:
-			"Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet.",
+			"Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in term of changes, if this will breaks API, compatibility issue.",
 	},
 ];
 
@@ -170,8 +187,9 @@ export function parseConfig(
 			};
 			if (typeof t.description === "string") task.description = t.description;
 			if (typeof t.category === "string" && t.category.trim() !== "") task.category = t.category.trim();
-			if (typeof t.autoRun === "boolean") task.autoRun = t.autoRun;
-			tasks.push(task);
+				if (typeof t.autoRun === "boolean") task.autoRun = t.autoRun;
+				if (typeof t.requireDirty === "boolean") task.requireDirty = t.requireDirty;
+				tasks.push(task);
 		} else {
 			onError(`do-always: skipping invalid task in ${path} (each task needs "name" and "prompt")`);
 		}
@@ -299,6 +317,21 @@ export function orderTasksByCategory(
 export function shouldAutoRun(task: DoAlwaysTask): boolean {
 	if (typeof task.autoRun === "boolean") return task.autoRun;
 	return (task.category ?? "").trim().toLowerCase() === "plan";
+}
+
+/**
+ * Evaluate a task's guards against the current prompt context. Returns a
+ * notification message (caller should notify and abort) when a guard fails, or
+ * null when every guard is met and the task may proceed.
+ *
+ * Guards keep low-value round-trips down: e.g. `requireDirty` blocks Review and
+ * Commit on a clean tree so the agent is never asked to inspect nothing.
+ */
+export function evaluateGuards(task: DoAlwaysTask, ctx: PromptContext): string | null {
+	if (task.requireDirty && ctx.files_changed_count === "0") {
+		return "working tree is clean — nothing to review";
+	}
+	return null;
 }
 
 /**

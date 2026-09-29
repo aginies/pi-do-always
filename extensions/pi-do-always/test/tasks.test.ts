@@ -5,6 +5,7 @@ import {
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
 	PROMPT_CONTEXT_KEYS,
+	evaluateGuards,
 	formatList,
 	groupTasksByCategory,
 	isValidKeyId,
@@ -16,6 +17,7 @@ import {
 	resolveTask,
 	shouldAutoRun,
 	type DoAlwaysTask,
+	type PromptContext,
 } from "../tasks";
 
 const sample: DoAlwaysTask[] = [
@@ -376,6 +378,52 @@ test("shouldAutoRun lets an explicit flag override the category default", () => 
 	assert.equal(shouldAutoRun({ name: "c", autoRun: true, prompt: "p" }), true);
 });
 
+test("parseConfig reads a boolean requireDirty and omits it when absent", () => {
+	const on = parseConfig(JSON.stringify([{ name: "x", prompt: "p", requireDirty: true }]), "test.json");
+	assert.equal(on.tasks[0].requireDirty, true);
+	const off = parseConfig(JSON.stringify([{ name: "x", prompt: "p", requireDirty: false }]), "test.json");
+	assert.equal(off.tasks[0].requireDirty, false);
+	const absent = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
+	assert.equal(absent.tasks[0].requireDirty, undefined);
+	assert.ok(!("requireDirty" in absent.tasks[0]), "requireDirty key omitted when not set");
+});
+
+test("parseConfig ignores a non-boolean requireDirty", () => {
+	const out = parseConfig(JSON.stringify([{ name: "x", prompt: "p", requireDirty: "yes" }]), "test.json");
+	assert.equal(out.tasks[0].requireDirty, undefined);
+});
+
+const dirtyCtx: PromptContext = {
+	cwd: "/tmp/proj",
+	date: "2026-09-29",
+	branch: "main",
+	last_commit: "x",
+	files_changed: "a.ts",
+	files_changed_count: "1",
+	user: "y",
+	diff_stat: "1 file changed",
+	repo: "proj",
+	staged_files: "a.ts",
+	unstaged_files: "a.ts",
+};
+const cleanCtx: PromptContext = { ...dirtyCtx, files_changed: "none", files_changed_count: "0" };
+
+test("evaluateGuards lets a task through when no guard is set", () => {
+	assert.equal(evaluateGuards({ name: "a", prompt: "p" }, cleanCtx), null);
+});
+
+test("evaluateGuards blocks a requireDirty task only on a clean tree", () => {
+	const guarded = { name: "a", prompt: "p", requireDirty: true };
+	assert.equal(evaluateGuards(guarded, dirtyCtx), null, "dirty tree passes");
+	assert.equal(evaluateGuards(guarded, cleanCtx), "working tree is clean — nothing to review");
+});
+
+test("DEFAULT_TASKS marks Review and Commit as requireDirty", () => {
+	const byName = new Map(DEFAULT_TASKS.map((t) => [t.name, t]));
+	assert.equal(byName.get("Review")?.requireDirty, true);
+	assert.equal(byName.get("Commit")?.requireDirty, true);
+});
+
 test("DEFAULT_TASKS is non-empty and internally consistent", () => {
 	assert.ok(DEFAULT_TASKS.length > 0, "has at least one default task");
 	for (const t of DEFAULT_TASKS) {
@@ -441,6 +489,10 @@ test("rendering every default prompt with a full context leaves no placeholders"
 		files_changed: "auth.ts, login.ts, test/auth.test.ts",
 		files_changed_count: "3",
 		user: "Agine",
+		diff_stat: "3 files changed, 41 insertions(+), 7 deletions(-)",
+		repo: "pi-do-always",
+		staged_files: "a.ts, b.ts",
+		unstaged_files: "c.ts",
 	};
 	for (const t of DEFAULT_TASKS) {
 		assert.doesNotMatch(renderPrompt(t.prompt, ctx), /\{\{/, t.name);
@@ -456,6 +508,10 @@ test("rendering default prompts with a fallback (non-git) context leaves no plac
 		files_changed: "none",
 		files_changed_count: "0",
 		user: "unknown",
+		diff_stat: "none",
+		repo: "notgit",
+		staged_files: "none",
+		unstaged_files: "none",
 	};
 	for (const t of DEFAULT_TASKS) {
 		assert.doesNotMatch(renderPrompt(t.prompt, ctx), /\{\{/, t.name);

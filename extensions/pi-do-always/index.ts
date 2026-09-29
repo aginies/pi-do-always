@@ -57,6 +57,7 @@ import {
 	parseConfig,
 	orderTasksByCategory,
 	renderPrompt,
+	evaluateGuards,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
@@ -123,6 +124,13 @@ function buildContext(cwd: string): PromptContext {
 	const lastCommit = git(cwd, ["log", "-1", "--format=%s"]) ?? "unknown";
 	const user = git(cwd, ["config", "user.name"]) ?? "unknown";
 
+	// repo = bare name of the git remote (owner/repo.git -> repo), falling back
+	// to the basename of cwd so monorepo work stays disambiguated everywhere.
+	const remoteUrl = git(cwd, ["config", "--get", "remote.origin.url"]);
+	const repo = remoteUrl
+		? (remoteUrl.replace(/\.git$/, "").split("/").pop() ?? "unknown")
+		: cwd.split(/[\\/]/).filter(Boolean).pop() ?? "unknown";
+
 	const files: string[] = [];
 	const status = git(cwd, ["status", "--porcelain"]);
 	if (status) {
@@ -151,6 +159,10 @@ function buildContext(cwd: string): PromptContext {
 		files_changed: listed,
 		files_changed_count: String(files.length),
 		user,
+		diff_stat: git(cwd, ["diff", "--shortstat"]) ?? "none",
+		repo,
+		staged_files: git(cwd, ["diff", "--cached", "--name-only"]) ?? "none",
+		unstaged_files: git(cwd, ["diff", "--name-only"]) ?? "none",
 	};
 }
 
@@ -182,7 +194,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext): Promise<void> {
 		// Render the prompt with the current context (branch, changed files, …)
 		// so the injected text matches this directory at this moment.
-		const prompt = renderPrompt(task.prompt, buildContext(ctx.cwd));
+		const context = buildContext(ctx.cwd);
+		const blocked = evaluateGuards(task, context);
+		if (blocked) {
+			ctx.ui.notify(`do-always: ${blocked}`, "info");
+			return;
+		}
+		const prompt = renderPrompt(task.prompt, context);
 		if (shouldAutoRun(task)) {
 			await pi.sendUserMessage(prompt);
 			ctx.ui.notify(`do-always: auto-ran "${task.name}"`, "info");

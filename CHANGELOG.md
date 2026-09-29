@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- New prompt placeholders filled from the git state of the current directory:
+  `{{diff_stat}}` (e.g. "3 files changed, 41 insertions(+), 7 deletions(-)"),
+  `{{repo}}` (basename of the git remote or the working directory, to
+  disambiguate monorepo work), and `{{staged_files}}` / `{{unstaged_files}}`
+  (file lists for staged vs. unstaged changes). Unknown placeholders are left
+  as-is, so existing prompts are unaffected. The built-in Review task now
+  includes `{{diff_stat}}` so prompts are concrete.
+- Task guards: a new optional `requireDirty` field (parsed from config) blocks a
+  task when the working tree is clean (`files_changed_count === 0`). Selecting a
+  guarded task on a clean tree now notifies "working tree is clean — nothing to
+  review" instead of injecting a no-op prompt. The built-in Review and Commit
+  tasks are guarded by default; guards are evaluated by the new pure
+  `evaluateGuards` helper and can be extended with more conditions later.
+
 ## [0.4.4] - 2026-09-29
 
 ### Changed
