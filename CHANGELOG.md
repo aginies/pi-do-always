@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-29
+
+### Changed
+
+- Removed the version-pinned pi packages from `devDependencies`; they are
+  declared in `peerDependencies` with a `*` range (Pi supplies them at
+  runtime) and npm installs them automatically.
+- Added `repository.directory` so the npm page links to the extension
+  source under `extensions/pi-do-always/`.
+- Dropped the redundant `pi` and `pi-coding-agent` npm keywords.
+
 ## [0.4.2] - 2026-09-29
 
 ### Changed
