@@ -798,6 +798,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const task = row.task;
 						const auto = shouldAutoRun(task);
 						const focused = cursor.kind === "cell" && cursor.row === idx;
+						// The ▸ in the ORDER cell marks the ORDER column specifically;
+						// the full-row background marks the row in either column.
+						const inOrderCol =
+							cursor.kind === "cell" && cursor.row === idx && cursor.col === "order";
 						const num = `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
 						// ⚡ is 2 columns wide, so "⚡ " takes 3 — reserve it so
 						// auto-run rows align with the others (ORDER cell is
@@ -808,10 +812,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						// stays aligned (and mouse hit-testing stays exact).
 						const orderCell =
 							row.order !== undefined
-								? focused
+								? inOrderCol
 									? truncateToWidth(`▸[${row.order}]`, ORDER_COL_W, "", true)
 									: ` [${row.order}] `
-								: focused
+								: inOrderCol
 									? "▸  · "
 									: "  ·  ";
 						let line: string;
@@ -983,10 +987,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					if (kb.matches(data, "tui.select.down")) {
 						if (cursor.kind === "run") {
 							cursor = { kind: "cell", row: 0, col: "task" };
+						} else if (cursor.row === itemRows.length - 1) {
+							// The pinned Run row sits below the last task row.
+							cursor = { kind: "run" };
+							lastCellRow = itemRows.length - 1;
 						} else {
 							cursor = {
 								kind: "cell",
-								row: cursor.row === itemRows.length - 1 ? 0 : cursor.row + 1,
+								row: cursor.row + 1,
 								col: cursor.col,
 							};
 						}

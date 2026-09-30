@@ -71,7 +71,8 @@ Building a chain in the selector:
   the task column).
 - **→** moves the cursor to the ORDER column on the same row, where **Enter** toggles
   that task's chain membership (`·` → `[n]` → `·`). **←** goes back to the task column.
-- **↑ / ↓** move the cursor in either column; the highlighted row is the cursor.
+- **↑ / ↓** move the cursor in either column; the highlighted row is the cursor. From
+  the last task row, **↓** lands on the pinned Run row (and **↑** back).
 - **Enter on the `▶ Run the chain (n)` row** — or a mouse click on it — runs the chain.
   The row is dimmed while the chain is empty.
 - **Backspace** (with no filter typed) undoes the last add; **ctrl+u** clears the whole
