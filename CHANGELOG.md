@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **Task chains**: the selector is now a task table with an `ORDER` column and a
-  pinned `▶ Run the chain (n)` row. → moves the cursor to the ORDER column, where
+  pinned `Run the chain (n)` row. → moves the cursor to the ORDER column, where
   Enter toggles the task's chain membership; Enter (or a click) on the Run row runs
   the chain. ↑/↓ move the cursor in either column, Backspace (no filter) undoes the
   last add, ctrl+u clears, and clicking an ORDER cell toggles membership. The cursor

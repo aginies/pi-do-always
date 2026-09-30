@@ -685,7 +685,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 *   1  ⚡ Review changes      Review the current       ►[1]
 	 *   2  Build                 Build the project          ·
 	 *   ─────────────────────────────────────────────────────
-	 *   ▶ Run the chain (1)
+	 *   Run the chain (1)
 	 *
 	 * The TASK column is primary: Enter runs just the task under the cursor
 	 * (the classic pick). The ORDER column is the optional chain: Enter
@@ -972,12 +972,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				lines.push(theme.fg("dim", "  " + "─".repeat(Math.max(1, width - 4))));
 				const runLabel = chainRunLabel(chain.items.length);
 				runLine = lines.length;
+				// No play glyph in the label: the ► cursor marker is the only
+				// ">" and it appears only while the row is selected (like task rows).
 				if (cursor.kind === "run") {
-					lines.push(theme.bg("selectedBg", theme.bold(`${cursorMark} ▶ ${runLabel}`)));
+					lines.push(theme.bg("selectedBg", theme.bold(`${cursorMark} ${runLabel}`)));
 				} else if (chain.items.length === 0) {
-					lines.push(theme.fg("dim", `  ▶ ${runLabel}`));
+					lines.push(theme.fg("dim", `  ${runLabel}`));
 				} else {
-					lines.push(theme.fg("accent", `  ▶ ${runLabel}`));
+					lines.push(theme.fg("accent", `  ${runLabel}`));
 				}
 
 				// Context-sensitive footer.

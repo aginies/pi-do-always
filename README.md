@@ -75,8 +75,9 @@ Building a chain in the selector:
   theme's accent color: in the left gutter in the task column, in the ORDER cell in
   the order column (plus a row highlight where your theme makes it visible). From the
   last task row, **↓** lands on the pinned Run row (and **↑** back).
-- **Enter on the `▶ Run the chain (n)` row** — or a mouse click on it — runs the chain.
-  The row is dimmed while the chain is empty.
+- **Enter on the `Run the chain (n)` row** — or a mouse click on it — runs the chain.
+  The row is dimmed while the chain is empty. The ► marker appears on it only
+  while the cursor is on the row (as on task rows).
 - **Backspace** (with no filter typed) undoes the last add; **ctrl+u** clears the whole
   chain; **Esc** cancels and discards it.
 - Clicking an ORDER cell toggles the task's chain membership.
