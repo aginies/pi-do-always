@@ -32,6 +32,12 @@ import {
 	parseStatusPorcelain,
 	orderTasksByCategory,
 	renderPrompt,
+	reportFileName,
+	reportFooter,
+	reportHeader,
+	reportStepSection,
+	assistantText,
+	resolveReportPath,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
@@ -1133,4 +1139,99 @@ test("validateChain skips stale names and passes an empty chain", () => {
 	const stale = { items: ["ghost", "ok"], history: [] };
 	assert.equal(validateChain(tasks, stale, cleanCtx), null);
 	assert.equal(validateChain(tasks, chainClear(), cleanCtx), null);
+});
+
+// ── Chain report ───────────────────────────────────────────────────────
+
+test("reportFileName is do-always-report-tasks-YYYY-MM-DD-HHMM.md", () => {
+	const now = new Date(2025, 0, 15, 9, 5); // local 2025-01-15 09:05
+	assert.equal(reportFileName(now), "do-always-report-tasks-2025-01-15-0905.md");
+	const noon = new Date(2025, 11, 31, 23, 59);
+	assert.equal(reportFileName(noon), "do-always-report-tasks-2025-12-31-2359.md");
+});
+
+test("resolveReportPath returns the plain path when free, -N when taken", () => {
+	const dir = mkdtempSync(join(tmpdir(), "do-always-report-"));
+	try {
+		const now = new Date(2025, 0, 15, 9, 5);
+		const free = resolveReportPath(dir, now);
+		assert.equal(free, join(dir, "do-always-report-tasks-2025-01-15-0905.md"));
+		// Occupy the base name and the -2 name; the resolver must pick -3.
+		writeFileSync(free, "");
+		writeFileSync(join(dir, "do-always-report-tasks-2025-01-15-0905-2.md"), "");
+		const taken = resolveReportPath(dir, now);
+		assert.equal(taken, join(dir, "do-always-report-tasks-2025-01-15-0905-3.md"));
+		// A custom existence check is honored (no filesystem needed): every
+		// name is taken except -7, so the resolver must land on -7.
+		const custom = resolveReportPath(dir, now, (p) => !p.endsWith("-7.md"));
+		assert.equal(custom, join(dir, "do-always-report-tasks-2025-01-15-0905-7.md"));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("reportHeader has the title, project, and step list", () => {
+	const now = new Date(2025, 0, 15, 14, 32);
+	const header = reportHeader("/home/u/proj", ["Review", "Build"], now);
+	assert.match(header, /^# do-always chain report — 2025-01-15 14:32$/m);
+	assert.match(header, /- Project: \/home\/u\/proj/);
+	assert.match(header, /- Steps: Review → Build/);
+	assert.ok(header.endsWith("\n"));
+});
+
+test("reportStepSection shows index, name, status, times, and result", () => {
+	const start = new Date(2025, 0, 15, 14, 32);
+	const end = new Date(2025, 0, 15, 14, 35);
+	const section = reportStepSection(0, "Review", "completed", start, end, "3 issues found\n");
+	assert.match(section, /^## 1\. Review — completed \(14:32 → 14:35\)$/m);
+	assert.match(section, /3 issues found/);
+	// failed-to-start: no start time, single time shown
+	const failed = reportStepSection(1, "Build", "failed-to-start", null, end, "");
+	assert.match(failed, /^## 2\. Build — failed-to-start \(14:35\)$/m);
+	assert.match(failed, /_\(no result text\)_/);
+});
+
+test("reportFooter summarizes completion and early stop", () => {
+	const now = new Date(2025, 0, 15, 14, 38);
+	const done = reportFooter(["completed", "completed", "completed"], now);
+	assert.match(done, /\*\*Chain finished:\*\* 2025-01-15 14:38 — 3\/3 completed/);
+	assert.ok(!done.includes("stopped early"));
+	const stopped = reportFooter(["completed", "aborted", "pending"], now);
+	assert.match(stopped, /1\/3 completed — chain stopped early/);
+});
+
+test("assistantText handles string content, text parts, and mixed parts", () => {
+	assert.equal(assistantText("plain"), "plain");
+	assert.equal(
+		assistantText([
+			{ type: "text", text: "a" },
+			{ type: "text", text: "b" },
+		]),
+		"a\nb",
+	);
+	// Non-text parts (tool calls) are skipped.
+	assert.equal(
+		assistantText([
+			{ type: "toolCall" },
+			{ type: "text", text: "result" },
+			{ type: "thinking", text: "hidden" },
+		]),
+		"result",
+	);
+	assert.equal(assistantText([]), "");
+	assert.equal(assistantText(null), "");
+	assert.equal(assistantText(undefined), "");
+});
+
+test("parseConfig reads the report flag (default on, explicit off honored)", () => {
+	const on = parseConfig(JSON.stringify({ tasks: [], report: true }), "t.json");
+	assert.equal(on.report, true);
+	const off = parseConfig(JSON.stringify({ tasks: [], report: false }), "t.json");
+	assert.equal(off.report, false);
+	const absent = parseConfig(JSON.stringify({ tasks: [] }), "t.json");
+	assert.equal(absent.report, undefined);
+	let warned = "";
+	const invalid = parseConfig(JSON.stringify({ tasks: [], report: "yes" }), "t.json", (m) => (warned = m));
+	assert.equal(invalid.report, undefined);
+	assert.match(warned, /report/);
 });

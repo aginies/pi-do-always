@@ -23,6 +23,15 @@ All notable changes to this project will be documented in this file.
   ○ pending, ✗ errored, ⊘ aborted, – skipped) and a `(n/N)` progress count. It is
   removed when the chain completes and kept as a trace when it stops early; a
   second chain is refused while one is running.
+- **Chain report file**: every chain run writes `do-always-report-tasks-YYYY-MM-DD-HHMM.md`
+  in the project root (e.g. `do-always-report-tasks-2025-01-15-1432.md`), so earlier
+  steps' results survive later steps' output scrolling them off screen. Each step
+  appends a section as it finishes — its outcome, run time, and final assistant
+  message — so the file is complete even if the session dies mid-chain; a footer
+  with the overall summary is appended when the chain ends. When a report was
+  written, the completion widget stays below the prompt pointing at the file and
+  the completion notification carries its path. Same-minute runs get `-2`, `-3`, …
+  suffixes. New config field `report` (boolean, default `true`) disables it.
 
 ### Changed
 

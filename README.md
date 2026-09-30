@@ -112,10 +112,20 @@ currently at.
 
 Markers: `✓` completed, `▶` running (or waiting for your Enter on a fill-first step 1),
 `○` pending, `✗` errored / failed to start, `⊘` aborted, `–` skipped because its guards
-no longer hold. The widget is removed when the chain completes; if the chain stops early
-it stays below the prompt as a trace of where it stopped (until the next chain or a new
-session). Starting a second chain while one is running is refused — wait for it to finish
-or abort the current step with Esc.
+no longer hold. The widget is removed when the chain completes (unless a report file was
+written — see below); if the chain stops early it stays below the prompt as a trace of
+where it stopped (until the next chain or a new session). Starting a second chain while
+one is running is refused — wait for it to finish or abort the current step with Esc.
+
+Every chain run also writes a **report file** in the project root —
+`do-always-report-tasks-YYYY-MM-DD-HHMM.md` (e.g. `do-always-report-tasks-2025-01-15-1432.md`) —
+so earlier steps' results are not lost when later steps' output scrolls them off screen.
+Each step appends a section as it finishes (the step's final assistant message, with its
+outcome and run time), so the file is complete even if the session dies mid-chain; a
+footer with the overall summary is appended when the chain ends. When a report was
+written, the completion widget stays below the prompt pointing at the file, and the
+completion notification carries its path. Set `"report": false` in the config to disable
+it (the project file's value wins over the global one).
 
 ## Install
 
@@ -175,6 +185,7 @@ In the object form you can also configure the selector shortcut:
 
 - `shortcut` (optional) — key that opens the selector, e.g. `"f4"`. Set to `null` to disable the shortcut. Defaults to `F4`. The project file's value wins over the global one.
 - `merge` (optional) — how project tasks combine with the global tasks: `"override"` (default) replaces a global task with the same `name`; `"append"` keeps the global tasks and only adds new project task names (a cascade, like CSS). The project file's value wins over the global one; when neither sets it, the default is `override` (the historical behavior).
+- `report` (optional) — whether chain runs write a Markdown report file in the project root (one per run, appended as each step finishes). Default `true`; set `false` to disable. The project file's value wins over the global one. See [Chains](#chains).
 
 Example project file that only *adds* tasks without overriding the global set:
 

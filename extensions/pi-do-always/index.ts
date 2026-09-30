@@ -34,8 +34,8 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -53,6 +53,7 @@ import {
 	CHAIN_MAX,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
+	assistantText,
 	buildTableRows,
 	chainAdd,
 	chainClear,
@@ -69,7 +70,11 @@ import {
 	parseConfig,
 	parseStatusPorcelain,
 	orderTasksByCategory,
+	reportFooter,
+	reportHeader,
+	reportStepSection,
 	renderPrompt,
+	resolveReportPath,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
@@ -112,16 +117,18 @@ function loadConfig(
 ): {
 	tasks: DoAlwaysTask[];
 	shortcut: string | null;
+	/** Whether chain runs write a Markdown report file (default true). */
+	report: boolean;
 } {
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
 
 	const global = existsSync(globalPath)
 		? parseConfig(readFileSync(globalPath, "utf-8"), globalPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined };
 	const project = existsSync(projectPath)
 		? parseConfig(readFileSync(projectPath, "utf-8"), projectPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined };
 
 	// The project file's merge mode wins; otherwise the global value; otherwise
 	// override (the historical behavior), so existing configs are unaffected.
@@ -132,6 +139,9 @@ function loadConfig(
 		// `/do-always <n>`, and `list` all share one consistent order.
 		tasks: orderTasksByCategory(mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS, mode)),
 		shortcut: resolveShortcut(global.shortcut, project.shortcut),
+		// The project file's value wins; otherwise the global value; otherwise
+		// reports are on.
+		report: project.report ?? global.report ?? true,
 	};
 }
 
@@ -252,6 +262,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		outcome: "completed" | "aborted" | "error" | null;
 		timer: NodeJS.Timeout | null;
 		resolve: (outcome: ChainStepOutcome) => void;
+		/** Which chain step (0-based) this waiter belongs to — for the report. */
+		stepIndex: number;
 	} | null = null;
 
 	function settleChainWaiter(outcome: ChainStepOutcome) {
@@ -276,6 +288,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// their event waiters (the old chain's sendAndWait would resolve on the
 	// new chain's step), so starting one is refused until the first ends.
 	let chainActive = false;
+	// Whether chain runs write a Markdown report file (config `report`,
+	// default true). Refreshed whenever the config is (re)loaded.
+	let reportEnabled = true;
+	// The in-flight chain's report file: its path (absolute + relative for
+	// display) and when the current step's run actually started (agent_start;
+	// null until then and for failed-to-start steps).
+	let chainReport: { path: string; display: string; stepStartedAt: Date | null } | null = null;
 
 	/** Status marker glyph (all one column wide) with its color. */
 	function stepMarker(status: ChainStepStatus, theme: Theme): string {
@@ -327,10 +346,31 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		);
 	}
 
-	/** Remove the widget and forget the status. */
+	/**
+	 * Finish the report file: append the summary footer and point the widget
+	 * at the file. Called on every terminal path (complete, stopped, skipped);
+	 * a no-op when no report was created (disabled or write failure).
+	 */
+	function finishReport(ctx: ExtensionContext): void {
+		if (!chainReport || !chainStatus) return;
+		try {
+			appendFileSync(
+				chainReport.path,
+				reportFooter(chainStatus.steps.map((s) => s.status), new Date()),
+			);
+		} catch (err) {
+			ctx.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
+		}
+		const prev = chainStatus.note ? `${chainStatus.note} • ` : "";
+		chainStatus.note = `${prev}📄 ${chainReport.display}`;
+		updateChainWidget(ctx);
+	}
+
+	/** Remove the widget and forget the status (and any in-flight report). */
 	function clearChainWidget(ctx: ExtensionContext): void {
 		if (!chainStatus) return;
 		chainStatus = null;
+		chainReport = null;
 		if (ctx.mode === "tui") ctx.ui.setWidget(CHAIN_WIDGET_KEY, undefined);
 	}
 
@@ -362,6 +402,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_start", () => {
 		if (chainWaiter) chainWaiter.started = true;
+		// The run actually began — time the step for the report.
+		if (chainReport) chainReport.stepStartedAt = new Date();
 		// Fill-first: step 1 left the editor and is running — update the
 		// widget (and drop the "press Enter" note) as soon as the run starts.
 		if (lastCtx && chainStatus?.steps[0]?.status === "waiting") {
@@ -373,7 +415,28 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
 		if (lastAssistant) {
 			const stopReason = lastAssistant.stopReason;
-			chainWaiter.outcome = stopReason === "aborted" ? "aborted" : stopReason === "error" ? "error" : "completed";
+			const outcome = stopReason === "aborted" ? "aborted" : stopReason === "error" ? "error" : "completed";
+			chainWaiter.outcome = outcome;
+			// Append this step's result to the report while the transcript is
+			// fresh (the step's final assistant message is its result).
+			if (chainReport && chainStatus) {
+				const idx = chainWaiter.stepIndex;
+				const name = chainStatus.steps[idx]?.name ?? `step ${idx + 1}`;
+				const section = reportStepSection(
+					idx,
+					name,
+					outcome,
+					chainReport.stepStartedAt,
+					new Date(),
+					assistantText(lastAssistant.content),
+				);
+				try {
+					appendFileSync(chainReport.path, section);
+				} catch (err) {
+					lastCtx?.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
+				}
+				chainReport.stepStartedAt = null;
+			}
 		}
 	});
 	pi.on("agent_settled", () => {
@@ -386,16 +449,17 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * (agent_settled), reporting that run's outcome. With `graceMs`, resolves
 	 * "failed-to-start" if no agent_start arrives in time — a send that
 	 * throws before the run begins emits no agent events and its error is
-	 * swallowed by the runtime.
+	 * swallowed by the runtime. `stepIndex` tags the waiter so the report
+	 * knows which chain step the run belongs to.
 	 */
-	function armWaiter(graceMs?: number): Promise<ChainStepOutcome> {
+	function armWaiter(graceMs?: number, stepIndex = 0): Promise<ChainStepOutcome> {
 		return new Promise((resolve) => {
 			const timer = graceMs
 				? setTimeout(() => {
 						if (chainWaiter && !chainWaiter.started) settleChainWaiter("failed-to-start");
 					}, graceMs)
 				: null;
-			chainWaiter = { started: false, outcome: null, timer, resolve };
+			chainWaiter = { started: false, outcome: null, timer, resolve, stepIndex };
 		});
 	}
 
@@ -403,8 +467,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * Send a prompt and resolve when the run it starts has fully settled,
 	 * reporting the run's outcome (see armWaiter).
 	 */
-	function sendAndWait(prompt: string, graceMs = 10_000): Promise<ChainStepOutcome> {
-		const done = armWaiter(graceMs);
+	function sendAndWait(prompt: string, graceMs = 10_000, stepIndex = 0): Promise<ChainStepOutcome> {
+		const done = armWaiter(graceMs, stepIndex);
 		pi.sendUserMessage(prompt);
 		return done;
 	}
@@ -449,6 +513,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		loadedCwd = ctx.cwd;
 		const config = loadConfig(ctx.cwd, onError);
 		tasks = config.tasks;
+		reportEnabled = config.report;
 		refreshVisible(ctx.cwd, buildContext(ctx.cwd));
 		registerShortcut(config.shortcut, onError);
 	});
@@ -506,6 +571,20 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return;
 		}
 		chainActive = true;
+		// Report file: one per run, in the project root, appended as each step
+		// finishes (see the report section in tasks.ts). A write failure is not
+		// fatal — the chain still runs, just without a report.
+		if (reportEnabled) {
+			const now = new Date();
+			const path = resolveReportPath(ctx.cwd, now);
+			try {
+				writeFileSync(path, reportHeader(ctx.cwd, steps.map((t) => t.name), now));
+				chainReport = { path, display: relative(ctx.cwd, path), stepStartedAt: null };
+			} catch (err) {
+				ctx.ui.notify(`do-always: could not create the report file: ${err}`, "warning");
+				chainReport = null;
+			}
+		}
 		const first = steps[0];
 		if (shouldAutoRun(first) || ctx.mode !== "tui") {
 			try {
@@ -534,10 +613,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			`do-always: step 1 of ${steps.length} in the editor — press Enter to run; steps 2–${steps.length} follow automatically`,
 			"info",
 		);
-		void armWaiter().then(async (outcome) => {
+		void armWaiter(undefined, 0).then(async (outcome) => {
 			try {
 				if (outcome !== "completed") {
 					markChainStopped(ctx, 0, outcome);
+					finishReport(ctx);
 					ctx.ui.notify(`do-always: step 1 — ${outcome}; chain stopped`, "error");
 					return;
 				}
@@ -562,6 +642,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const blocked = evaluateGuards(step, context);
 			if (blocked) {
 				markChainStopped(ctx, i, "skipped", blocked);
+				finishReport(ctx);
 				ctx.ui.notify(`do-always: chain stopped at step ${i + 1} (${step.name}): ${blocked}`, "warning");
 				return;
 			}
@@ -569,12 +650,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const label = `do-always: step ${i + 1}/${steps.length} — ${step.name}`;
 			setChainStep(ctx, i, "running");
 			ctx.ui.notify(`${label} — starting`, "info");
-			const outcome = await sendAndWait(prompt);
+			const outcome = await sendAndWait(prompt, 10_000, i);
 			if (outcome === "completed") {
 				setChainStep(ctx, i, "completed");
 				continue;
 			}
 			markChainStopped(ctx, i, outcome);
+			finishReport(ctx);
 			if (outcome === "failed-to-start") {
 				ctx.ui.notify(`${label} — failed to start (check model/API key); chain stopped`, "error");
 			} else if (outcome === "aborted") {
@@ -584,8 +666,16 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			}
 			return;
 		}
-		clearChainWidget(ctx);
-		ctx.ui.notify(`do-always: chain complete (${steps.length} steps)`, "info");
+		// Complete: keep the widget as a summary (with the report path when
+		// there is one) until the next session — the report file holds the
+		// full results of every step.
+		if (chainReport) {
+			finishReport(ctx);
+			ctx.ui.notify(`do-always: chain complete (${steps.length} steps) — report: ${chainReport.display}`, "info");
+		} else {
+			clearChainWidget(ctx);
+			ctx.ui.notify(`do-always: chain complete (${steps.length} steps)`, "info");
+		}
 	}
 
 	/**
@@ -1156,7 +1246,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				if (ctx.mode === "tui") ctx.ui.notify(m, "warning");
 				else console.warn(m);
 			};
-			tasks = loadConfig(ctx.cwd, onError).tasks;
+			const config = loadConfig(ctx.cwd, onError);
+			tasks = config.tasks;
+			reportEnabled = config.report;
 		}
 
 		// One context per command run: shared by visibility filtering, rendering,

@@ -78,6 +78,11 @@ export type DoAlwaysConfig =
 			tasks: DoAlwaysTask[];
 			shortcut?: string | null;
 			merge?: "append" | "override";
+			/**
+			 * Whether chain runs write a Markdown report file (one per run, in
+			 * the project root). Default true; set false to disable.
+			 */
+			report?: boolean;
 		};
 
 /** Shortcut used when neither config file specifies one. */
@@ -96,6 +101,11 @@ export interface ParsedDoAlwaysConfig {
 	 * file does not set one.
 	 */
 	merge?: "append" | "override" | undefined;
+	/**
+	 * The `report` field, if present: whether chain runs write a Markdown
+	 * report file. undefined when the file does not set one (default: on).
+	 */
+	report: boolean | undefined;
 }
 
 import { existsSync } from "node:fs";
@@ -326,14 +336,14 @@ export function parseConfig(
 		data = JSON.parse(raw);
 	} catch (err) {
 		onError(`do-always: invalid JSON in ${path}: ${err}`);
-		return { tasks: [], shortcut: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined };
 	}
 
 	const list = Array.isArray(data) ? data : data?.tasks;
 
 	if (!Array.isArray(list)) {
 		onError(`do-always: ${path} must be a JSON array of tasks or {"tasks": [...]}`);
-		return { tasks: [], shortcut: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined };
 	}
 
 	const tasks: DoAlwaysTask[] = [];
@@ -384,8 +394,13 @@ export function parseConfig(
 	if (!Array.isArray(data) && "merge" in data) {
 		merge = parseMerge(data.merge, path, onError);
 	}
+	let report: boolean | undefined;
+	if (!Array.isArray(data) && "report" in data) {
+		if (typeof data.report === "boolean") report = data.report;
+		else onError(`do-always: ignoring invalid "report" in ${path} (expected true or false)`);
+	}
 
-	return { tasks, shortcut, merge };
+	return { tasks, shortcut, merge, report };
 }
 
 const KEY_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -985,4 +1000,103 @@ export function validateChain(
 		if (message) return { step: i + 1, task, message };
 	}
 	return null;
+}
+
+// ── Chain report ─────────────────────────────────────────────────────────
+//
+// A chain run's results are appended to a Markdown report file (one file
+// per run, in the project root) as each step finishes, so earlier steps'
+// results survive later steps' output scrolling them off screen. The file
+// is written incrementally: even if the session dies mid-chain, the
+// finished steps' results are on disk.
+
+/** HH:MM in the local timezone. */
+function reportTime(d: Date): string {
+	return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** File name for one chain run's report, e.g. do-always-report-tasks-2025-01-15-1432.md. */
+export function reportFileName(now: Date): string {
+	const p = (n: number) => String(n).padStart(2, "0");
+	return `do-always-report-tasks-${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}.md`;
+}
+
+/**
+ * Resolve the report file path in `cwd`, appending -2, -3, … when a file
+ * with the same name already exists (two runs within the same minute).
+ */
+export function resolveReportPath(
+	cwd: string,
+	now: Date,
+	exists: (path: string) => boolean = existsSync,
+): string {
+	const base = reportFileName(now);
+	const first = join(cwd, base);
+	if (!exists(first)) return first;
+	const stem = base.slice(0, -3); // drop ".md"
+	for (let i = 2; ; i++) {
+		const candidate = join(cwd, `${stem}-${i}.md`);
+		if (!exists(candidate)) return candidate;
+	}
+}
+
+/** Markdown header for a new report file. */
+export function reportHeader(projectPath: string, stepNames: string[], now: Date): string {
+	const p = (n: number) => String(n).padStart(2, "0");
+	const stamp = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${reportTime(now)}`;
+	return [
+		`# do-always chain report — ${stamp}`,
+		"",
+		`- Project: ${projectPath}`,
+		`- Steps: ${stepNames.join(" → ")}`,
+		"",
+		"",
+	].join("\n");
+}
+
+/**
+ * Markdown section for one finished step: its number, name, outcome, run
+ * time, and the final assistant message (the step's result). `startedAt`
+ * is null when the run never started (failed-to-start).
+ */
+export function reportStepSection(
+	index: number,
+	name: string,
+	status: string,
+	startedAt: Date | null,
+	endedAt: Date,
+	text: string,
+): string {
+	const times = startedAt ? `${reportTime(startedAt)} → ${reportTime(endedAt)}` : reportTime(endedAt);
+	const lines = [`## ${index + 1}. ${name} — ${status} (${times})`, ""];
+	const trimmed = text.trim();
+	lines.push(trimmed === "" ? "_(no result text)_" : trimmed, "", "");
+	return lines.join("\n");
+}
+
+/** Markdown footer summarizing the whole run. */
+export function reportFooter(stepStatuses: string[], now: Date): string {
+	const done = stepStatuses.filter((s) => s === "completed").length;
+	const total = stepStatuses.length;
+	const p = (n: number) => String(n).padStart(2, "0");
+	const stamp = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${reportTime(now)}`;
+	const summary =
+		done === total ? `${done}/${total} completed` : `${done}/${total} completed — chain stopped early`;
+	return `---\n\n**Chain finished:** ${stamp} — ${summary}\n`;
+}
+
+/**
+ * Extract an assistant message's text: string content as-is, or the text
+ * parts of a content array joined with newlines (tool-call parts are not
+ * text and are skipped). Same shape pi's own runtime uses. Null/undefined
+ * content (a run that produced no assistant text) yields "".
+ */
+export function assistantText(
+	content: string | Array<{ type?: string; text?: string }> | null | undefined,
+): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.flatMap((part) => (part && part.type === "text" && typeof part.text === "string" ? [part.text] : []))
+		.join("\n");
 }
