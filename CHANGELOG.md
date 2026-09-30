@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-09-30
+
+### Changed
+
+- The inline chain report is now bounded: only the last 3 step sections
+  are kept in memory (the report file on disk still holds every step), so
+  long chains no longer hold megabytes of assistant text per run.
+- Changed files are listed in locale-aware order (`localeCompare`)
+  instead of code-unit order.
+
+### Fixed
+
+- The inline chain report now numbers sections by their step index
+  (previously every section was headed `## 1.`), uses the same `(retry)`
+  names as the report file, and flags omitted steps with a pointer to the
+  file when the chain had more steps than the in-memory window.
+- `parseStatusPorcelain` dedupes with a `Set` (O(n) instead of the
+  O(n²) `files.includes`).
+- Dropped the identity-keyed memoization around `groupTasksByCategory`:
+  every caller passes a fresh array, so it never hit, and it would have
+  served stale groups if a caller ever mutated its array in place.
+
 ## [0.10.0] - 2026-09-29
 
 ### Added
@@ -32,6 +54,10 @@ All notable changes to this project will be documented in this file.
   written, the completion widget stays below the prompt pointing at the file and
   the completion notification carries its path. Same-minute runs get `-2`, `-3`, …
   suffixes. New config field `report` (boolean, default `true`) disables it.
+- **Inline report display**: when a chain completes fully, the full
+  Markdown report is also sent as a chat message, so results are visible
+  without opening the file. It is removed on the next prompt or session;
+  chains that stop early keep the trace widget pointing at the file.
 
 ### Changed
 
@@ -75,6 +101,15 @@ All notable changes to this project will be documented in this file.
   drifts again.
 - The README placeholder table now documents every supported placeholder
   (`{{diff_stat}}`, `{{repo}}`, `{{staged_files}}`, `{{unstaged_files}}`).
+- Context building is batched: 9 synchronous git spawns per use became 5
+  (combined `rev-parse`, `log -1`, `config --get-regexp`,
+  `status --porcelain`, `diff --shortstat`), and the result is cached for
+  the duration of one command run.
+- Selector and chain rendering use O(1) Map lookups instead of O(n²)
+  `indexOf`/`findIndex`/`find`, and the selector's table is built once per
+  render and reused for mouse hit-testing.
+- Removed dead code (`landOnOrderColumn`, the never-rendered
+  `chainReport.content` field) and unnecessary exports from `tasks.ts`.
 
 ### Fixed
 
@@ -86,6 +121,9 @@ All notable changes to this project will be documented in this file.
   (`>=22.19.0`) instead of Node 20.
 - The test suite is now typechecked: `tsconfig.json` includes the test
   directory.
+- `when: file` conditions can no longer probe paths outside the project
+  root: the existence check resolves the path and verifies it stays under
+  the working directory, rejecting `../../.ssh/id_rsa`-style values.
 
 ## [0.8.0] - 2026-09-29
 
