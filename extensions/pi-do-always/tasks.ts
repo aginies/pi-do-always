@@ -51,13 +51,13 @@ export interface DoAlwaysTask {
  * The task stays visible but selecting it notifies instead of injecting.
  * `requireDirty` needs no `value`; the others require a string `value`.
  */
-export interface Guard {
+interface Guard {
 	type: "requireDirty" | "requireBranch" | "requireRepo" | "requireFilePattern";
 	value?: string;
 }
 
 /** The set of known guard types (used for validation at parse time). */
-export const GUARD_TYPES = [
+const GUARD_TYPES = [
 	"requireDirty",
 	"requireBranch",
 	"requireRepo",
@@ -72,7 +72,7 @@ export const GUARD_TYPES = [
  * `override` (default) replaces a global task with the same name;
  * `append` keeps globals and only adds new project task names (a cascade).
  */
-export type DoAlwaysConfig =
+type DoAlwaysConfig =
 	| DoAlwaysTask[]
 	| {
 			tasks: DoAlwaysTask[];
@@ -89,7 +89,7 @@ export type DoAlwaysConfig =
 export const DEFAULT_SHORTCUT = "f4";
 
 /** Result of parsing a config file. */
-export interface ParsedDoAlwaysConfig {
+interface ParsedDoAlwaysConfig {
 	tasks: DoAlwaysTask[];
 	/**
 	 * The `shortcut` field, if present: a key id string, null when explicitly
@@ -109,7 +109,7 @@ export interface ParsedDoAlwaysConfig {
 }
 
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 /**
  * Structured facts about the working tree and git state, gathered once per
@@ -529,7 +529,12 @@ export function isValidWhen(when: unknown): boolean {
 /** True when `relativePath` exists (as file or directory) under `cwd`. */
 function pathExists(cwd: string, relativePath: string): boolean {
 	try {
-		return existsSync(join(cwd, relativePath));
+		const resolved = resolve(cwd, relativePath);
+		// Containment check: reject paths that escape the project root.
+		// `resolve` normalizes `..` sequences, so this catches
+		// "../../.ssh/id_rsa" → "/home/user/.ssh/id_rsa" when cwd is "/home/user/project".
+		if (!resolved.startsWith(cwd + sep) && resolved !== cwd) return false;
+		return existsSync(resolved);
 	} catch {
 		return false;
 	}
@@ -586,7 +591,7 @@ export function evaluateWhen(task: DoAlwaysTask, ctx: TaskContext): boolean {
 export const DEFAULT_CATEGORY_ORDER = ["Plan", "Do", "Docs", "Ops", "Other"];
 
 /** A category group: a display name and the tasks that belong to it. */
-export interface TaskGroup {
+interface TaskGroup {
 	name: string;
 	items: DoAlwaysTask[];
 }
@@ -700,8 +705,13 @@ function filesMatchPattern(files: string[], pattern: string): boolean {
 /** Regex metacharacters that must be escaped when matching a literal path char. */
 const METACHARACTERS = ".+^${}()|[]";
 
+/** Compiled regex cache: glob patterns are static config, so we memoize. */
+const globRegexCache = new Map<string, RegExp>();
+
 /** Convert a glob to an anchored RegExp (`**` -> `.*`, `*` -> `[^/]*`, `?` -> `[^/]`). */
 function globToRegex(pattern: string): RegExp {
+	let cached = globRegexCache.get(pattern);
+	if (cached) return cached;
 	let out = "";
 	let i = 0;
 	while (i < pattern.length) {
@@ -721,7 +731,9 @@ function globToRegex(pattern: string): RegExp {
 			i++;
 		}
 	}
-	return new RegExp(`^${out}$`);
+	cached = new RegExp(`^${out}$`);
+	globRegexCache.set(pattern, cached);
+	return cached;
 }
 
 /**
@@ -820,7 +832,7 @@ export const CHAIN_MAX = 8;
  * A task chain: ordered task names plus a LIFO history of adds (for undo).
  * Pure state — every operation returns a new state.
  */
-export interface ChainState {
+interface ChainState {
 	/** Task names in execution order (duplicate-free). */
 	items: string[];
 	/** LIFO history of added names, consumed by `chainUndo`. */
@@ -901,28 +913,6 @@ export function chainMove(state: ChainState, name: string, dir: -1 | 1): ChainSt
 }
 
 /**
- * Where the cursor lands when pressing → from task row `fromRow`: the ORDER
- * cell of the nearest chained row — the same row when it is chained, else the
- * nearest chained row upward, then downward (wrapping). Null when the chain
- * is empty (or when no visible row is chained, e.g. a stale chain).
- */
-export function landOnOrderColumn(
-	rows: DoAlwaysTask[],
-	chain: ChainState,
-	fromRow: number,
-): number | null {
-	if (chain.items.length === 0 || rows.length === 0) return null;
-	const isChained = (i: number): boolean => chain.items.includes(rows[i]?.name ?? "");
-	if (isChained(fromRow)) return fromRow;
-	const n = rows.length;
-	for (let d = 1; d < n; d++) {
-		if (isChained((fromRow - d + n) % n)) return (fromRow - d + n) % n;
-		if (isChained((fromRow + d) % n)) return (fromRow + d) % n;
-	}
-	return null;
-}
-
-/**
  * Label for the pinned Run row: a dimmed placeholder for an empty chain,
  * singular for one task, plural with the count otherwise.
  */
@@ -971,9 +961,11 @@ export function buildTableRows(groups: TaskGroup[], chain: ChainState): TableRow
  * looked up in `tasks`; unknown names (a stale chain) are skipped.
  */
 export function formatChainSequence(tasks: DoAlwaysTask[], chain: ChainState): string {
+	// O(n) index map so find → O(1) lookup.
+	const taskByName = new Map(tasks.map((t) => [t.name, t]));
 	const parts = chain.items
 		.map((name, i) => {
-			const t = tasks.find((x) => x.name === name);
+			const t = taskByName.get(name);
 			if (!t) return null;
 			const marker = shouldAutoRun(t) ? "⚡" : "";
 			return `${i + 1}.${marker}${t.name}`;
@@ -1083,6 +1075,27 @@ export function reportFooter(stepStatuses: string[], now: Date): string {
 	const summary =
 		done === total ? `${done}/${total} completed` : `${done}/${total} completed — chain stopped early`;
 	return `---\n\n**Chain finished:** ${stamp} — ${summary}\n`;
+}
+
+/** Markdown footer for a chain that never reached a terminal path (e.g., the session ended mid-chain). */
+export function reportAbandonedFooter(stepStatuses: string[], now: Date): string {
+	const done = stepStatuses.filter((s) => s === "completed").length;
+	const total = stepStatuses.length;
+	const p = (n: number) => String(n).padStart(2, "0");
+	const stamp = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${reportTime(now)}`;
+	return `---\n\n**Chain abandoned:** ${stamp} — ${done}/${total} completed\n`;
+}
+
+/**
+ * Whether a finished run's report file is worth keeping on disk: at least
+ * one completed step, or some step section carried result text. A run that
+ * produced neither (e.g. step 1 errored before any output, or the chain was
+ * blocked before running) leaves no file behind — the failure is already
+ * surfaced by the notification, and a quick same-minute retry would
+ * otherwise get a `-N` sibling next to an empty report.
+ */
+export function reportWorthKeeping(stepStatuses: string[], hasContent: boolean): boolean {
+	return hasContent || stepStatuses.some((s) => s === "completed");
 }
 
 /**

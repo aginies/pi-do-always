@@ -110,9 +110,9 @@ currently at.
 
 Markers: `✓` completed, `▶` running (or waiting for your Enter on a fill-first step 1),
 `○` pending, `✗` errored / failed to start, `⊘` aborted, `–` skipped because its guards
-no longer hold. The widget is removed when the chain completes (unless a report file was
-written — see below); if the chain stops early it stays below the prompt as a trace of
-where it stopped (until the next chain or a new session). Starting a second chain while
+no longer hold. The widget is removed when the chain completes; if the chain stops early
+it stays below the prompt as a trace of where it stopped (until your next prompt or a new
+session). Starting a second chain while
 one is running is refused — wait for it to finish or abort the current step with Esc.
 
 Every chain run also writes a **report file** in the project root —
@@ -120,10 +120,17 @@ Every chain run also writes a **report file** in the project root —
 so earlier steps' results are not lost when later steps' output scrolls them off screen.
 Each step appends a section as it finishes (the step's final assistant message, with its
 outcome and run time), so the file is complete even if the session dies mid-chain; a
-footer with the overall summary is appended when the chain ends. When a report was
-written, the completion widget stays below the prompt pointing at the file, and the
-completion notification carries its path. Set `"report": false` in the config to disable
-it (the project file's value wins over the global one).
+footer with the overall summary is appended when the chain ends, and the completion
+notification carries the file's path. A run that produces nothing worth keeping (no
+completed step and no step result text — e.g. step 1 errors before any output) leaves no
+file behind. Set `"report": false` in the config to disable
+it (the project file's value wins over the global one). See [Report file](#report-file).
+
+**Inline report in the chat.** When a chain completes fully (all steps done), the full
+Markdown report is sent as a message in the chat so you can read the results without
+opening the file. The message is automatically removed when you start the next
+prompt or session. A run that stops early (aborted, errored, or skipped steps) does
+not show the inline report — only the status trace widget below the prompt.
 
 ## Install
 

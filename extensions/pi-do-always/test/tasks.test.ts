@@ -22,7 +22,6 @@ import {
 	evaluateWhen,
 	formatChainSequence,
 	formatList,
-	landOnOrderColumn,
 	parseGuard,
 	groupTasksByCategory,
 	isValidKeyId,
@@ -32,10 +31,12 @@ import {
 	parseStatusPorcelain,
 	orderTasksByCategory,
 	renderPrompt,
+	reportAbandonedFooter,
 	reportFileName,
 	reportFooter,
 	reportHeader,
 	reportStepSection,
+	reportWorthKeeping,
 	assistantText,
 	resolveReportPath,
 	resolveShortcut,
@@ -1027,45 +1028,25 @@ test("chainMove is a no-op at the ends and for absent names", () => {
 	assert.equal(chainMove(s, "zzz", 1), s);
 });
 
-test("landOnOrderColumn lands on the same row when it is chained", () => {
-	const rows = sample.concat([{ name: "build", prompt: "p" }]);
-	const chain = chainAdd(chainClear(), "build").state;
-	assert.equal(landOnOrderColumn(rows, chain, 2), 2);
+test("formatChainSequence numbers tasks and marks auto-run ones", () => {
+	const t1 = { name: "a", prompt: "p" };
+	const t2 = { name: "b", prompt: "p" };
+	const t3 = { name: "c", prompt: "p", autoRun: true };
+	assert.equal(formatChainSequence([t1, t2, t3], { items: ["a", "b"], history: [] }), "1.a → 2.b");
+	assert.equal(formatChainSequence([t1, t2, t3], { items: ["c", "a"], history: [] }), "1.⚡c → 2.a");
+	assert.equal(formatChainSequence([t1], { items: ["a"], history: [] }), "1.a");
 });
 
-test("landOnOrderColumn finds the nearest chained row upward first", () => {
-	const rows = sample.concat([{ name: "build", prompt: "p" }]);
-	const chain = chainAdd(chainClear(), "build").state; // rows[2]
-	assert.equal(landOnOrderColumn(rows, chain, 1), 2, "row below: nearest is up? no — down is 1 away, up wraps 2 away");
-	// From row 0, the chained row 2 is 2 away down, 1 away up (wrap to row 2).
-	assert.equal(landOnOrderColumn(rows, chain, 0), 2);
+test("reportFileName is do-always-report-tasks-YYYY-MM-DD-HHMM.md", () => {
+	assert.equal(resolveReportPath("/tmp", new Date("2024-01-01T12:00:00Z")).includes("do-always-report-tasks-"), true);
 });
 
-test("landOnOrderColumn prefers the closer row when both sides are chained", () => {
-	const rows = [
-		{ name: "a", prompt: "p" },
-		{ name: "b", prompt: "p" },
-		{ name: "c", prompt: "p" },
-		{ name: "d", prompt: "p" },
-		{ name: "e", prompt: "p" },
-	];
-	let chain = chainClear();
-	chain = chainAdd(chain, "a").state;
-	chain = chainAdd(chain, "e").state;
-	// From row 2 (c): a is 2 away (up), e is 2 away (down) — up wins the tie.
-	assert.equal(landOnOrderColumn(rows, chain, 2), 0);
-	// From row 1 (b): a is 1 away up, e is 2 away down.
-	assert.equal(landOnOrderColumn(rows, chain, 1), 0);
-});
-
-test("landOnOrderColumn returns null for an empty chain or rows", () => {
-	assert.equal(landOnOrderColumn(sample, chainClear(), 0), null);
-	assert.equal(landOnOrderColumn([], chainAdd(chainClear(), "a").state, 0), null);
-});
-
-test("landOnOrderColumn returns null when no visible row is chained", () => {
-	const rows = [{ name: "ghost", prompt: "p" }];
-	assert.equal(landOnOrderColumn(rows, chainAdd(chainClear(), "other").state, 0), null);
+test("reportHeader has the title, project, and step list", () => {
+	const header = reportHeader("/tmp/project", ["review", "build"], new Date("2024-01-01T12:00:00Z"));
+	assert.equal(header.includes("# do-always chain report"), true);
+	assert.equal(header.includes("/tmp/project"), true);
+	assert.equal(header.includes("review"), true);
+	assert.equal(header.includes("build"), true);
 });
 
 test("chainRunLabel is a placeholder for zero, singular for one, counted for two", () => {
@@ -1198,6 +1179,27 @@ test("reportFooter summarizes completion and early stop", () => {
 	assert.ok(!done.includes("stopped early"));
 	const stopped = reportFooter(["completed", "aborted", "pending"], now);
 	assert.match(stopped, /1\/3 completed — chain stopped early/);
+});
+
+test("reportAbandonedFooter marks a chain that never finished", () => {
+	const now = new Date(2025, 0, 15, 14, 38);
+	const footer = reportAbandonedFooter(["completed", "running", "pending"], now);
+	assert.match(footer, /\*\*Chain abandoned:\*\* 2025-01-15 14:38 — 1\/3 completed/);
+	assert.ok(!footer.includes("finished"));
+});
+
+test("reportWorthKeeping keeps reports with progress or result text", () => {
+	// A completed step keeps the file even without result text.
+	assert.equal(reportWorthKeeping(["completed", "pending"], false), true);
+	// Result text keeps the file even when no step completed.
+	assert.equal(reportWorthKeeping(["error", "pending"], true), true);
+	// Neither → the (mostly) empty file is removed.
+	assert.equal(reportWorthKeeping(["error", "pending"], false), false);
+	assert.equal(reportWorthKeeping(["failed-to-start"], false), false);
+	assert.equal(reportWorthKeeping(["aborted"], false), false);
+	// Skipped steps count as no progress, but result text still counts.
+	assert.equal(reportWorthKeeping(["skipped", "pending"], false), false);
+	assert.equal(reportWorthKeeping(["skipped", "pending"], true), true);
 });
 
 test("assistantText handles string content, text parts, and mixed parts", () => {

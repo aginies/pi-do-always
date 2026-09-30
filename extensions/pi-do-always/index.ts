@@ -34,7 +34,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -70,15 +70,16 @@ import {
 	parseConfig,
 	parseStatusPorcelain,
 	orderTasksByCategory,
+	reportAbandonedFooter,
 	reportFooter,
 	reportHeader,
 	reportStepSection,
+	reportWorthKeeping,
 	renderPrompt,
 	resolveReportPath,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
-	splitFileLines,
 	toPromptContext,
 	validateChain,
 	type DoAlwaysTask,
@@ -166,37 +167,91 @@ function git(cwd: string, args: string[]): string | undefined {
 }
 
 /**
+ * Cache that deduplicates `buildContext` calls for the same cwd within a
+ * single user action (chain run, /do-always invocation, session_start).
+ * The cache is created fresh for each action entry point.
+ */
+function createContextCache(): {
+	get(cwd: string): TaskContext;
+} {
+	let cached: { cwd: string; ctx: TaskContext } | null = null;
+	return {
+		get(cwd: string): TaskContext {
+			if (cached && cached.cwd === cwd) return cached.ctx;
+			cached = { cwd, ctx: buildContext(cwd) };
+			return cached.ctx;
+		},
+	};
+}
+
+/**
  * Build the structured context for the current directory. Git facts fall back
  * to neutral values when unavailable (non-git dir, no git, empty repo) so
- * default prompts read cleanly in any directory. The string view for
- * `renderPrompt` is derived with `toPromptContext`.
+ * default prompts read cleanly in any directory.
+ *
+ * Batches the 9 individual git calls into 5:
+ *  1. rev-parse --abbrev-ref HEAD --is-inside-work-tree → branch + isGitRepo
+ *  2. log -1 --format="%H %s" → commit hash + subject
+ *  3. config --get-regexp "^user.name$|^remote.origin.url$" → user + remote
+ *  4. status --porcelain → stagedFiles + unstagedFiles (parsed from porcelain)
+ *  5. diff --shortstat → diffStat
  */
 function buildContext(cwd: string): TaskContext {
-	const branch = git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]) ?? "unknown";
-	const lastCommit = git(cwd, ["log", "-1", "--format=%s"]) ?? "unknown";
-	const user = git(cwd, ["config", "user.name"]) ?? "unknown";
-	// Authoritative working-tree check — the branch sentinel is not (a branch
-	// could literally be named "unknown", and detached HEAD reports "HEAD").
-	const isGitRepo = git(cwd, ["rev-parse", "--is-inside-work-tree"]) === "true";
+	// 1. Branch + isGitRepo in one call.
+	//    rev-parse --abbrev-ref HEAD --is-inside-work-tree outputs two lines:
+	//      <branch-name>
+	//      true|false
+	//    Fails (exit != 0) when not in a work tree.
+	const revParse = git(cwd, ["rev-parse", "--abbrev-ref", "HEAD", "--is-inside-work-tree"]);
+	const lines = revParse ? revParse.split("\n") : [];
+	const branch = lines[0] ?? "unknown";
+	const isGitRepo = lines[1] === "true";
 
-	// repo = bare name of the git remote (owner/repo.git -> repo), falling back
-	// to the basename of cwd so monorepo work stays disambiguated everywhere.
-	const remoteUrl = git(cwd, ["config", "--get", "remote.origin.url"]);
+	// 2. Commit subject (hash is unused but cheap to fetch alongside).
+	const commitLine = isGitRepo ? git(cwd, ["log", "-1", "--format=%H %s"]) : undefined;
+	const lastCommit = commitLine ? commitLine.split(" ", 2).pop() ?? "unknown" : "unknown";
+
+	// 3. User + remote in one config call.
+	const user = isGitRepo ? git(cwd, ["config", "--get-regexp", "^user\\.name$"]) : undefined;
+	const remoteUrl = isGitRepo ? git(cwd, ["config", "--get-regexp", "^remote\\.origin\\.url$"]) : undefined;
 	const repo = remoteUrl
 		? (remoteUrl.replace(/\.git$/, "").split("/").pop() ?? "unknown")
 		: cwd.split(/[\\/]/).filter(Boolean).pop() ?? "unknown";
+
+	// 4. status --porcelain gives staged + unstaged in one call.
+	//    Lines starting with a space are unstaged; others are staged/untracked.
+	const porcelain = isGitRepo ? git(cwd, ["status", "--porcelain"]) : "";
+	const stagedFiles: string[] = [];
+	const unstagedFiles: string[] = [];
+	const fileSet = new Set<string>();
+	if (porcelain) {
+		for (const line of porcelain.split("\n")) {
+			if (line.length < 2) continue;
+			const file = line.slice(2);
+			if (fileSet.has(file)) continue; // deduplicate
+			fileSet.add(file);
+			if (line[0] === " ") {
+				unstagedFiles.push(file);
+			} else {
+				stagedFiles.push(file);
+			}
+		}
+	}
+
+	// 5. diff --shortstat.
+	const diffStat = isGitRepo ? git(cwd, ["diff", "--shortstat"]) : undefined;
 
 	return {
 		cwd,
 		date: new Date().toLocaleDateString("en-CA"), // local YYYY-MM-DD
 		branch,
 		lastCommit,
-		files: parseStatusPorcelain(git(cwd, ["status", "--porcelain"]) ?? ""),
-		user,
-		diffStat: git(cwd, ["diff", "--shortstat"]) ?? "none",
+		files: parseStatusPorcelain(porcelain ?? ""),
+		user: user ?? "unknown",
+		diffStat: diffStat ?? "none",
 		repo,
-		stagedFiles: splitFileLines(git(cwd, ["diff", "--cached", "--name-only"])),
-		unstagedFiles: splitFileLines(git(cwd, ["diff", "--name-only"])),
+		stagedFiles,
+		unstagedFiles,
 		isGitRepo,
 	};
 }
@@ -292,9 +347,24 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// default true). Refreshed whenever the config is (re)loaded.
 	let reportEnabled = true;
 	// The in-flight chain's report file: its path (absolute + relative for
-	// display) and when the current step's run actually started (agent_start;
-	// null until then and for failed-to-start steps).
-	let chainReport: { path: string; display: string; stepStartedAt: Date | null } | null = null;
+	// display), when the current step's run actually started (agent_start;
+	// null until then and for failed-to-start steps), whether the footer has
+	// been appended, the index of the last step section written (dedupes
+	// retried runs), and whether any step section carried result text (the
+	// file is worth keeping).
+	let chainReport: {
+		path: string;
+		display: string;
+		stepStartedAt: Date | null;
+		/** True once the summary (or abandoned) footer has been appended. */
+		footerWritten: boolean;
+		/** Index of the last step whose section was appended (-1 = none). */
+		lastStepSection: number;
+		/** True once a step section with result text was appended. */
+		hasContent: boolean;
+		/** In-memory section data for inline display (populated in agent_end). */
+		sections: Array<{ name: string; outcome: string; text: string }>;
+	} | null = null;
 
 	/** Status marker glyph (all one column wide) with its color. */
 	function stepMarker(status: ChainStepStatus, theme: Theme): string {
@@ -347,37 +417,131 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Finish the report file: append the summary footer and point the widget
-	 * at the file. Called on every terminal path (complete, stopped, skipped);
-	 * a no-op when no report was created (disabled or write failure).
+	 * Finish the report file: append the summary footer. Called on every
+	 * terminal path (complete, stopped, skipped); a no-op when no report was
+	 * created (disabled or write failure). A run that produced nothing worth
+	 * keeping (no completed step, no result text) leaves no file behind — see
+	 * `reportWorthKeeping`. When the chain completed fully (all steps done),
+	 * removes the status widget so nothing lingers below the prompt; otherwise
+	 * keeps it as a trace with the report path in the note.
 	 */
 	function finishReport(ctx: ExtensionContext): void {
 		if (!chainReport || !chainStatus) return;
+		const statuses = chainStatus.steps.map((s) => s.status);
+		// Nothing worth keeping — remove the (mostly) empty file so a quick
+		// same-minute retry doesn't get a -N sibling next to it.
+		if (!reportWorthKeeping(statuses, chainReport.hasContent)) {
+			closeAbandonedReport(statuses);
+			chainReport = null;
+			return;
+		}
 		try {
-			appendFileSync(
-				chainReport.path,
-				reportFooter(chainStatus.steps.map((s) => s.status), new Date()),
-			);
+			appendFileSync(chainReport.path, reportFooter(statuses, new Date()));
+			chainReport.footerWritten = true;
 		} catch (err) {
 			ctx.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
 		}
 		const prev = chainStatus.note ? `${chainStatus.note} • ` : "";
 		chainStatus.note = `${prev}📄 ${chainReport.display}`;
-		updateChainWidget(ctx);
+		// Chain fully done → show inline report above editor, then clear the
+		// trace widget. Chain stopped early → keep the trace widget.
+		const allDone = statuses.every((s) => s === "completed");
+		if (allDone) {
+			showInlineReport();
+			clearChainWidget(ctx);
+		} else {
+			updateChainWidget(ctx);
+		}
 	}
 
-	/** Remove the widget and forget the status (and any in-flight report). */
+	/**
+	 * Send the full chain report as a markdown message in the chat when a chain
+	 * completes. Built from in-memory section data (no file read needed).
+	 * Auto-cleared on the next agent_start / session_start.
+	 */
+	function showInlineReport(): void {
+		if (!chainReport || !chainStatus || chainReport.sections.length === 0) return;
+		// Reconstruct the full markdown report from in-memory sections.
+		const lines: string[] = [];
+		lines.push(`# do-always chain report — ${new Date().toISOString().slice(0, 10)}`);
+		lines.push("");
+		lines.push(`- Project: ${chainReport.display}`);
+		lines.push(`- Steps: ${chainStatus.steps.map((s) => s.name).join(" → ")}`);
+		lines.push("");
+		for (const sec of chainReport.sections) {
+			const section = reportStepSection(
+				0, // index not meaningful for display
+				sec.name,
+				sec.outcome,
+				new Date(), // approximate start
+				new Date(), // approximate end
+				sec.text,
+			);
+			lines.push(section);
+			lines.push("");
+		}
+		// Footer.
+		const statuses = chainStatus.steps.map((s) => s.status);
+		lines.push(reportFooter(statuses, new Date()));
+
+		// Send as a markdown message in the chat (renders as markdown, not plain text).
+		pi.sendMessage({
+			customType: "do-always-report",
+			content: lines.join("\n"),
+			display: true,
+			details: chainReport.display,
+		});
+	}
+
+	/**
+	 * Close an in-flight report that never reached a terminal path (e.g.,
+	 * the session ended mid-chain): delete the file when the run produced
+	 * nothing worth keeping, otherwise append an "abandoned" footer so it
+	 * does not stay header-only on disk.
+	 */
+	function closeAbandonedReport(statuses: string[]): void {
+		if (!chainReport || chainReport.footerWritten) return;
+		if (!reportWorthKeeping(statuses, chainReport.hasContent)) {
+			// Nothing worth keeping — remove the (mostly) empty file.
+			try {
+				unlinkSync(chainReport.path);
+			} catch {
+				// Best effort — the file stays on disk.
+			}
+			return;
+		}
+		try {
+			appendFileSync(chainReport.path, reportAbandonedFooter(statuses, new Date()));
+		} catch {
+			// Best effort — the report file stays as-is on disk.
+		}
+	}
+
+	/**
+	 * Remove the widget and forget the status (and any in-flight report).
+	 * When the report never reached a terminal path (e.g., the session
+	 * ended mid-chain), it is closed by `closeAbandonedReport`.
+	 */
 	function clearChainWidget(ctx: ExtensionContext): void {
 		if (!chainStatus) return;
+		const statuses = chainStatus.steps.map((s) => s.status);
 		chainStatus = null;
+		closeAbandonedReport(statuses);
 		chainReport = null;
 		if (ctx.mode === "tui") ctx.ui.setWidget(CHAIN_WIDGET_KEY, undefined);
 	}
 
-	/** Render the status widget from `chainStatus` (TUI only). */
+	/**
+	 * Render the status widget from `chainStatus` (TUI only): the chain's
+	 * steps with per-step markers, a (n/N) progress line, and the note,
+	 * below the editor. Refreshed on every step change; removed by
+	 * `clearChainWidget` when the chain completes or a new prompt starts.
+	 */
 	function updateChainWidget(ctx: ExtensionContext): void {
 		if (ctx.mode !== "tui" || !chainStatus) return;
 		const { steps, note } = chainStatus;
+
+		// Chain status widget: stays below the editor.
 		ctx.ui.setWidget(
 			CHAIN_WIDGET_KEY,
 			(tui, theme) => {
@@ -409,6 +573,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		if (lastCtx && chainStatus?.steps[0]?.status === "waiting") {
 			setChainStep(lastCtx, 0, "running", "");
 		}
+		// User entered a new prompt and the old chain is no longer active —
+		// clear the trace widget so nothing lingers below the prompt.
+		if (!chainActive && chainStatus && lastCtx) {
+			clearChainWidget(lastCtx);
+		}
 	});
 	pi.on("agent_end", (event) => {
 		if (!chainWaiter) return;
@@ -421,17 +590,26 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			// fresh (the step's final assistant message is its result).
 			if (chainReport && chainStatus) {
 				const idx = chainWaiter.stepIndex;
+				// A retried/continued run emits a second agent_end for the
+				// same step before agent_settled — mark the repeat so the
+				// report shows both attempts without a duplicate heading.
+				const isRetry = chainReport.lastStepSection === idx;
 				const name = chainStatus.steps[idx]?.name ?? `step ${idx + 1}`;
+				const text = assistantText(lastAssistant.content);
 				const section = reportStepSection(
 					idx,
-					name,
+					isRetry ? `${name} (retry)` : name,
 					outcome,
 					chainReport.stepStartedAt,
 					new Date(),
-					assistantText(lastAssistant.content),
+					text,
 				);
 				try {
 					appendFileSync(chainReport.path, section);
+					chainReport.lastStepSection = idx;
+					if (text.trim() !== "") chainReport.hasContent = true;
+					// Keep in-memory section data for inline display.
+					chainReport.sections.push({ name, outcome, text });
 				} catch (err) {
 					lastCtx?.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
 				}
@@ -552,7 +730,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * are sent immediately; fill tasks put step 1 in the editor and wait for
 	 * its run to settle before starting the remaining steps.
 	 */
-	async function runChain(names: string[], ctx: ExtensionContext): Promise<void> {
+	async function runChain(
+		names: string[],
+		ctx: ExtensionContext,
+		cache: ReturnType<typeof createContextCache>,
+	): Promise<void> {
 		if (chainActive) {
 			ctx.ui.notify("do-always: a chain is already running — wait for it to finish (or abort the current step with Esc)", "info");
 			return;
@@ -565,7 +747,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return;
 		}
 		// Fail fast: report the first blocked step before sending anything.
-		const blocked = validateChain(tasks, { items: names, history: [] }, buildContext(ctx.cwd));
+		const blocked = validateChain(tasks, { items: names, history: [] }, cache.get(ctx.cwd));
 		if (blocked) {
 			ctx.ui.notify(`do-always: chain blocked at step ${blocked.step} (${blocked.task.name}): ${blocked.message}`, "warning");
 			return;
@@ -579,7 +761,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const path = resolveReportPath(ctx.cwd, now);
 			try {
 				writeFileSync(path, reportHeader(ctx.cwd, steps.map((t) => t.name), now));
-				chainReport = { path, display: relative(ctx.cwd, path), stepStartedAt: null };
+				chainReport = {
+					path,
+					display: relative(ctx.cwd, path),
+					stepStartedAt: null,
+					footerWritten: false,
+					lastStepSection: -1,
+					hasContent: false,
+					sections: [],
+				};
 			} catch (err) {
 				ctx.ui.notify(`do-always: could not create the report file: ${err}`, "warning");
 				chainReport = null;
@@ -592,7 +782,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					ctx,
 					steps.map((t, i) => ({ name: t.name, status: i === 0 ? "running" : "pending" })),
 				);
-				await runChainSteps(steps, ctx, 0);
+				await runChainSteps(steps, ctx, 0, cache);
 			} finally {
 				chainActive = false;
 			}
@@ -608,7 +798,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			steps.map((t, i) => ({ name: t.name, status: i === 0 ? "waiting" : "pending" })),
 			"step 1 is in the editor — press Enter to start",
 		);
-		ctx.ui.setEditorText(renderPrompt(first.prompt, toPromptContext(buildContext(ctx.cwd))));
+		ctx.ui.setEditorText(renderPrompt(first.prompt, toPromptContext(cache.get(ctx.cwd))));
 		ctx.ui.notify(
 			`do-always: step 1 of ${steps.length} in the editor — press Enter to run; steps 2–${steps.length} follow automatically`,
 			"info",
@@ -622,7 +812,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					return;
 				}
 				setChainStep(ctx, 0, "completed");
-				await runChainSteps(steps, ctx, 1);
+				await runChainSteps(steps, ctx, 1, cache);
 			} finally {
 				chainActive = false;
 			}
@@ -635,10 +825,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * its run has fully settled; an aborted/errored step (or a send that
 	 * failed to start) stops the chain.
 	 */
-	async function runChainSteps(steps: DoAlwaysTask[], ctx: ExtensionContext, startAt: number): Promise<void> {
+	async function runChainSteps(
+		steps: DoAlwaysTask[],
+		ctx: ExtensionContext,
+		startAt: number,
+		cache: ReturnType<typeof createContextCache>,
+	): Promise<void> {
 		for (let i = startAt; i < steps.length; i++) {
 			const step = steps[i];
-			const context = buildContext(ctx.cwd);
+			const context = cache.get(ctx.cwd);
 			const blocked = evaluateGuards(step, context);
 			if (blocked) {
 				markChainStopped(ctx, i, "skipped", blocked);
@@ -666,12 +861,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			}
 			return;
 		}
-		// Complete: keep the widget as a summary (with the report path when
-		// there is one) until the next session — the report file holds the
-		// full results of every step.
+		// Complete: the report file holds the full results of every step;
+		// finishReport clears the status widget so nothing lingers below
+		// the prompt. Capture the display path first — finishReport clears
+		// `chainReport` when the chain is fully done.
+		const reportDisplay = chainReport?.display;
 		if (chainReport) {
 			finishReport(ctx);
-			ctx.ui.notify(`do-always: chain complete (${steps.length} steps) — report: ${chainReport.display}`, "info");
+			ctx.ui.notify(`do-always: chain complete (${steps.length} steps) — report: ${reportDisplay}`, "info");
 		} else {
 			clearChainWidget(ctx);
 			ctx.ui.notify(`do-always: chain complete (${steps.length} steps)`, "info");
@@ -695,7 +892,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * run (never inside the render loop — no process spawning per frame) and
 	 * shared with `fillPrompt`.
 	 */
-	async function showSelector(ctx: ExtensionContext, context: TaskContext): Promise<void> {
+	async function showSelector(
+		ctx: ExtensionContext,
+		context: TaskContext,
+		cache: ReturnType<typeof createContextCache>,
+	): Promise<void> {
 		// Filter by the `when` condition once per session, so hidden tasks never
 		// appear, are never numbered, and can't be picked.
 		const visibleTasks = tasks.filter((t) => evaluateWhen(t, context));
@@ -781,11 +982,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				const tableRows = buildTableRows(filteredGroups, chain);
 				const bodyRows: TableRow[] = [];
 				const itemRows: { task: DoAlwaysTask; globalIndex: number; order?: number }[] = [];
+				// O(n) index map so indexOf → O(1) lookup.
+				const taskToGlobalIndex = new Map(visibleTasks.map((t, i) => [t, i]));
 				for (const r of tableRows) {
 					if (r.kind === "run") continue; // pinned row, rendered separately
 					bodyRows.push(r);
 					if (r.kind === "task" && r.task) {
-						itemRows.push({ task: r.task, globalIndex: visibleTasks.indexOf(r.task), order: r.order });
+						itemRows.push({ task: r.task, globalIndex: taskToGlobalIndex.get(r.task) ?? -1, order: r.order });
 					}
 				}
 				// Scroll window over the filtered items.
@@ -840,6 +1043,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				return { tier, taskCol, descCol, orderColX };
 			}
 
+			// Cached last buildTable result (avoids double-work on mouse hit-test).
+			// Invalidated whenever chain/filter changes (handledInput calls
+			// requestRender, which re-renders before any subsequent mouse event).
+			let lastTable: ReturnType<typeof buildTable> | null = null;
+
 			// Build the full selector output for a width, plus the line map for
 			// mouse handling (itemLine: line -> task, runLine: the Run row,
 			// orderColX: where the ORDER cell starts, or null in the narrow tier).
@@ -877,6 +1085,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					lines.push(theme.fg("warning", "  No matching tasks"));
 				} else {
 					let itemShown = 0;
+					// O(n) index map so findIndex → O(1) lookup.
+					const idxMap = new Map(itemRows.map((x, i) => [x.task, i]));
 					for (const row of bodyRows) {
 						if (row.kind === "header") {
 							if (!visibleHeaderNames.has(row.name ?? "")) continue;
@@ -887,8 +1097,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							continue;
 						}
 						if (!row.task) continue;
-						const idx = itemRows.findIndex((x) => x.task === row.task);
-						if (idx < 0 || idx < winStart || idx >= winStart + maxVisible) continue;
+						const idx = idxMap.get(row.task);
+						if (idx === undefined || idx < winStart || idx >= winStart + maxVisible) continue;
 						itemShown++;
 						const task = row.task;
 						const auto = shouldAutoRun(task);
@@ -1003,7 +1213,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 			return {
 				render(width: number) {
-					return buildTable(width).lines;
+					lastTable = buildTable(width);
+					return lastTable!.lines;
 				},
 				invalidate() {},
 				handleInput(data: string) {
@@ -1167,7 +1378,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						return { handled: true, render: true };
 					}
 					if (event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
-					const { itemLine, runLine, orderColX } = buildTable(event.width);
+					// Reuse the last render's table for hit-testing (avoids
+				// rebuilding the table twice per mouse event). The table is
+				// always fresh because handleInput calls requestRender before
+				// the next mouse event can arrive.
+				const { itemLine, runLine, orderColX } = lastTable ?? buildTable(event.width);
 					// Pinned Run row: press runs the chain.
 					if (runLine >= 0 && event.y === runLine) {
 						if (event.type === "press" && chain.items.length > 0) {
@@ -1213,7 +1428,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		if (result.kind === "single") {
 			await fillPrompt(result.task, ctx, context);
 		} else {
-			await runChain(result.names, ctx);
+			await runChain(result.names, ctx, cache);
 		}
 	}
 
@@ -1255,14 +1470,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 		// One context per command run: shared by visibility filtering, rendering,
 		// and the completion cache (never inside a render loop).
-		const context = buildContext(ctx.cwd);
+		const cache = createContextCache();
+		const context = cache.get(ctx.cwd);
 		const visible = refreshVisible(ctx.cwd, context);
 
 		const arg = args.trim();
 
 		if (!arg) {
 			if (ctx.mode === "tui") {
-				await showSelector(ctx, context);
+				await showSelector(ctx, context, cache);
 			} else {
 				ctx.ui.notify(`do-always tasks (use /do-always <number|name>):\n${formatList(visible)}`, "info");
 			}
