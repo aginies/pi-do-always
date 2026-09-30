@@ -23,7 +23,7 @@
 	},
 	"homepage": "https://github.com/aginies/pi-do-always",
 	"bugs": {
-		"url": "https://github.com/aginies/pi-do-always/issues"
+		"url": "git+https://github.com/aginies/pi-do-always/issues"
 	},
 	"files": [
 		"extensions/pi-do-always/index.ts",
