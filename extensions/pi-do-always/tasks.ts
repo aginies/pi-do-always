@@ -215,12 +215,16 @@ function formatFileLines(files: string[]): string {
  */
 export function parseStatusPorcelain(status: string): string[] {
 	const files: string[] = [];
+	const seen = new Set<string>();
 	for (const line of status.split("\n")) {
 		if (line.length < 4) continue;
 		const path = line.slice(3);
-		if (path && !files.includes(path)) files.push(path);
+		if (path && !seen.has(path)) {
+			seen.add(path);
+			files.push(path);
+		}
 	}
-	files.sort();
+	files.sort((a, b) => a.localeCompare(b));
 	return files;
 }
 
@@ -606,6 +610,11 @@ function titleCase(s: string): string {
  * `order` (case-insensitive), then alphabetically; the original order within a
  * group is preserved. The group `name` is the title-cased category. Tasks
  * without a (non-empty) category fall under "Other".
+ *
+ * Not memoized: every caller passes a fresh array (selector open, config
+ * load, list), so an identity-keyed cache would never hit — and would go
+ * stale if a caller ever mutated its array in place. The input is small
+ * (a dozen tasks), so recomputing is cheap.
  */
 export function groupTasksByCategory(
 	tasks: DoAlwaysTask[],

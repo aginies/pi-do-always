@@ -352,6 +352,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// been appended, the index of the last step section written (dedupes
 	// retried runs), and whether any step section carried result text (the
 	// file is worth keeping).
+	// Max in-memory sections kept for inline display; the file on disk retains
+	// all steps. Bounded to avoid holding 400KB–2MB of assistant text per chain.
+	const MAX_INLINE_SECTIONS = 3;
+
 	let chainReport: {
 		path: string;
 		display: string;
@@ -362,8 +366,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		lastStepSection: number;
 		/** True once a step section with result text was appended. */
 		hasContent: boolean;
-		/** In-memory section data for inline display (populated in agent_end). */
-		sections: Array<{ name: string; outcome: string; text: string }>;
+		/**
+		 * In-memory section data for inline display (populated in agent_end,
+		 * bounded to the last MAX_INLINE_SECTIONS). `index` is the step's
+		 * position in the chain (retries share it); `name` matches the file.
+		 */
+		sections: Array<{ index: number; name: string; outcome: string; text: string }>;
 	} | null = null;
 
 	/** Status marker glyph (all one column wide) with its color. */
@@ -461,16 +469,24 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 */
 	function showInlineReport(): void {
 		if (!chainReport || !chainStatus || chainReport.sections.length === 0) return;
-		// Reconstruct the full markdown report from in-memory sections.
+		// Reconstruct the report from in-memory sections. Only the last
+		// MAX_INLINE_SECTIONS are kept (the file on disk has all of them), so
+		// flag the omission when a step has no section in the window.
+		const shownSteps = new Set(chainReport.sections.map((s) => s.index));
+		const omitted = chainStatus.steps.length - shownSteps.size;
 		const lines: string[] = [];
 		lines.push(`# do-always chain report — ${new Date().toISOString().slice(0, 10)}`);
 		lines.push("");
 		lines.push(`- Project: ${chainReport.display}`);
 		lines.push(`- Steps: ${chainStatus.steps.map((s) => s.name).join(" → ")}`);
 		lines.push("");
+		if (omitted > 0) {
+			lines.push(`> … ${omitted} earlier step${omitted === 1 ? "" : "s"} omitted — see ${chainReport.display}`);
+			lines.push("");
+		}
 		for (const sec of chainReport.sections) {
 			const section = reportStepSection(
-				0, // index not meaningful for display
+				sec.index,
 				sec.name,
 				sec.outcome,
 				new Date(), // approximate start
@@ -595,10 +611,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				// report shows both attempts without a duplicate heading.
 				const isRetry = chainReport.lastStepSection === idx;
 				const name = chainStatus.steps[idx]?.name ?? `step ${idx + 1}`;
+				const displayName = isRetry ? `${name} (retry)` : name;
 				const text = assistantText(lastAssistant.content);
 				const section = reportStepSection(
 					idx,
-					isRetry ? `${name} (retry)` : name,
+					displayName,
 					outcome,
 					chainReport.stepStartedAt,
 					new Date(),
@@ -608,8 +625,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					appendFileSync(chainReport.path, section);
 					chainReport.lastStepSection = idx;
 					if (text.trim() !== "") chainReport.hasContent = true;
-					// Keep in-memory section data for inline display.
-					chainReport.sections.push({ name, outcome, text });
+					// Keep in-memory section data for inline display (bounded);
+					// index + display name let it number sections like the file.
+					chainReport.sections.push({ index: idx, name: displayName, outcome, text });
+					if (chainReport.sections.length > MAX_INLINE_SECTIONS) {
+						chainReport.sections.splice(0, chainReport.sections.length - MAX_INLINE_SECTIONS);
+					}
 				} catch (err) {
 					lastCtx?.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
 				}
@@ -1044,14 +1065,17 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			}
 
 			// Cached last buildTable result (avoids double-work on mouse hit-test).
-			// Invalidated whenever chain/filter changes (handledInput calls
-			// requestRender, which re-renders before any subsequent mouse event).
-			let lastTable: ReturnType<typeof buildTable> | null = null;
+			// The table depends on cursor and preview state, so render() must
+			// rebuild it on every pass; handleMouse only reuses the last render's
+			// table (or builds one if no render has happened yet, e.g. the very
+			// first mouse event).
+			type Table = { lines: string[]; itemLine: Map<number, DoAlwaysTask>; runLine: number; orderColX: number | null };
+			let lastTable: Table | null = null;
 
 			// Build the full selector output for a width, plus the line map for
 			// mouse handling (itemLine: line -> task, runLine: the Run row,
 			// orderColX: where the ORDER cell starts, or null in the narrow tier).
-			function buildTable(width: number) {
+			function buildTable(width: number): Table {
 				const { bodyRows, itemRows, winStart, visibleHeaderNames } = getVisible();
 				const { tier, taskCol, descCol, orderColX } = tableGeometry(width);
 				const lines: string[] = [];
@@ -1214,7 +1238,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return {
 				render(width: number) {
 					lastTable = buildTable(width);
-					return lastTable!.lines;
+					return lastTable.lines;
 				},
 				invalidate() {},
 				handleInput(data: string) {
@@ -1378,10 +1402,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						return { handled: true, render: true };
 					}
 					if (event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
-					// Reuse the last render's table for hit-testing (avoids
-				// rebuilding the table twice per mouse event). The table is
-				// always fresh because handleInput calls requestRender before
-				// the next mouse event can arrive.
+				// Reuse the last render's table for hit-testing (avoids rebuilding
+				// the table twice per mouse event). The table is always fresh
+				// because handleInput calls requestRender before the next mouse
+				// event can arrive; build one if no render has happened yet.
 				const { itemLine, runLine, orderColX } = lastTable ?? buildTable(event.width);
 					// Pinned Run row: press runs the chain.
 					if (runLine >= 0 && event.y === runLine) {
