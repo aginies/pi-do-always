@@ -36,12 +36,14 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	type KeyId,
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
+	Container,
+	Text,
 	getKeybindings,
 	matchesKey,
 	truncateToWidth,
@@ -202,6 +204,27 @@ const PREVIEW_MAX_LINES = 3;
 /** Outcome of one chain step's run (see sendAndWait). */
 type ChainStepOutcome = "completed" | "aborted" | "error" | "failed-to-start";
 
+/**
+ * Status of one chain step for the below-prompt status widget: pending
+ * (not reached yet), running (its turn is in flight), waiting (fill-first:
+ * step 1 is in the editor, waiting for the user's Enter), completed, or one
+ * of the stop outcomes (failed-to-start/aborted/error/skipped-by-guards).
+ */
+type ChainStepStatus =
+	| "pending"
+	| "running"
+	| "waiting"
+	| "completed"
+	| "failed-to-start"
+	| "aborted"
+	| "error"
+	| "skipped";
+
+interface ChainStepView {
+	name: string;
+	status: ChainStepStatus;
+}
+
 export default function doAlwaysExtension(pi: ExtensionAPI) {
 	let tasks: DoAlwaysTask[] = [];
 	let loadedCwd = ""; // cwd the cached `tasks` were loaded for
@@ -237,6 +260,101 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		chainWaiter = null;
 		if (waiter.timer) clearTimeout(waiter.timer);
 		waiter.resolve(outcome);
+	}
+
+	// Below-prompt status widget while a chain is running: the chain's tasks
+	// with per-step status and a (n/N) progress marker. Shown in TUI mode
+	// only; cleared when the chain completes, kept (as a trace) when it stops
+	// early, and reset on session start.
+	let chainStatus: { steps: ChainStepView[]; note?: string } | null = null;
+	const CHAIN_WIDGET_KEY = "do-always-chain";
+	// True while a chain's runner is in flight (from start to its final
+	// outcome). A second chain started while one is running would interleave
+	// their event waiters (the old chain's sendAndWait would resolve on the
+	// new chain's step), so starting one is refused until the first ends.
+	let chainActive = false;
+
+	/** Status marker glyph (all one column wide) with its color. */
+	function stepMarker(status: ChainStepStatus, theme: Theme): string {
+		switch (status) {
+			case "completed":
+				return theme.fg("success", "✓");
+			case "running":
+				return theme.fg("accent", theme.bold("▶"));
+			case "waiting":
+				return theme.fg("warning", "▶");
+			case "aborted":
+				return theme.fg("warning", "⊘");
+			case "error":
+			case "failed-to-start":
+				return theme.fg("error", "✗");
+			case "skipped":
+				return theme.fg("muted", "–");
+			default:
+				return theme.fg("dim", "○");
+		}
+	}
+
+	/** Replace the chain status and refresh the widget. */
+	function showChainStatus(ctx: ExtensionContext, steps: ChainStepView[], note?: string): void {
+		chainStatus = { steps, note };
+		updateChainWidget(ctx);
+	}
+
+	/** Update one step's status (and optionally the note) and refresh. */
+	function setChainStep(ctx: ExtensionContext, index: number, status: ChainStepStatus, note?: string): void {
+		if (!chainStatus) return;
+		const s = chainStatus.steps[index];
+		if (s) s.status = status;
+		if (note !== undefined) chainStatus.note = note;
+		updateChainWidget(ctx);
+	}
+
+	/**
+	 * Mark the chain as stopped at `index` with `status`, keeping the widget
+	 * visible as a trace of where it stopped.
+	 */
+	function markChainStopped(ctx: ExtensionContext, index: number, status: ChainStepStatus, detail?: string): void {
+		const name = chainStatus?.steps[index]?.name;
+		setChainStep(
+			ctx,
+			index,
+			status,
+			`stopped at step ${index + 1}${name ? ` (${name})` : ""}${detail ? `: ${detail}` : ""}`,
+		);
+	}
+
+	/** Remove the widget and forget the status. */
+	function clearChainWidget(ctx: ExtensionContext): void {
+		if (!chainStatus) return;
+		chainStatus = null;
+		if (ctx.mode === "tui") ctx.ui.setWidget(CHAIN_WIDGET_KEY, undefined);
+	}
+
+	/** Render the status widget from `chainStatus` (TUI only). */
+	function updateChainWidget(ctx: ExtensionContext): void {
+		if (ctx.mode !== "tui" || !chainStatus) return;
+		const { steps, note } = chainStatus;
+		ctx.ui.setWidget(
+			CHAIN_WIDGET_KEY,
+			(tui, theme) => {
+				const lines: string[] = [];
+				// (n/N): the step the chain is currently at (N when it is done).
+				let at = 0;
+				steps.forEach((s, i) => {
+					if (s.status !== "pending") at = i + 1;
+				});
+				lines.push(theme.fg("accent", theme.bold(`⛓ do-always (${at}/${steps.length})`)));
+				for (const s of steps) {
+					lines.push(`  ${stepMarker(s.status, theme)} ${s.name}`);
+				}
+				if (note) lines.push(theme.fg("muted", truncateToWidth(`  ${note}`, tui.terminal.columns - 2, "…")));
+				const container = new Container();
+				for (const line of lines) container.addChild(new Text(line, 1, 0));
+				return container;
+			},
+			{ placement: "belowEditor" },
+		);
 	}
 
 	pi.on("agent_start", () => {
@@ -316,6 +434,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			if (ctx.mode === "tui") ctx.ui.notify(m, "warning");
 			else console.warn(m);
 		};
+		// A failed chain's status widget is a trace of the previous session;
+		// start each session clean.
+		clearChainWidget(ctx);
 		loadedCwd = ctx.cwd;
 		const config = loadConfig(ctx.cwd, onError);
 		tasks = config.tasks;
@@ -358,6 +479,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * its run to settle before starting the remaining steps.
 	 */
 	async function runChain(names: string[], ctx: ExtensionContext): Promise<void> {
+		if (chainActive) {
+			ctx.ui.notify("do-always: a chain is already running — wait for it to finish (or abort the current step with Esc)", "info");
+			return;
+		}
 		const steps = names
 			.map((n) => tasks.find((t) => t.name === n))
 			.filter((t): t is DoAlwaysTask => t !== undefined);
@@ -371,9 +496,18 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`do-always: chain blocked at step ${blocked.step} (${blocked.task.name}): ${blocked.message}`, "warning");
 			return;
 		}
+		chainActive = true;
 		const first = steps[0];
 		if (shouldAutoRun(first) || ctx.mode !== "tui") {
-			await runChainSteps(steps, ctx, 0);
+			try {
+				showChainStatus(
+					ctx,
+					steps.map((t, i) => ({ name: t.name, status: i === 0 ? "running" : "pending" })),
+				);
+				await runChainSteps(steps, ctx, 0);
+			} finally {
+				chainActive = false;
+			}
 			return;
 		}
 		// Fill-first: put step 1 in the editor; the remaining steps start once
@@ -381,17 +515,28 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// takes as long as they need to press Enter. (If the user runs an
 		// unrelated prompt instead, the chain continues after it, as the
 		// notification says.)
+		showChainStatus(
+			ctx,
+			steps.map((t, i) => ({ name: t.name, status: i === 0 ? "waiting" : "pending" })),
+			"step 1 is in the editor — press Enter to start",
+		);
 		ctx.ui.setEditorText(renderPrompt(first.prompt, toPromptContext(buildContext(ctx.cwd))));
 		ctx.ui.notify(
 			`do-always: step 1 of ${steps.length} in the editor — press Enter to run; steps 2–${steps.length} follow automatically`,
 			"info",
 		);
-		void armWaiter().then((outcome) => {
-			if (outcome !== "completed") {
-				ctx.ui.notify(`do-always: step 1 — ${outcome}; chain stopped`, "error");
-				return;
+		void armWaiter().then(async (outcome) => {
+			try {
+				if (outcome !== "completed") {
+					markChainStopped(ctx, 0, outcome);
+					ctx.ui.notify(`do-always: step 1 — ${outcome}; chain stopped`, "error");
+					return;
+				}
+				setChainStep(ctx, 0, "completed");
+				await runChainSteps(steps, ctx, 1);
+			} finally {
+				chainActive = false;
 			}
-			void runChainSteps(steps, ctx, 1);
 		});
 	}
 
@@ -407,26 +552,30 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const context = buildContext(ctx.cwd);
 			const blocked = evaluateGuards(step, context);
 			if (blocked) {
+				markChainStopped(ctx, i, "skipped", blocked);
 				ctx.ui.notify(`do-always: chain stopped at step ${i + 1} (${step.name}): ${blocked}`, "warning");
 				return;
 			}
 			const prompt = renderPrompt(step.prompt, toPromptContext(context));
 			const label = `do-always: step ${i + 1}/${steps.length} — ${step.name}`;
+			setChainStep(ctx, i, "running");
 			ctx.ui.notify(`${label} — starting`, "info");
 			const outcome = await sendAndWait(prompt);
+			if (outcome === "completed") {
+				setChainStep(ctx, i, "completed");
+				continue;
+			}
+			markChainStopped(ctx, i, outcome);
 			if (outcome === "failed-to-start") {
 				ctx.ui.notify(`${label} — failed to start (check model/API key); chain stopped`, "error");
-				return;
-			}
-			if (outcome === "aborted") {
+			} else if (outcome === "aborted") {
 				ctx.ui.notify(`${label} — aborted; chain stopped`, "error");
-				return;
-			}
-			if (outcome === "error") {
+			} else {
 				ctx.ui.notify(`${label} — run errored; chain stopped`, "error");
-				return;
 			}
+			return;
 		}
+		clearChainWidget(ctx);
 		ctx.ui.notify(`do-always: chain complete (${steps.length} steps)`, "info");
 	}
 

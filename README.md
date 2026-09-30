@@ -95,6 +95,25 @@ If the first task of a chain is a fill task (no `⚡`) in the TUI, step 1 is put
 editor and the rest of the chain starts automatically once you press Enter and that run
 finishes.
 
+While a chain is running, a **status widget** is shown below the prompt: the chain's
+tasks with a marker per step and a `(n/N)` progress count — the step the chain is
+currently at.
+
+```
+  ⛓ do-always (2/4)
+  ✓ Review changes
+  ▶ Build
+  ○ Test
+  ○ Deploy
+```
+
+Markers: `✓` completed, `▶` running (or waiting for your Enter on a fill-first step 1),
+`○` pending, `✗` errored / failed to start, `⊘` aborted, `–` skipped because its guards
+no longer hold. The widget is removed when the chain completes; if the chain stops early
+it stays below the prompt as a trace of where it stopped (until the next chain or a new
+session). Starting a second chain while one is running is refused — wait for it to finish
+or abort the current step with Esc.
+
 ## Install
 
 Install it from npm as a Pi package, which loads the bundled `index.ts` (and its `tasks.ts`) without

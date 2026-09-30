@@ -18,6 +18,11 @@ All notable changes to this project will be documented in this file.
   guards are re-evaluated at its turn; a blocked, aborted, or errored step stops
   the chain (steps already run are kept). Fill-first chains (non-⚡ step 1 in the
   TUI) put step 1 in the editor and continue automatically once that run finishes.
+- **Chain status widget**: while a chain is running, a widget below the prompt
+  lists the chain's tasks with per-step markers (✓ completed, ▶ running/waiting,
+  ○ pending, ✗ errored, ⊘ aborted, – skipped) and a `(n/N)` progress count. It is
+  removed when the chain completes and kept as a trace when it stops early; a
+  second chain is refused while one is running.
 
 ### Changed
 
