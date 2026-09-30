@@ -5,14 +5,24 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	CHAIN_MAX,
 	DEFAULT_CATEGORY_ORDER,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
 	MAX_FILES_LISTED,
 	PROMPT_CONTEXT_KEYS,
+	buildTableRows,
+	chainAdd,
+	chainClear,
+	chainMove,
+	chainRemove,
+	chainRunLabel,
+	chainUndo,
 	evaluateGuards,
 	evaluateWhen,
+	formatChainSequence,
 	formatList,
+	landOnOrderColumn,
 	parseGuard,
 	groupTasksByCategory,
 	isValidKeyId,
@@ -27,6 +37,7 @@ import {
 	shouldAutoRun,
 	splitFileLines,
 	toPromptContext,
+	validateChain,
 	type DoAlwaysTask,
 	type PromptContext,
 	type TaskContext,
@@ -929,4 +940,197 @@ test("rendering default prompts with a fallback (non-git) context leaves no plac
 	for (const t of DEFAULT_TASKS) {
 		assert.doesNotMatch(renderPrompt(t.prompt, ctx), /\{\{/, t.name);
 	}
+});
+
+// ---------------------------------------------------------------------------
+// Chains
+// ---------------------------------------------------------------------------
+
+test("chainClear returns an empty chain", () => {
+	assert.deepEqual(chainClear(), { items: [], history: [] });
+});
+
+test("chainAdd appends a new task and records it in the history", () => {
+	const { state, result } = chainAdd(chainClear(), "build");
+	assert.equal(result, "added");
+	assert.deepEqual(state, { items: ["build"], history: ["build"] });
+});
+
+test("chainAdd moves a re-added task to the end", () => {
+	let s = chainClear();
+	s = chainAdd(s, "a").state;
+	s = chainAdd(s, "b").state;
+	const { state, result } = chainAdd(s, "a");
+	assert.equal(result, "movedToEnd");
+	assert.deepEqual(state.items, ["b", "a"]);
+	assert.deepEqual(state.history, ["a", "b", "a"]);
+});
+
+test("chainAdd reports full at CHAIN_MAX and leaves the state unchanged", () => {
+	let s = chainClear();
+	for (let i = 0; i < CHAIN_MAX; i++) s = chainAdd(s, `t${i}`).state;
+	const { state, result } = chainAdd(s, "overflow");
+	assert.equal(result, "full");
+	assert.equal(state, s, "state object is returned unchanged");
+	assert.equal(state.items.length, CHAIN_MAX);
+});
+
+test("chainRemove removes a task and is a no-op for absent names", () => {
+	const s = chainAdd(chainAdd(chainClear(), "a").state, "b").state;
+	assert.deepEqual(chainRemove(s, "a").items, ["b"]);
+	assert.equal(chainRemove(s, "zzz"), s, "absent name returns the same state");
+});
+
+test("chainUndo removes the most recent add still in the chain", () => {
+	let s = chainClear();
+	s = chainAdd(s, "a").state;
+	s = chainAdd(s, "b").state;
+	const { state, removed } = chainUndo(s);
+	assert.equal(removed, "b");
+	assert.deepEqual(state.items, ["a"]);
+	assert.deepEqual(state.history, ["a"]);
+});
+
+test("chainUndo skips names that were already removed", () => {
+	let s = chainClear();
+	s = chainAdd(s, "a").state;
+	s = chainAdd(s, "b").state;
+	s = chainRemove(s, "b");
+	const { state, removed } = chainUndo(s);
+	assert.equal(removed, "a", 'skips the removed "b" and undoes "a"');
+	assert.deepEqual(state.items, []);
+});
+
+test("chainUndo returns null when nothing is left to undo", () => {
+	const s = chainClear();
+	assert.deepEqual(chainUndo(s), { state: s, removed: null });
+});
+
+test("chainMove swaps with the neighbor in the given direction", () => {
+	let s = chainClear();
+	for (const n of ["a", "b", "c"]) s = chainAdd(s, n).state;
+	assert.deepEqual(chainMove(s, "a", 1).items, ["b", "a", "c"]);
+	assert.deepEqual(chainMove(s, "c", -1).items, ["a", "c", "b"]);
+});
+
+test("chainMove is a no-op at the ends and for absent names", () => {
+	let s = chainClear();
+	for (const n of ["a", "b"]) s = chainAdd(s, n).state;
+	assert.equal(chainMove(s, "a", -1), s);
+	assert.equal(chainMove(s, "b", 1), s);
+	assert.equal(chainMove(s, "zzz", 1), s);
+});
+
+test("landOnOrderColumn lands on the same row when it is chained", () => {
+	const rows = sample.concat([{ name: "build", prompt: "p" }]);
+	const chain = chainAdd(chainClear(), "build").state;
+	assert.equal(landOnOrderColumn(rows, chain, 2), 2);
+});
+
+test("landOnOrderColumn finds the nearest chained row upward first", () => {
+	const rows = sample.concat([{ name: "build", prompt: "p" }]);
+	const chain = chainAdd(chainClear(), "build").state; // rows[2]
+	assert.equal(landOnOrderColumn(rows, chain, 1), 2, "row below: nearest is up? no — down is 1 away, up wraps 2 away");
+	// From row 0, the chained row 2 is 2 away down, 1 away up (wrap to row 2).
+	assert.equal(landOnOrderColumn(rows, chain, 0), 2);
+});
+
+test("landOnOrderColumn prefers the closer row when both sides are chained", () => {
+	const rows = [
+		{ name: "a", prompt: "p" },
+		{ name: "b", prompt: "p" },
+		{ name: "c", prompt: "p" },
+		{ name: "d", prompt: "p" },
+		{ name: "e", prompt: "p" },
+	];
+	let chain = chainClear();
+	chain = chainAdd(chain, "a").state;
+	chain = chainAdd(chain, "e").state;
+	// From row 2 (c): a is 2 away (up), e is 2 away (down) — up wins the tie.
+	assert.equal(landOnOrderColumn(rows, chain, 2), 0);
+	// From row 1 (b): a is 1 away up, e is 2 away down.
+	assert.equal(landOnOrderColumn(rows, chain, 1), 0);
+});
+
+test("landOnOrderColumn returns null for an empty chain or rows", () => {
+	assert.equal(landOnOrderColumn(sample, chainClear(), 0), null);
+	assert.equal(landOnOrderColumn([], chainAdd(chainClear(), "a").state, 0), null);
+});
+
+test("landOnOrderColumn returns null when no visible row is chained", () => {
+	const rows = [{ name: "ghost", prompt: "p" }];
+	assert.equal(landOnOrderColumn(rows, chainAdd(chainClear(), "other").state, 0), null);
+});
+
+test("chainRunLabel is a placeholder for zero, singular for one, counted for two", () => {
+	assert.equal(chainRunLabel(0), "run the chain (0)");
+	assert.equal(chainRunLabel(1), "Run the task");
+	assert.equal(chainRunLabel(2), "Run the chain (2)");
+	assert.equal(chainRunLabel(8), "Run the chain (8)");
+});
+
+test("buildTableRows emits headers, ordered task rows and the run row last", () => {
+	const groups = groupTasksByCategory([
+		{ name: "review", category: "Plan", prompt: "p" },
+		{ name: "build", category: "Do", prompt: "p" },
+	]);
+	let chain = chainClear();
+	chain = chainAdd(chain, "build").state;
+	chain = chainAdd(chain, "review").state;
+	const rows = buildTableRows(groups, chain);
+	assert.deepEqual(
+		rows.map((r) => [r.kind, r.name, r.order]),
+		[
+			["header", "Plan", undefined],
+			["task", undefined, 2],
+			["header", "Do", undefined],
+			["task", undefined, 1],
+			["run", "Run the chain (2)", undefined],
+		],
+	);
+	assert.equal(rows[1].task?.name, "review");
+	assert.equal(rows[3].task?.name, "build");
+});
+
+test("buildTableRows omits empty groups and shows the empty-chain run label", () => {
+	const groups = groupTasksByCategory([{ name: "a", category: "Plan", prompt: "p" }]);
+	const rows = buildTableRows(groups, chainClear());
+	assert.deepEqual(rows.map((r) => r.kind), ["header", "task", "run"]);
+	assert.equal(rows[2].name, "run the chain (0)");
+});
+
+test("formatChainSequence numbers tasks and marks auto-run ones", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "review", category: "Plan", prompt: "p" },
+		{ name: "build", prompt: "p" },
+	];
+	let chain = chainClear();
+	chain = chainAdd(chain, "review").state;
+	chain = chainAdd(chain, "build").state;
+	assert.equal(formatChainSequence(tasks, chain), "1.⚡review → 2.build");
+	// Stale names are skipped; numbering follows the chain position.
+	const stale = { items: ["ghost", "build"], history: [] };
+	assert.equal(formatChainSequence(tasks, stale), "2.build");
+});
+
+test("validateChain returns the first failing step with the guard message", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "ok", prompt: "p" },
+		{ name: "dirty", prompt: "p", requireDirty: true },
+		{ name: "also-ok", prompt: "p" },
+	];
+	let chain = chainClear();
+	for (const n of ["ok", "dirty", "also-ok"]) chain = chainAdd(chain, n).state;
+	const failure = validateChain(tasks, chain, cleanCtx);
+	assert.equal(failure?.step, 2);
+	assert.equal(failure?.task.name, "dirty");
+	assert.match(failure!.message, /clean/);
+	assert.equal(validateChain(tasks, chain, dirtyCtx), null, "all guards pass on a dirty tree");
+});
+
+test("validateChain skips stale names and passes an empty chain", () => {
+	const tasks: DoAlwaysTask[] = [{ name: "ok", prompt: "p" }];
+	const stale = { items: ["ghost", "ok"], history: [] };
+	assert.equal(validateChain(tasks, stale, cleanCtx), null);
+	assert.equal(validateChain(tasks, chainClear(), cleanCtx), null);
 });

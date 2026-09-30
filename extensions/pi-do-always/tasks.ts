@@ -789,3 +789,200 @@ export function formatList(tasks: DoAlwaysTask[]): string {
 	}
 	return lines.join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Chains
+//
+// A chain is an ordered, duplicate-free list of tasks the user builds in the
+// selector table (ORDER column) and runs from the pinned Run row. All
+// operations are pure: they return new states, never mutate.
+// ---------------------------------------------------------------------------
+
+/** Maximum number of tasks in a chain. */
+export const CHAIN_MAX = 8;
+
+/**
+ * A task chain: ordered task names plus a LIFO history of adds (for undo).
+ * Pure state — every operation returns a new state.
+ */
+export interface ChainState {
+	/** Task names in execution order (duplicate-free). */
+	items: string[];
+	/** LIFO history of added names, consumed by `chainUndo`. */
+	history: string[];
+}
+
+/** An empty chain. */
+export function chainClear(): ChainState {
+	return { items: [], history: [] };
+}
+
+/**
+ * Add a task to the chain. A name already in the chain is moved to the end
+ * (`movedToEnd`); when the chain is at CHAIN_MAX the state is returned
+ * unchanged (`full`).
+ */
+export function chainAdd(
+	state: ChainState,
+	name: string,
+): { state: ChainState; result: "added" | "movedToEnd" | "full" } {
+	if (state.items.includes(name)) {
+		return {
+			state: {
+				items: [...state.items.filter((n) => n !== name), name],
+				history: [...state.history, name],
+			},
+			result: "movedToEnd",
+		};
+	}
+	if (state.items.length >= CHAIN_MAX) {
+		return { state, result: "full" };
+	}
+	return {
+		state: { items: [...state.items, name], history: [...state.history, name] },
+		result: "added",
+	};
+}
+
+/** Remove a task from the chain (no-op when absent). History is untouched. */
+export function chainRemove(state: ChainState, name: string): ChainState {
+	if (!state.items.includes(name)) return state;
+	return { ...state, items: state.items.filter((n) => n !== name) };
+}
+
+/**
+ * Undo the most recent add that is still in the chain, skipping names that
+ * were removed in the meantime. Returns `removed: null` when there is
+ * nothing left to undo.
+ */
+export function chainUndo(state: ChainState): { state: ChainState; removed: string | null } {
+	for (let i = state.history.length - 1; i >= 0; i--) {
+		const name = state.history[i];
+		if (state.items.includes(name)) {
+			return {
+				state: {
+					items: state.items.filter((n) => n !== name),
+					history: state.history.slice(0, i),
+				},
+				removed: name,
+			};
+		}
+	}
+	return { state, removed: null };
+}
+
+/**
+ * Move a task one position up (-1) or down (1) in the chain. No-op at the
+ * ends or when the name is not in the chain.
+ */
+export function chainMove(state: ChainState, name: string, dir: -1 | 1): ChainState {
+	const idx = state.items.indexOf(name);
+	const target = idx + dir;
+	if (idx < 0 || target < 0 || target >= state.items.length) return state;
+	const items = [...state.items];
+	items[idx] = items[target];
+	items[target] = name;
+	return { ...state, items };
+}
+
+/**
+ * Where the cursor lands when pressing → from task row `fromRow`: the ORDER
+ * cell of the nearest chained row — the same row when it is chained, else the
+ * nearest chained row upward, then downward (wrapping). Null when the chain
+ * is empty (or when no visible row is chained, e.g. a stale chain).
+ */
+export function landOnOrderColumn(
+	rows: DoAlwaysTask[],
+	chain: ChainState,
+	fromRow: number,
+): number | null {
+	if (chain.items.length === 0 || rows.length === 0) return null;
+	const isChained = (i: number): boolean => chain.items.includes(rows[i]?.name ?? "");
+	if (isChained(fromRow)) return fromRow;
+	const n = rows.length;
+	for (let d = 1; d < n; d++) {
+		if (isChained((fromRow - d + n) % n)) return (fromRow - d + n) % n;
+		if (isChained((fromRow + d) % n)) return (fromRow + d) % n;
+	}
+	return null;
+}
+
+/**
+ * Label for the pinned Run row: a dimmed placeholder for an empty chain,
+ * singular for one task, plural with the count otherwise.
+ */
+export function chainRunLabel(count: number): string {
+	if (count === 0) return "run the chain (0)";
+	if (count === 1) return "Run the task";
+	return `Run the chain (${count})`;
+}
+
+/** One row of the task table (see `buildTableRows`). */
+export interface TableRow {
+	kind: "header" | "task" | "run";
+	/** Header text (kind=header) or the run label (kind=run). */
+	name?: string;
+	/** The task (kind=task). */
+	task?: DoAlwaysTask;
+	/** 1-based chain position (kind=task, only when the task is chained). */
+	order?: number;
+}
+
+/**
+ * Build the table rows: a header row per non-empty category, a task row per
+ * task carrying its ORDER position, and the pinned Run row last (label from
+ * `chainRunLabel`).
+ */
+export function buildTableRows(groups: TaskGroup[], chain: ChainState): TableRow[] {
+	const rows: TableRow[] = [];
+	for (const g of groups) {
+		if (g.items.length === 0) continue;
+		rows.push({ kind: "header", name: g.name });
+		for (const t of g.items) {
+			const pos = chain.items.indexOf(t.name);
+			rows.push({
+				kind: "task",
+				task: t,
+				...(pos >= 0 ? { order: pos + 1 } : {}),
+			});
+		}
+	}
+	rows.push({ kind: "run", name: chainRunLabel(chain.items.length) });
+	return rows;
+}
+
+/**
+ * Footer preview of the chain: "1.⚡ Review changes → 2.Build". Tasks are
+ * looked up in `tasks`; unknown names (a stale chain) are skipped.
+ */
+export function formatChainSequence(tasks: DoAlwaysTask[], chain: ChainState): string {
+	const parts = chain.items
+		.map((name, i) => {
+			const t = tasks.find((x) => x.name === name);
+			if (!t) return null;
+			const marker = shouldAutoRun(t) ? "⚡" : "";
+			return `${i + 1}.${marker}${t.name}`;
+		})
+		.filter((p): p is string => p !== null);
+	return parts.join(" → ");
+}
+
+/**
+ * Validate a chain against the context: every task must pass its guards.
+ * Returns the first failing step (1-based) with the guard message, or null
+ * when the whole chain may run. Stale names (not found in `tasks`) are
+ * skipped — the runner drops them.
+ */
+export function validateChain(
+	tasks: DoAlwaysTask[],
+	chain: ChainState,
+	ctx: TaskContext,
+): { step: number; task: DoAlwaysTask; message: string } | null {
+	for (let i = 0; i < chain.items.length; i++) {
+		const task = tasks.find((t) => t.name === chain.items[i]);
+		if (!task) continue;
+		const message = evaluateGuards(task, ctx);
+		if (message) return { step: i + 1, task, message };
+	}
+	return null;
+}
