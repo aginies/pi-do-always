@@ -798,11 +798,18 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const task = row.task;
 						const auto = shouldAutoRun(task);
 						const focused = cursor.kind === "cell" && cursor.row === idx;
-						// The ▸ in the ORDER cell marks the ORDER column specifically;
-						// the full-row background marks the row in either column.
+						// Cursor markers: ▸ in the left gutter = TASK column, ▸ in the
+						// ORDER cell = ORDER column. The row background is applied too,
+						// but some themes map selectedBg to a color that is nearly
+						// indistinguishable from the terminal background, so the
+						// character marker is the reliable indicator.
+						const inTaskCol =
+							cursor.kind === "cell" && cursor.row === idx && cursor.col === "task";
 						const inOrderCol =
 							cursor.kind === "cell" && cursor.row === idx && cursor.col === "order";
-						const num = `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
+						const num = inTaskCol
+							? `▸ ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
+							: `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
 						// ⚡ is 2 columns wide, so "⚡ " takes 3 — reserve it so
 						// auto-run rows align with the others (ORDER cell is
 						// hit-tested at a fixed x).
@@ -827,9 +834,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						} else {
 							line = truncateToWidth(`${num}  ${taskCell}`, width - 2, "…");
 						}
-						// The cursor is a full-row background highlight so it is
-						// visible at a glance; the ▸ in the ORDER cell marks the
-						// column.
+						// Full-row background + bold where the theme makes it visible;
+						// the ▸ gutter/cell marker carries the cursor either way.
 						if (focused) line = theme.bg("selectedBg", theme.bold(line));
 						lines.push(line);
 						itemLine.set(lines.length - 1, task);
