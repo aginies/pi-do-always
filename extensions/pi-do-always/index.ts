@@ -43,18 +43,28 @@ import {
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
 	getKeybindings,
+	matchesKey,
 	truncateToWidth,
-	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import {
+	CHAIN_MAX,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
+	buildTableRows,
+	chainAdd,
+	chainClear,
+	chainMove,
+	chainRemove,
+	chainRunLabel,
+	chainUndo,
 	evaluateGuards,
 	evaluateWhen,
+	formatChainSequence,
 	formatList,
 	groupTasksByCategory,
 	isValidKeyId,
+	landOnOrderColumn,
 	mergeTasks,
 	parseConfig,
 	parseStatusPorcelain,
@@ -65,10 +75,26 @@ import {
 	shouldAutoRun,
 	splitFileLines,
 	toPromptContext,
+	validateChain,
 	type DoAlwaysTask,
 	type TaskContext,
-	type TaskGroup,
+	type TableRow,
 } from "./tasks";
+
+/**
+ * What the selector resolved to: a single task (the classic pick), a chain to
+ * run, or a cancel.
+ */
+type SelectorResult =
+	| { kind: "single"; task: DoAlwaysTask }
+	| { kind: "chain"; names: string[] }
+	| { kind: "cancel" };
+
+/**
+ * Selector cursor: a cell in the task table (TASK or ORDER column) or the
+ * pinned Run row.
+ */
+type Cursor = { kind: "cell"; row: number; col: "task" | "order" } | { kind: "run" };
 
 /**
  * Load tasks and the selector shortcut from config files.
@@ -165,11 +191,6 @@ function buildContext(cwd: string): TaskContext {
 	};
 }
 
-/** Find the group (among `groups`) that contains a task. */
-function findGroupOf(task: DoAlwaysTask, groups: TaskGroup[]): TaskGroup | undefined {
-	return groups.find((g) => g.items.includes(task));
-}
-
 /** True for a single printable ASCII character (used for filter typing). */
 function isPrintable(data: string): boolean {
 	return data.length === 1 && data >= " " && data <= "~";
@@ -180,6 +201,9 @@ const PREVIEW_DELAY_MS = 2000;
 /** Max lines of the prompt shown in the selector preview. */
 const PREVIEW_MAX_LINES = 3;
 
+/** Outcome of one chain step's run (see sendAndWait). */
+type ChainStepOutcome = "completed" | "aborted" | "error" | "failed-to-start";
+
 export default function doAlwaysExtension(pi: ExtensionAPI) {
 	let tasks: DoAlwaysTask[] = [];
 	let loadedCwd = ""; // cwd the cached `tasks` were loaded for
@@ -188,6 +212,78 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// `/do-always <n>` do. When stale (or absent), completions fall back to
 	// the full list rather than guessing.
 	let visibleCache: { cwd: string; visible: DoAlwaysTask[] } | null = null;
+
+	// Chain control: `pi.sendUserMessage` is fire-and-forget (returns void),
+	// so the chain runner sequences steps on session events:
+	//   agent_start   — the run actually began. A send that fails before the
+	//                   run starts (no API key, compaction collision) never
+	//                   emits agent events and its error is swallowed by the
+	//                   runtime; the grace timer in sendAndWait turns that
+	//                   into "failed-to-start".
+	//   agent_end     — carries the run's messages; the last assistant
+	//                   message's stopReason gives completed/aborted/error.
+	//   agent_settled — the session is fully idle (the busy flag is cleared
+	//                   before this fires), so the next step can be sent
+	//                   safely; auto-retry, compaction, and queued
+	//                   continuations have all had their chance.
+	let chainWaiter: {
+		started: boolean;
+		outcome: "completed" | "aborted" | "error" | null;
+		timer: NodeJS.Timeout | null;
+		resolve: (outcome: ChainStepOutcome) => void;
+	} | null = null;
+
+	function settleChainWaiter(outcome: ChainStepOutcome) {
+		if (!chainWaiter) return;
+		const waiter = chainWaiter;
+		chainWaiter = null;
+		if (waiter.timer) clearTimeout(waiter.timer);
+		waiter.resolve(outcome);
+	}
+
+	pi.on("agent_start", () => {
+		if (chainWaiter) chainWaiter.started = true;
+	});
+	pi.on("agent_end", (event) => {
+		if (!chainWaiter) return;
+		const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
+		if (lastAssistant) {
+			const stopReason = lastAssistant.stopReason;
+			chainWaiter.outcome = stopReason === "aborted" ? "aborted" : stopReason === "error" ? "error" : "completed";
+		}
+	});
+	pi.on("agent_settled", () => {
+		if (!chainWaiter) return;
+		settleChainWaiter(chainWaiter.started ? (chainWaiter.outcome ?? "completed") : "failed-to-start");
+	});
+
+	/**
+	 * Arm the chain waiter and resolve when the next run has fully settled
+	 * (agent_settled), reporting that run's outcome. With `graceMs`, resolves
+	 * "failed-to-start" if no agent_start arrives in time — a send that
+	 * throws before the run begins emits no agent events and its error is
+	 * swallowed by the runtime.
+	 */
+	function armWaiter(graceMs?: number): Promise<ChainStepOutcome> {
+		return new Promise((resolve) => {
+			const timer = graceMs
+				? setTimeout(() => {
+						if (chainWaiter && !chainWaiter.started) settleChainWaiter("failed-to-start");
+					}, graceMs)
+				: null;
+			chainWaiter = { started: false, outcome: null, timer, resolve };
+		});
+	}
+
+	/**
+	 * Send a prompt and resolve when the run it starts has fully settled,
+	 * reporting the run's outcome (see armWaiter).
+	 */
+	function sendAndWait(prompt: string, graceMs = 10_000): Promise<ChainStepOutcome> {
+		const done = armWaiter(graceMs);
+		pi.sendUserMessage(prompt);
+		return done;
+	}
 
 	/** Filter tasks by their `when` condition and refresh the completion cache. */
 	function refreshVisible(cwd: string, context: TaskContext): DoAlwaysTask[] {
@@ -240,7 +336,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// user saw is exactly what gets injected.
 		const prompt = renderPrompt(task.prompt, toPromptContext(context));
 		if (shouldAutoRun(task)) {
-			await pi.sendUserMessage(prompt);
+			// Fire-and-forget: sendUserMessage returns void; the run proceeds
+			// independently (see the chain control notes for why).
+			pi.sendUserMessage(prompt);
 			ctx.ui.notify(`do-always: auto-ran "${task.name}"`, "info");
 			return;
 		}
@@ -248,15 +346,107 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			ctx.ui.setEditorText(prompt);
 			ctx.ui.notify(`do-always: prompt for "${task.name}" filled — press Enter to run`, "info");
 		} else {
-			await pi.sendUserMessage(prompt);
+			pi.sendUserMessage(prompt);
 		}
 	}
 
 	/**
-	 * Numbered selector with categorized sections. Press 1-9 to pick by global
-	 * number, type to filter, or navigate with arrows + Enter, Esc to cancel.
-	 * The context is built once per command run (never inside the render loop
-	 * — no process spawning per frame) and shared with `fillPrompt`.
+	 * Run a chain: each step is sent as its own turn, awaited in order, so the
+	 * steps run strictly one after another. Aborting (or erroring) a step
+	 * stops the chain.
+	 *
+	 * Step 1 follows the task's autoRun semantics: ⚡ tasks (and non-TUI modes)
+	 * are sent immediately; fill tasks put step 1 in the editor and wait for
+	 * its run to settle before starting the remaining steps.
+	 */
+	async function runChain(names: string[], ctx: ExtensionContext): Promise<void> {
+		const steps = names
+			.map((n) => tasks.find((t) => t.name === n))
+			.filter((t): t is DoAlwaysTask => t !== undefined);
+		if (steps.length === 0) {
+			ctx.ui.notify("do-always: nothing to run", "info");
+			return;
+		}
+		// Fail fast: report the first blocked step before sending anything.
+		const blocked = validateChain(tasks, { items: names, history: [] }, buildContext(ctx.cwd));
+		if (blocked) {
+			ctx.ui.notify(`do-always: chain blocked at step ${blocked.step} (${blocked.task.name}): ${blocked.message}`, "warning");
+			return;
+		}
+		const first = steps[0];
+		if (shouldAutoRun(first) || ctx.mode !== "tui") {
+			await runChainSteps(steps, ctx, 0);
+			return;
+		}
+		// Fill-first: put step 1 in the editor; the remaining steps start once
+		// step 1's run has settled successfully. No grace timer — the user
+		// takes as long as they need to press Enter. (If the user runs an
+		// unrelated prompt instead, the chain continues after it, as the
+		// notification says.)
+		ctx.ui.setEditorText(renderPrompt(first.prompt, toPromptContext(buildContext(ctx.cwd))));
+		ctx.ui.notify(
+			`do-always: step 1 of ${steps.length} in the editor — press Enter to run; steps 2–${steps.length} follow automatically`,
+			"info",
+		);
+		void armWaiter().then((outcome) => {
+			if (outcome !== "completed") {
+				ctx.ui.notify(`do-always: step 1 — ${outcome}; chain stopped`, "error");
+				return;
+			}
+			void runChainSteps(steps, ctx, 1);
+		});
+	}
+
+	/**
+	 * Send chain steps `startAt..end` sequentially. Each step gets a fresh
+	 * context (so its guards see the tree as it is now) and is awaited until
+	 * its run has fully settled; an aborted/errored step (or a send that
+	 * failed to start) stops the chain.
+	 */
+	async function runChainSteps(steps: DoAlwaysTask[], ctx: ExtensionContext, startAt: number): Promise<void> {
+		for (let i = startAt; i < steps.length; i++) {
+			const step = steps[i];
+			const context = buildContext(ctx.cwd);
+			const blocked = evaluateGuards(step, context);
+			if (blocked) {
+				ctx.ui.notify(`do-always: chain stopped at step ${i + 1} (${step.name}): ${blocked}`, "warning");
+				return;
+			}
+			const prompt = renderPrompt(step.prompt, toPromptContext(context));
+			const label = `do-always: step ${i + 1}/${steps.length} — ${step.name}`;
+			ctx.ui.notify(`${label} — starting`, "info");
+			const outcome = await sendAndWait(prompt);
+			if (outcome === "failed-to-start") {
+				ctx.ui.notify(`${label} — failed to start (check model/API key); chain stopped`, "error");
+				return;
+			}
+			if (outcome === "aborted") {
+				ctx.ui.notify(`${label} — aborted; chain stopped`, "error");
+				return;
+			}
+			if (outcome === "error") {
+				ctx.ui.notify(`${label} — run errored; chain stopped`, "error");
+				return;
+			}
+		}
+		ctx.ui.notify(`do-always: chain complete (${steps.length} steps)`, "info");
+	}
+
+	/**
+	 * Task table with an ORDER column (the chain) and a pinned Run row:
+	 *
+	 *   #  TASK                  DESCRIPTION              ORDER
+	 * ▸ 1  ⚡ Review changes      Review the current       [1]
+	 *   2  Build                 Build the project          ·
+	 *   ─────────────────────────────────────────────────────
+	 *   ▶ Run the chain (1)
+	 *
+	 * Enter is the universal confirm: on a task row it adds the task to the
+	 * chain, on an ORDER cell it removes it, on the Run row it runs the chain.
+	 * ←/→ switch columns, 1-9 still runs a task immediately (closing the
+	 * selector, discarding the chain). The context is built once per command
+	 * run (never inside the render loop — no process spawning per frame) and
+	 * shared with `fillPrompt`.
 	 */
 	async function showSelector(ctx: ExtensionContext, context: TaskContext): Promise<void> {
 		// Filter by the `when` condition once per session, so hidden tasks never
@@ -264,7 +454,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		const visibleTasks = tasks.filter((t) => evaluateWhen(t, context));
 		// String view for prompt rendering (derived once, used by the preview).
 		const strings = toPromptContext(context);
-		const selected = await ctx.ui.custom<number | null>((tui, theme, _kb, done) => {
+		const result = await ctx.ui.custom<SelectorResult>((tui, theme, _kb, done) => {
 			let settled = false;
 			let previewVisible = false;
 			let previewTimer: ReturnType<typeof setTimeout> | null = null;
@@ -276,16 +466,28 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			// `finish` receives the chosen task (or null) and translates it to the
-			// full index `tasks[selected]` expects. Reference-based, so it stays
-			// correct while a text filter is active (itemRows is then a subset of
-			// visibleTasks and positional indices would point at the wrong task).
-			const finish = (task: DoAlwaysTask | null) => {
+			// Finish the selector with a result. Reference-based (task object /
+			// chain names), so it stays correct while a text filter is active
+			// (itemRows is then a subset of visibleTasks and positional indices
+			// would point at the wrong task).
+			function finishSingle(task: DoAlwaysTask) {
 				if (settled) return;
 				settled = true;
 				clearPreviewTimer();
-				done(task ? tasks.indexOf(task) : null);
-			};
+				done({ kind: "single", task });
+			}
+			function finishChain(names: string[]) {
+				if (settled) return;
+				settled = true;
+				clearPreviewTimer();
+				done({ kind: "chain", names });
+			}
+			function finishCancel() {
+				if (settled) return;
+				settled = true;
+				clearPreviewTimer();
+				done({ kind: "cancel" });
+			}
 
 			// The prompt preview appears only after the selection has been stable
 			// for PREVIEW_DELAY_MS; any change hides it and restarts the delay.
@@ -307,7 +509,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const kb = getKeybindings();
 			const maxVisible = 12;
 			let filter = "";
-			let selectedIndex = 0;
+			let chain = chainClear();
+			let cursor: Cursor = { kind: "cell", row: 0, col: "task" };
+			let lastCellRow = 0;
 			let mousePressedIndex: number | null = null;
 
 			// Arm the preview timer for the initial selection.
@@ -323,92 +527,171 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				);
 			};
 
-			// Recompute the visible (filtered, grouped) rows on every render so
-			// filter typing updates the list live.
+			// Recompute the visible (filtered) table rows on every render so
+			// filter typing and chain edits update the table live.
 			function getVisible() {
-				const visibleGroups = groups
-					.map((g) => ({ name: g.name, items: g.items.filter(matchesFilter) }))
-					.filter((g) => g.items.length > 0);
-				const rows: Array<
-					| { kind: "header"; name: string }
-					| { kind: "item"; task: DoAlwaysTask; group: string }
-				> = [];
-				for (const g of visibleGroups) {
-					rows.push({ kind: "header", name: g.name });
-					for (const t of g.items) rows.push({ kind: "item", task: t, group: g.name });
+				const filteredGroups = groups.map((g) => ({ name: g.name, items: g.items.filter(matchesFilter) }));
+				const tableRows = buildTableRows(filteredGroups, chain);
+				const bodyRows: TableRow[] = [];
+				const itemRows: { task: DoAlwaysTask; globalIndex: number; order?: number }[] = [];
+				for (const r of tableRows) {
+					if (r.kind === "run") continue; // pinned row, rendered separately
+					bodyRows.push(r);
+					if (r.kind === "task" && r.task) {
+						itemRows.push({ task: r.task, globalIndex: visibleTasks.indexOf(r.task), order: r.order });
+					}
 				}
-				const itemRows = rows.filter((r): r is (typeof rows)[number] & { kind: "item" } => r.kind === "item");
-				// Clamp selection to the visible item count.
-				selectedIndex = Math.max(0, Math.min(selectedIndex, Math.max(0, itemRows.length - 1)));
-				// Visible item window with scrolling.
-				const winStart = Math.max(0, Math.min(selectedIndex - Math.floor(maxVisible / 2), Math.max(0, itemRows.length - maxVisible)));
-				const visibleItemKeys = new Set(itemRows.slice(winStart, winStart + maxVisible).map((r) => r.task));
-				const visibleHeaderNames = new Set([...visibleItemKeys].map((t) => findGroupOf(t, visibleGroups)?.name ?? ""));
-				return { rows, itemRows, visibleItemKeys, visibleHeaderNames };
+				// Scroll window over the filtered items.
+				const anchor = cursor.kind === "cell" ? cursor.row : lastCellRow;
+				const winStart =
+					itemRows.length > maxVisible
+						? Math.max(0, Math.min(anchor + 1 - maxVisible, itemRows.length - maxVisible))
+						: 0;
+				// Headers whose group has at least one item in the window.
+				const inWindow = new Set(itemRows.slice(winStart, winStart + maxVisible).map((r) => r.task));
+				const visibleHeaderNames = new Set(
+					filteredGroups.filter((g) => g.items.some((t) => inWindow.has(t))).map((g) => g.name),
+				);
+				return { bodyRows, itemRows, winStart, visibleHeaderNames };
 			}
 
-			const labelCol = 26;
-
-			function renderLabel(task: DoAlwaysTask, globalIndex: number, isSelected: boolean, width: number): string {
-				const prefix = isSelected ? "▸ " : "  ";
-				const marker = shouldAutoRun(task) ? "⚡ " : "";
-				const label = `${prefix}${globalIndex + 1}. ${marker}${task.name}`;
-				if (!task.description) {
-					const line = truncateToWidth(label, Math.max(1, width - 2), "");
-					return isSelected ? theme.fg("accent", theme.bold(line)) : line;
+			// Keep the cursor valid after the rows or the chain change.
+			function clampCursor() {
+				const { itemRows } = getVisible();
+				if (itemRows.length === 0) {
+					cursor = { kind: "cell", row: 0, col: "task" };
+					return;
 				}
-				// Width-aware two-column layout; fall back to label-only when the
-				// terminal is too narrow to fit a description column.
-				const effCol = Math.max(1, Math.min(labelCol, width - 8));
-				const nameOnly = truncateToWidth(label, effCol, "");
-				const pad = " ".repeat(Math.max(1, effCol - visibleWidth(nameOnly)));
-				const remaining = width - visibleWidth(nameOnly) - pad.length - 2;
-				if (remaining < 10) {
-					const line = truncateToWidth(label, Math.max(1, width - 2), "");
-					return isSelected ? theme.fg("accent", theme.bold(line)) : line;
+				if (cursor.kind === "cell") {
+					if (cursor.row >= itemRows.length) {
+						cursor = { kind: "cell", row: itemRows.length - 1, col: "task" };
+					} else if (cursor.col === "order" && !chain.items.includes(itemRows[cursor.row].task.name)) {
+						// The row is no longer chained — fall back to the TASK column.
+						cursor = { kind: "cell", row: cursor.row, col: "task" };
+					}
 				}
-				const desc = truncateToWidth(task.description, remaining, "");
-				if (isSelected) {
-					return theme.fg("accent", theme.bold(`${nameOnly}${pad}${desc}`));
-				}
-				return `${nameOnly}${pad}${theme.fg("muted", desc)}`;
 			}
 
-			// Build the full selector output for a width, plus a map from line
-			// index to task for the item rows (used by mouse handling).
-			function buildRender(width: number) {
-				const { rows, itemRows, visibleItemKeys, visibleHeaderNames } = getVisible();
+			// --- Table geometry ---------------------------------------------------
+			// Three tiers by width:
+			//   >= 76:   # TASK DESCRIPTION ORDER
+			//   58-75:   # TASK ORDER
+			//   < 58:    # TASK   (chain shown on its own line below the list)
+			const ORDER_COL_W = 5;
+			const TASK_COL_W = 24;
+			type Tier = "full" | "compact" | "narrow";
+			function tierFor(width: number): Tier {
+				if (width >= 76) return "full";
+				if (width >= 58) return "compact";
+				return "narrow";
+			}
+			// Column geometry: [2] # [3]  [taskCol]  [descCol]  [ORDER_COL_W] [1]
+			function tableGeometry(width: number) {
+				const tier = tierFor(width);
+				const taskCol = tier === "full" ? TASK_COL_W : Math.max(10, width - 2 - 3 - 2 - 2 - ORDER_COL_W - 1);
+				const descCol = tier === "full" ? Math.max(8, width - 2 - 3 - 2 - TASK_COL_W - 2 - 2 - ORDER_COL_W - 1) : 0;
+				// The ORDER cell is the last ORDER_COL_W characters of the line
+				// (the line is width-2 chars wide), so it starts at width-2-W.
+				const orderColX = tier === "narrow" ? null : width - 2 - ORDER_COL_W;
+				return { tier, taskCol, descCol, orderColX };
+			}
+
+			// Build the full selector output for a width, plus the line map for
+			// mouse handling (itemLine: line -> task, runLine: the Run row,
+			// orderColX: where the ORDER cell starts, or null in the narrow tier).
+			function buildTable(width: number) {
+				const { bodyRows, itemRows, winStart, visibleHeaderNames } = getVisible();
+				const { tier, taskCol, descCol, orderColX } = tableGeometry(width);
 				const lines: string[] = [];
 				const itemLine = new Map<number, DoAlwaysTask>();
-				lines.push(theme.fg("accent", theme.bold("  do-always — pick a task")));
-				lines.push("");
+				let runLine = -1;
+
+				// Header.
+				lines.push(
+					theme.fg(
+						"muted",
+						truncateToWidth(
+							// The 6-char prefix ("   #  ") lines the header up with
+							// the body rows (2-digit number + 2 spaces).
+							tier === "full"
+								? `   #  ${"TASK".padEnd(taskCol)}  ${"DESCRIPTION".padEnd(descCol)}  ${"ORDER".padEnd(ORDER_COL_W)}`
+								: tier === "compact"
+									? `   #  ${"TASK".padEnd(taskCol)}  ${"ORDER".padEnd(ORDER_COL_W)}`
+									: "   #  TASK",
+							width - 2,
+							"",
+						),
+					),
+				);
+
 				if (itemRows.length === 0) {
 					lines.push(theme.fg("warning", "  No matching tasks"));
 				} else {
-					for (const row of rows) {
+					let itemShown = 0;
+					for (const row of bodyRows) {
 						if (row.kind === "header") {
-							if (!visibleHeaderNames.has(row.name)) continue;
-							lines.push(theme.fg("accent", theme.bold(`  ${row.name.toUpperCase()}`)));
+							if (!visibleHeaderNames.has(row.name ?? "")) continue;
+							if (itemShown >= maxVisible) break;
+							lines.push(
+								theme.fg("accent", theme.bold(truncateToWidth(`  ${(row.name ?? "").toUpperCase()}`, width - 2, ""))),
+							);
 							continue;
 						}
-						if (!visibleItemKeys.has(row.task)) continue;
-						const globalIndex = visibleTasks.indexOf(row.task);
-						const isSelected = row.task === itemRows[selectedIndex].task;
-						lines.push(renderLabel(row.task, globalIndex, isSelected, width));
-						itemLine.set(lines.length - 1, row.task);
+						if (!row.task) continue;
+						const idx = itemRows.findIndex((x) => x.task === row.task);
+						if (idx < 0 || idx < winStart || idx >= winStart + maxVisible) continue;
+						itemShown++;
+						const task = row.task;
+						const auto = shouldAutoRun(task);
+						const focused = cursor.kind === "cell" && cursor.row === idx;
+						const num = `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
+						// ⚡ is 2 columns wide, so "⚡ " takes 3 — reserve it so
+						// auto-run rows align with the others (ORDER cell is
+						// hit-tested at a fixed x).
+						const name = truncateToWidth(task.name, taskCol - (auto ? 3 : 0), "…", true);
+						const taskCell = (auto ? "⚡ " : "") + name;
+						// Every ORDER cell is exactly ORDER_COL_W wide so the column
+						// stays aligned (and mouse hit-testing stays exact).
+						const orderCell =
+							row.order !== undefined
+								? focused
+									? truncateToWidth(`▸[${row.order}]`, ORDER_COL_W, "", true)
+									: ` [${row.order}] `
+								: focused
+									? "▸  · "
+									: "  ·  ";
+						let line: string;
+						if (tier === "full") {
+							const desc = truncateToWidth(task.description ?? "", descCol, "…", true);
+							line = `${num}  ${taskCell}  ${desc}  ${orderCell}`;
+						} else if (tier === "compact") {
+							line = `${num}  ${taskCell}  ${orderCell}`;
+						} else {
+							line = truncateToWidth(`${num}  ${taskCell}`, width - 2, "…");
+						}
+						if (focused) line = theme.fg("accent", theme.bold(line));
+						lines.push(line);
+						itemLine.set(lines.length - 1, task);
 					}
 					if (itemRows.length > maxVisible) {
-						const hint = `  (${selectedIndex + 1}/${itemRows.length})`;
-						lines.push(theme.fg("dim", truncateToWidth(hint, width - 2, "")));
+						const anchor = cursor.kind === "cell" ? cursor.row : lastCellRow;
+						lines.push(theme.fg("dim", truncateToWidth(`  (${anchor + 1}/${itemRows.length})`, width - 2, "")));
+					}
+					// Narrow tier: the chain gets its own line instead of a column.
+					if (tier === "narrow" && chain.items.length > 0) {
+						lines.push(
+							theme.fg("dim", truncateToWidth(`  chain: ${formatChainSequence(visibleTasks, chain)}`, width - 2, "…")),
+						);
 					}
 				}
-				// Prompt preview: revealed after the selection has been stable for
-				// PREVIEW_DELAY_MS, showing exactly what will be injected.
-				if (previewVisible) {
-					const sel = itemRows[selectedIndex];
+
+				// Prompt preview: revealed after the cursor has been stable on a
+				// task row for PREVIEW_DELAY_MS, showing exactly what will be
+				// injected.
+				if (previewVisible && cursor.kind === "cell" && cursor.col === "task") {
+					const sel = itemRows[cursor.row];
 					if (sel) {
 						const wrapWidth = Math.max(10, width - 4);
-						// Show the rendered prompt — exactly what will be injected.
 						const wrapped = wrapTextWithAnsi(renderPrompt(sel.task.prompt, strings), wrapWidth);
 						const shown = wrapped.slice(0, PREVIEW_MAX_LINES);
 						const truncated = wrapped.length > PREVIEW_MAX_LINES;
@@ -421,60 +704,186 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						});
 					}
 				}
+
+				// Pinned Run row (always visible, outside the scroll window).
 				lines.push("");
-				const anyAutoRun = itemRows.some((r) => shouldAutoRun(r.task));
-				const footer = anyAutoRun
-					? "  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel  •  ⚡ auto-runs"
-					: "  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel";
+				lines.push(theme.fg("dim", "  " + "─".repeat(Math.max(1, width - 4))));
+				const runLabel = chainRunLabel(chain.items.length);
+				runLine = lines.length;
+				if (cursor.kind === "run") {
+					lines.push(theme.fg("accent", theme.bold(`▸ ▶ ${runLabel}`)));
+				} else if (chain.items.length === 0) {
+					lines.push(theme.fg("dim", `  ▶ ${runLabel}`));
+				} else {
+					lines.push(theme.fg("accent", `  ▶ ${runLabel}`));
+				}
+
+				// Context-sensitive footer.
+				let footer: string;
+				if (cursor.kind === "run") {
+					footer =
+						chain.items.length > 0
+							? `  ⏎ run: ${formatChainSequence(visibleTasks, chain)}`
+							: "  ⏎ run the chain (chain is empty)";
+				} else if (cursor.col === "order") {
+					footer = "  ← tasks  •  ↑↓ move  •  ⏎ remove  •  esc";
+				} else {
+					footer = "  1-9 run now  •  ⏎ add to chain  •  → order  •  ⌫ undo  •  esc";
+				}
+				if (chain.items.length > 0 && cursor.kind !== "run") footer += "  •  ctrl+u clear";
 				lines.push(theme.fg("dim", truncateToWidth(footer, width - 2, "")));
-				return { lines, itemLine, itemRows };
+
+				return { lines, itemLine, runLine, orderColX };
 			}
 
 			return {
 				render(width: number) {
-					return buildRender(width).lines;
+					return buildTable(width).lines;
 				},
 				invalidate() {},
 				handleInput(data: string) {
-					// Direct pick by number (1-9) — only when not filtering, and within
-					// the visible set, so digits pick a visible task by its number.
+					// Direct pick by number (1-9) — runs the task immediately (the
+					// classic fast path), closing the selector and discarding the
+					// chain. Only when not filtering, and within the visible set,
+					// so digits pick a visible task by its number.
 					if (!filter && /^[1-9]$/.test(data) && Number(data) <= visibleTasks.length) {
-						finish(visibleTasks[Number(data) - 1]);
+						finishSingle(visibleTasks[Number(data) - 1]);
 						return;
 					}
-					// Filter typing.
+					// Filter typing (Backspace edits the filter; with an empty
+					// filter it undoes the last chain add).
 					if (kb.matches(data, "tui.editor.deleteCharBackward")) {
-						filter = filter.slice(0, -1);
-						selectedIndex = 0;
+						if (filter.length > 0) {
+							filter = filter.slice(0, -1);
+							clampCursor();
+						} else {
+							const { state, removed } = chainUndo(chain);
+							if (removed) {
+								chain = state;
+								clampCursor();
+							}
+						}
 						resetPreview();
 						tui.requestRender();
 						return;
 					}
 					if (isPrintable(data)) {
 						filter += data;
-						selectedIndex = 0;
+						clampCursor();
 						resetPreview();
 						tui.requestRender();
 						return;
 					}
-					// Navigation / confirmation.
 					const { itemRows } = getVisible();
+					if (itemRows.length === 0) {
+						// Nothing to navigate; only Esc is useful here.
+						if (kb.matches(data, "tui.select.cancel")) finishCancel();
+						return;
+					}
+					// Column switching.
+					if (matchesKey(data, "left")) {
+						if (cursor.kind === "run") {
+							cursor = { kind: "cell", row: itemRows.length - 1, col: "task" };
+						} else if (cursor.col === "order") {
+							cursor = { kind: "cell", row: cursor.row, col: "task" };
+						}
+						lastCellRow = cursor.kind === "cell" ? cursor.row : lastCellRow;
+						resetPreview();
+						tui.requestRender();
+						return;
+					}
+					if (matchesKey(data, "right")) {
+						if (cursor.kind !== "run" && cursor.col === "task") {
+							const land = landOnOrderColumn(itemRows.map((r) => r.task), chain, cursor.row);
+							if (land === null) {
+								ctx.ui.notify(
+									chain.items.length === 0
+										? "do-always: chain is empty — add a task first"
+										: "do-always: no chained task is visible",
+									"info",
+								);
+							} else {
+								cursor = { kind: "cell", row: land, col: "order" };
+							}
+						}
+						// (→ in the ORDER column and on the Run row is a no-op:
+						// the cursor is already at the right/bottom edge.)
+						lastCellRow = cursor.kind === "cell" ? cursor.row : lastCellRow;
+						resetPreview();
+						tui.requestRender();
+						return;
+					}
+					// Row navigation.
 					if (kb.matches(data, "tui.select.up")) {
-						selectedIndex = selectedIndex === 0 ? itemRows.length - 1 : selectedIndex - 1;
+						if (cursor.kind === "run") {
+							cursor = { kind: "cell", row: itemRows.length - 1, col: "task" };
+						} else if (cursor.col === "task") {
+							cursor = { kind: "cell", row: cursor.row === 0 ? itemRows.length - 1 : cursor.row - 1, col: "task" };
+						} else {
+							// ORDER column: move the task within the chain.
+							const name = itemRows[cursor.row]?.task.name;
+							if (name) chain = chainMove(chain, name, -1);
+						}
+						lastCellRow = cursor.kind === "cell" ? cursor.row : lastCellRow;
 						resetPreview();
 						tui.requestRender();
+						return;
 					}
-					else if (kb.matches(data, "tui.select.down")) {
-						selectedIndex = selectedIndex === itemRows.length - 1 ? 0 : selectedIndex + 1;
+					if (kb.matches(data, "tui.select.down")) {
+						if (cursor.kind === "run") {
+							cursor = { kind: "cell", row: 0, col: "task" };
+						} else if (cursor.col === "task") {
+							cursor = { kind: "cell", row: cursor.row === itemRows.length - 1 ? 0 : cursor.row + 1, col: "task" };
+						} else {
+							const name = itemRows[cursor.row]?.task.name;
+							if (name) chain = chainMove(chain, name, 1);
+						}
+						lastCellRow = cursor.kind === "cell" ? cursor.row : lastCellRow;
 						resetPreview();
 						tui.requestRender();
+						return;
 					}
-					else if (kb.matches(data, "tui.select.confirm")) {
-						const chosen = itemRows[selectedIndex];
-						if (chosen) finish(chosen.task);
+					// Confirm: context-dependent.
+					if (kb.matches(data, "tui.select.confirm")) {
+						if (cursor.kind === "run") {
+							if (chain.items.length === 0) {
+								ctx.ui.notify("do-always: chain is empty — add a task first", "info");
+							} else {
+								finishChain([...chain.items]);
+							}
+							return;
+						}
+						const row = itemRows[cursor.row];
+						if (!row) return;
+						if (cursor.col === "task") {
+							const { state, result } = chainAdd(chain, row.task.name);
+							chain = state;
+							if (result === "movedToEnd") {
+								ctx.ui.notify(`do-always: moved "${row.task.name}" to the end of the chain`, "info");
+							} else if (result === "full") {
+								ctx.ui.notify(`do-always: chain is full (${CHAIN_MAX}) — remove a task first`, "error");
+							}
+						} else {
+							chain = chainRemove(chain, row.task.name);
+							if (chain.items.length === 0) cursor = { kind: "cell", row: cursor.row, col: "task" };
+						}
+						lastCellRow = cursor.kind === "cell" ? cursor.row : lastCellRow;
+						resetPreview();
+						tui.requestRender();
+						return;
 					}
-					else if (kb.matches(data, "tui.select.cancel")) {
-						finish(null);
+					// Clear the chain.
+					if (matchesKey(data, "ctrl+u")) {
+						if (chain.items.length > 0) {
+							chain = chainClear();
+							clampCursor();
+							resetPreview();
+							tui.requestRender();
+						}
+						return;
+					}
+					if (kb.matches(data, "tui.select.cancel")) {
+						finishCancel();
 					}
 				},
 				handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
@@ -482,21 +891,44 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const { itemRows } = getVisible();
 						if (itemRows.length === 0) return undefined;
 						const delta = event.wheelDelta < 0 ? -1 : 1;
-						const prev = selectedIndex;
-						selectedIndex = Math.max(0, Math.min(itemRows.length - 1, selectedIndex + delta));
-						if (selectedIndex !== prev) resetPreview();
-						return { handled: true, render: selectedIndex !== prev };
+						const prev = cursor.kind === "cell" ? cursor.row : lastCellRow;
+						const next = Math.max(0, Math.min(itemRows.length - 1, prev + delta));
+						if (next === prev) return { handled: true };
+						cursor = { kind: "cell", row: next, col: "task" };
+						lastCellRow = next;
+						resetPreview();
+						return { handled: true, render: true };
 					}
 					if (event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
-					const { itemLine, itemRows } = buildRender(event.width);
+					const { itemLine, runLine, orderColX } = buildTable(event.width);
+					// Pinned Run row: press runs the chain.
+					if (runLine >= 0 && event.y === runLine) {
+						if (event.type === "press" && chain.items.length > 0) {
+							finishChain([...chain.items]);
+						}
+						return { handled: true };
+					}
 					const task = itemLine.get(event.y);
 					if (!task) return undefined;
+					const { itemRows } = getVisible();
 					const idx = itemRows.findIndex((r) => r.task === task);
 					if (idx < 0) return undefined;
+					// ORDER cell: press toggles chain membership.
+					if (orderColX !== null && event.x >= orderColX) {
+						if (event.type === "press") {
+							chain = chain.items.includes(task.name) ? chainRemove(chain, task.name) : chainAdd(chain, task.name).state;
+							clampCursor();
+							resetPreview();
+							return { handled: true, render: true };
+						}
+						return { handled: true }; // swallow the click after the press action
+					}
+					// Task area: press selects, click runs (the classic fast path).
 					if (event.type === "press") {
 						mousePressedIndex = idx;
-						if (selectedIndex !== idx) {
-							selectedIndex = idx;
+						if (cursor.kind !== "cell" || cursor.row !== idx) {
+							cursor = { kind: "cell", row: idx, col: "task" };
+							lastCellRow = idx;
 							resetPreview();
 						}
 						return { handled: true, focus: true, render: true };
@@ -504,14 +936,18 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					const clicked = mousePressedIndex ?? idx;
 					mousePressedIndex = null;
 					const chosen = itemRows[clicked];
-					if (chosen) finish(chosen.task);
+					if (chosen) finishSingle(chosen.task);
 					return { handled: true };
 				},
 			};
 		});
 
-		if (selected === null || selected === undefined) return;
-		await fillPrompt(tasks[selected], ctx, context);
+		if (!result || result.kind === "cancel") return;
+		if (result.kind === "single") {
+			await fillPrompt(result.task, ctx, context);
+		} else {
+			await runChain(result.names, ctx);
+		}
 	}
 
 	pi.registerCommand("do-always", {
