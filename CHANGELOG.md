@@ -2,7 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.9.0] - 2026-09-29
+## [0.10.0] - 2026-09-29
+
+### Added
+
+- **Task chains**: the selector is now a task table with an `ORDER` column and a
+  pinned `▶ Run the chain (n)` row. Enter on a task row adds it to the chain,
+  Enter on an `[n]` marker removes it, and Enter (or a click) on the Run row runs
+  the chain. ←/→ switch columns, ↑/↓ in the ORDER column reorder the chain,
+  Backspace (no filter) undoes the last add, ctrl+u clears, and clicking an ORDER
+  cell toggles membership. Chains are capped at 8 tasks; on narrow terminals the
+  ORDER column is dropped in favor of a chain line below the list.
+- **Chain execution**: steps run strictly sequentially — each step is its own turn
+  and the next starts only after the previous run has fully settled. Each step's
+  guards are re-evaluated at its turn; a blocked, aborted, or errored step stops
+  the chain (steps already run are kept). Fill-first chains (non-⚡ step 1 in the
+  TUI) put step 1 in the editor and continue automatically once that run finishes.
+
+### Changed
+
+- The selector's Enter key is now context-dependent: on a task row it adds to the
+  chain (instead of immediately filling the prompt). Running a single task
+  immediately is still one action away via 1-9 or a click, so no workflow gets
+  slower; filling a single task's prompt is done by adding it to the chain and
+  running it, or by picking it with 1-9/click and letting the classic fill path
+  apply. All existing config fields, commands, and the shortcut are unchanged.
 
 ### Changed
 

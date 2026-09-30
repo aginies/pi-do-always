@@ -59,6 +59,39 @@ not filled): the `Plan` category does this by default, and any task can opt in o
 In non-interactive modes (no TUI) there is no editor to fill, so the selected prompt is sent
 as a user message instead.
 
+## Chains
+
+Run several tasks in a row as a **chain**. The selector shows an `ORDER` column; tasks in
+the chain get a `[n]` marker in execution order, and a pinned row at the bottom of the
+list runs the chain.
+
+Building a chain in the selector:
+
+- **Enter on a task row** adds it to the chain (adding it again moves it to the end).
+- **Enter on an `[n]` marker** removes the task from the chain.
+- **← / →** switch between the task column and the ORDER column (→ lands on the nearest
+  chained task). **↑ / ↓ while in the ORDER column** move the task earlier/later in the chain.
+- **Enter on the `▶ Run the chain (n)` row** — or a mouse click on it — runs the chain.
+  The row is dimmed while the chain is empty.
+- **Backspace** (with no filter typed) undoes the last add; **ctrl+u** clears the whole
+  chain; **Esc** cancels and discards it.
+- Clicking an ORDER cell toggles the task's chain membership.
+- The classic fast paths are unchanged: **1-9** runs a task immediately, and clicking a
+  task row runs it — both close the selector and discard the chain.
+
+Chains are capped at 8 tasks. On narrow terminals the ORDER column is dropped and the
+chain is shown on its own line below the list (keyboard chaining still works).
+
+Running a chain sends each step as its own turn, strictly one after another — the next
+step starts only after the previous run has fully finished. Each step's guards are
+re-evaluated at its turn against the current state; a step whose guards no longer hold
+stops the chain there (with a warning), as do an aborted step (Esc) or a step that
+errors. Steps already run are kept.
+
+If the first task of a chain is a fill task (no `⚡`) in the TUI, step 1 is put in the
+editor and the rest of the chain starts automatically once you press Enter and that run
+finishes.
+
 ## Install
 
 Install it from npm as a Pi package, which loads the bundled `index.ts` (and its `tasks.ts`) without
