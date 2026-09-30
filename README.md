@@ -11,26 +11,23 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
 ```text
   do-always — pick a task
 
+   #  TASK                      DESCRIPTION                                                    ORDER
   PLAN
-► 1. ⚡ Review changes       Review the current code changes (Plan)
-  2. ⚡ Review code          Review the whole project's code quality (Plan)
-  3. ⚡ Cleanup              Clean up dead code and duplicates (Plan)
-  4. ⚡ Security             Security audit (Plan)
-  5. ⚡ Performance          Performance review (Plan)
-  6. ⚡ Propose features     Propose new features (Plan)
+   1  ⚡ Review changes         Review the current code changes (Plan)                           ·  
+   2  ⚡ Review code            Review the whole project's code quality (Plan)                  [1] 
+   3  ⚡ Cleanup                Clean up dead code and duplicates (Plan)                        [2] 
+   4  ⚡ Security               Security audit (Plan)                                            ·  
+   5  ⚡ Performance            Performance review (Plan)                                      ►[3] 
+   6  ⚡ Propose features       Propose new features (Plan)                                      ·  
   DO
-  7. Build                  Test build is ok and fix issues
-  8. Tests                  Run tests and fix failures
+   7  Build                     Test build is ok and fix issues                                  ·  
+   8  Tests                     Run tests and fix failures                                       ·  
   DOCS
-  9. Readme                 Update the README.md
-  OPS
- 10. Release               Prepare a release (version, changelog, tag)
- 11. Commit                Prepare a clean commit
+   9  Readme                    Update the README.md                                             ·  
 
-  Review changes — prompt:
-  Review the changes on branch fix/login-null (3 changed files: auth.ts, login.ts,
-  test/auth.test.ts). Last commit: Fix null check in login. Check `git status` and
-  `git diff` to see what changed, then double-check the changes for bugs, edge …
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+  Run the chain (3)
+  ← tasks  •  ⏎ remove  •  esc  •  ctrl+u clear
 
   1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel  •  ⚡ auto-runs
 ```
