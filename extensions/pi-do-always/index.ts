@@ -50,41 +50,51 @@ import {
 import {
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
+	evaluateGuards,
+	evaluateWhen,
 	formatList,
 	groupTasksByCategory,
 	isValidKeyId,
 	mergeTasks,
 	parseConfig,
+	parseStatusPorcelain,
 	orderTasksByCategory,
 	renderPrompt,
-	evaluateGuards,
-	evaluateWhen,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
+	splitFileLines,
+	toPromptContext,
 	type DoAlwaysTask,
-	type PromptContext,
+	type TaskContext,
 	type TaskGroup,
 } from "./tasks";
 
 /**
  * Load tasks and the selector shortcut from config files.
- * Project-local tasks override global tasks with the same name; new ones are appended.
- * Falls back to DEFAULT_TASKS when nothing is defined.
+ * Project-local tasks override global tasks with the same name (or are
+ * appended, per the `merge` field); new ones are appended. Falls back to
+ * DEFAULT_TASKS when nothing is defined.
+ *
+ * Validation problems (malformed JSON, invalid tasks/shortcut/merge/when/
+ * guards) are reported through `onError` — callers must wire it up, since
+ * the default is a silent no-op.
  */
-function loadConfig(cwd: string): {
+function loadConfig(
+	cwd: string,
+	onError: (message: string) => void = () => {},
+): {
 	tasks: DoAlwaysTask[];
 	shortcut: string | null;
-	merge: "append" | "override";
 } {
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
 
 	const global = existsSync(globalPath)
-		? parseConfig(readFileSync(globalPath, "utf-8"), globalPath)
+		? parseConfig(readFileSync(globalPath, "utf-8"), globalPath, onError)
 		: { tasks: [], shortcut: undefined, merge: undefined };
 	const project = existsSync(projectPath)
-		? parseConfig(readFileSync(projectPath, "utf-8"), projectPath)
+		? parseConfig(readFileSync(projectPath, "utf-8"), projectPath, onError)
 		: { tasks: [], shortcut: undefined, merge: undefined };
 
 	// The project file's merge mode wins; otherwise the global value; otherwise
@@ -96,7 +106,6 @@ function loadConfig(cwd: string): {
 		// `/do-always <n>`, and `list` all share one consistent order.
 		tasks: orderTasksByCategory(mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS, mode)),
 		shortcut: resolveShortcut(global.shortcut, project.shortcut),
-		merge: mode,
 	};
 }
 
@@ -120,19 +129,19 @@ function git(cwd: string, args: string[]): string | undefined {
 	}
 }
 
-/** Max number of file paths listed in `files_changed` (the count stays exact). */
-const MAX_FILES_LISTED = 20;
-
 /**
- * Build the prompt context for `renderPrompt`. Always contains every
- * PROMPT_CONTEXT_KEYS entry: git facts fall back to neutral values when
- * unavailable (non-git dir, no git, empty repo) so default prompts read
- * cleanly in any directory.
+ * Build the structured context for the current directory. Git facts fall back
+ * to neutral values when unavailable (non-git dir, no git, empty repo) so
+ * default prompts read cleanly in any directory. The string view for
+ * `renderPrompt` is derived with `toPromptContext`.
  */
-function buildContext(cwd: string): PromptContext {
+function buildContext(cwd: string): TaskContext {
 	const branch = git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]) ?? "unknown";
 	const lastCommit = git(cwd, ["log", "-1", "--format=%s"]) ?? "unknown";
 	const user = git(cwd, ["config", "user.name"]) ?? "unknown";
+	// Authoritative working-tree check — the branch sentinel is not (a branch
+	// could literally be named "unknown", and detached HEAD reports "HEAD").
+	const isGitRepo = git(cwd, ["rev-parse", "--is-inside-work-tree"]) === "true";
 
 	// repo = bare name of the git remote (owner/repo.git -> repo), falling back
 	// to the basename of cwd so monorepo work stays disambiguated everywhere.
@@ -141,38 +150,18 @@ function buildContext(cwd: string): PromptContext {
 		? (remoteUrl.replace(/\.git$/, "").split("/").pop() ?? "unknown")
 		: cwd.split(/[\\/]/).filter(Boolean).pop() ?? "unknown";
 
-	const files: string[] = [];
-	const status = git(cwd, ["status", "--porcelain"]);
-	if (status) {
-		for (const line of status.split("\n")) {
-			// Porcelain v1 lines are "XY <path>" (X = index, Y = worktree).
-			if (line.length < 4) continue;
-			const path = line.slice(3);
-			if (path && !files.includes(path)) files.push(path);
-		}
-		files.sort();
-	}
-	let listed: string;
-	if (files.length === 0) {
-		listed = "none";
-	} else if (files.length > MAX_FILES_LISTED) {
-		listed = [...files.slice(0, MAX_FILES_LISTED), `… (+${files.length - MAX_FILES_LISTED} more)`].join(", ");
-	} else {
-		listed = files.join(", ");
-	}
-
 	return {
 		cwd,
 		date: new Date().toLocaleDateString("en-CA"), // local YYYY-MM-DD
 		branch,
-		last_commit: lastCommit,
-		files_changed: listed,
-		files_changed_count: String(files.length),
+		lastCommit,
+		files: parseStatusPorcelain(git(cwd, ["status", "--porcelain"]) ?? ""),
 		user,
-		diff_stat: git(cwd, ["diff", "--shortstat"]) ?? "none",
+		diffStat: git(cwd, ["diff", "--shortstat"]) ?? "none",
 		repo,
-		staged_files: git(cwd, ["diff", "--cached", "--name-only"]) ?? "none",
-		unstaged_files: git(cwd, ["diff", "--name-only"]) ?? "none",
+		stagedFiles: splitFileLines(git(cwd, ["diff", "--cached", "--name-only"])),
+		unstagedFiles: splitFileLines(git(cwd, ["diff", "--name-only"])),
+		isGitRepo,
 	};
 }
 
@@ -194,23 +183,62 @@ const PREVIEW_MAX_LINES = 3;
 export default function doAlwaysExtension(pi: ExtensionAPI) {
 	let tasks: DoAlwaysTask[] = [];
 	let loadedCwd = ""; // cwd the cached `tasks` were loaded for
+	// The visible (when-filtered) list for the last context we built, so
+	// argument completions number tasks the same way the selector and
+	// `/do-always <n>` do. When stale (or absent), completions fall back to
+	// the full list rather than guessing.
+	let visibleCache: { cwd: string; visible: DoAlwaysTask[] } | null = null;
 
-	pi.on("session_start", async (_event, ctx) => {
+	/** Filter tasks by their `when` condition and refresh the completion cache. */
+	function refreshVisible(cwd: string, context: TaskContext): DoAlwaysTask[] {
+		const visible = tasks.filter((t) => evaluateWhen(t, context));
+		visibleCache = { cwd, visible };
+		return visible;
+	}
+
+	/**
+	 * Register the selector shortcut from a resolved config value (null
+	 * disables it). Called from session_start so it reads the session's cwd,
+	 * not the process cwd; re-registering the same key is idempotent.
+	 */
+	function registerShortcut(shortcut: string | null, onError: (message: string) => void): void {
+		if (shortcut === null) return;
+		const shortcutKey = isValidKeyId(shortcut) ? shortcut : DEFAULT_SHORTCUT;
+		if (shortcutKey !== shortcut) {
+			onError(`do-always: invalid shortcut "${shortcut}" in do-always.json — using ${DEFAULT_SHORTCUT}`);
+		}
+		pi.registerShortcut(shortcutKey as KeyId, {
+			description: "do-always: pick a common task",
+			handler: async (ctx) => {
+				await runDoAlways("", ctx);
+			},
+		});
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		// Surface config validation problems (the README promises warnings);
+		// in non-TUI modes there is no UI, so fall back to the console.
+		const onError = (m: string) => {
+			if (ctx.mode === "tui") ctx.ui.notify(m, "warning");
+			else console.warn(m);
+		};
 		loadedCwd = ctx.cwd;
-		tasks = loadConfig(ctx.cwd).tasks;
+		const config = loadConfig(ctx.cwd, onError);
+		tasks = config.tasks;
+		refreshVisible(ctx.cwd, buildContext(ctx.cwd));
+		registerShortcut(config.shortcut, onError);
 	});
 
 	/** Put the task prompt into the editor (TUI) or send it as a user message (other modes). */
-	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext): Promise<void> {
-		// Render the prompt with the current context (branch, changed files, …)
-		// so the injected text matches this directory at this moment.
-		const context = buildContext(ctx.cwd);
+	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext, context: TaskContext): Promise<void> {
 		const blocked = evaluateGuards(task, context);
 		if (blocked) {
 			ctx.ui.notify(`do-always: ${blocked}`, "info");
 			return;
 		}
-		const prompt = renderPrompt(task.prompt, context);
+		// Render with the same context the selector/preview used, so what the
+		// user saw is exactly what gets injected.
+		const prompt = renderPrompt(task.prompt, toPromptContext(context));
 		if (shouldAutoRun(task)) {
 			await pi.sendUserMessage(prompt);
 			ctx.ui.notify(`do-always: auto-ran "${task.name}"`, "info");
@@ -227,15 +255,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	/**
 	 * Numbered selector with categorized sections. Press 1-9 to pick by global
 	 * number, type to filter, or navigate with arrows + Enter, Esc to cancel.
+	 * The context is built once per command run (never inside the render loop
+	 * — no process spawning per frame) and shared with `fillPrompt`.
 	 */
-	async function showSelector(ctx: ExtensionContext): Promise<void> {
-		// Build the context once per selector session (never inside the render
-		// loop — no process spawning per frame). fillPrompt re-renders at
-		// selection time, so a few seconds of drift is acceptable.
-		const context = buildContext(ctx.cwd);
+	async function showSelector(ctx: ExtensionContext, context: TaskContext): Promise<void> {
 		// Filter by the `when` condition once per session, so hidden tasks never
 		// appear, are never numbered, and can't be picked.
 		const visibleTasks = tasks.filter((t) => evaluateWhen(t, context));
+		// String view for prompt rendering (derived once, used by the preview).
+		const strings = toPromptContext(context);
 		const selected = await ctx.ui.custom<number | null>((tui, theme, _kb, done) => {
 			let settled = false;
 			let previewVisible = false;
@@ -381,7 +409,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					if (sel) {
 						const wrapWidth = Math.max(10, width - 4);
 						// Show the rendered prompt — exactly what will be injected.
-						const wrapped = wrapTextWithAnsi(renderPrompt(sel.task.prompt, context), wrapWidth);
+						const wrapped = wrapTextWithAnsi(renderPrompt(sel.task.prompt, strings), wrapWidth);
 						const shown = wrapped.slice(0, PREVIEW_MAX_LINES);
 						const truncated = wrapped.length > PREVIEW_MAX_LINES;
 						lines.push("");
@@ -483,17 +511,22 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		});
 
 		if (selected === null || selected === undefined) return;
-		await fillPrompt(tasks[selected], ctx);
+		await fillPrompt(tasks[selected], ctx, context);
 	}
 
 	pi.registerCommand("do-always", {
 		description: "Pick a common task (review, readme, ...) by number — fills the prompt",
 		getArgumentCompletions: (prefix) => {
 			const p = prefix.trim().toLowerCase();
+			// Number tasks by position in the VISIBLE (when-filtered) list — the
+			// same list the selector and `/do-always <n>` use. The cache is
+			// refreshed on session start and every command run; when it is
+			// stale, fall back to the full list rather than guessing.
+			const visible = visibleCache?.cwd === loadedCwd ? visibleCache.visible : tasks;
 			const matches = [
 				{ value: "list", label: "list" },
 				{ value: "list-details", label: "list-details" },
-				...tasks.map((t, i) => ({ value: t.name, label: `${i + 1}. ${t.name}` })),
+				...visible.map((t, i) => ({ value: t.name, label: `${i + 1}. ${t.name}` })),
 			].filter((c) => c.value.toLowerCase().includes(p));
 			return matches.length > 0 ? matches : null;
 		},
@@ -502,48 +535,35 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Keyboard shortcut: open the task selector without typing the command.
-	// The key is configurable via the "shortcut" field in do-always.json
-	// (null disables it). It is read once at extension load, so changing it
-	// requires a reload or a new session.
-	const configuredShortcut = loadConfig(process.cwd()).shortcut;
-	if (configuredShortcut !== null) {
-		const shortcutKey = isValidKeyId(configuredShortcut) ? configuredShortcut : DEFAULT_SHORTCUT;
-		if (shortcutKey !== configuredShortcut) {
-			console.warn(`do-always: invalid shortcut "${configuredShortcut}" in do-always.json — using ${DEFAULT_SHORTCUT}`);
-		}
-		pi.registerShortcut(shortcutKey as KeyId, {
-			description: "do-always: pick a common task",
-			handler: async (ctx) => {
-				await runDoAlways("", ctx);
-			},
-		});
-	}
-
 	async function runDoAlways(args: string, ctx: ExtensionContext): Promise<void> {
 		// Reload when the active directory changes, so switching projects
 		// mid-session serves the right config instead of stale tasks.
 		if (ctx.cwd !== loadedCwd) {
 			loadedCwd = ctx.cwd;
-			tasks = loadConfig(ctx.cwd).tasks;
+			const onError = (m: string) => {
+				if (ctx.mode === "tui") ctx.ui.notify(m, "warning");
+				else console.warn(m);
+			};
+			tasks = loadConfig(ctx.cwd, onError).tasks;
 		}
+
+		// One context per command run: shared by visibility filtering, rendering,
+		// and the completion cache (never inside a render loop).
+		const context = buildContext(ctx.cwd);
+		const visible = refreshVisible(ctx.cwd, context);
 
 		const arg = args.trim();
 
 		if (!arg) {
 			if (ctx.mode === "tui") {
-				await showSelector(ctx);
+				await showSelector(ctx, context);
 			} else {
-				const context = buildContext(ctx.cwd);
-				const visible = tasks.filter((t) => evaluateWhen(t, context));
 				ctx.ui.notify(`do-always tasks (use /do-always <number|name>):\n${formatList(visible)}`, "info");
 			}
 			return;
 		}
 
 		if (arg.toLowerCase() === "list") {
-			const context = buildContext(ctx.cwd);
-			const visible = tasks.filter((t) => evaluateWhen(t, context));
 			ctx.ui.notify(formatList(visible), "info");
 			return;
 		}
@@ -551,14 +571,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		if (arg.toLowerCase() === "list-details") {
 			// Display only — the description is metadata; selecting a task injects just its prompt.
 			// Render with the current context so what is shown is what gets injected.
-			const context = buildContext(ctx.cwd);
-			const visible = tasks.filter((t) => evaluateWhen(t, context));
+			const strings = toPromptContext(context);
 			const details = visible
 				.map((t, i) => {
 					const lines = [`${i + 1}. ${t.name}`];
 					if (t.description) lines.push(`   description: ${t.description}`);
 					lines.push("   prompt (this is what gets injected on select):");
-					for (const line of renderPrompt(t.prompt, context).split("\n")) lines.push(`   ${line}`);
+					for (const line of renderPrompt(t.prompt, strings).split("\n")) lines.push(`   ${line}`);
 					return lines.join("\n");
 				})
 				.join("\n\n");
@@ -573,8 +592,6 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// Numbers index the VISIBLE list (what the user sees in the selector and
 		// `list`); names resolve against the full set so picking a hidden task by
 		// name gets an explanatory message below instead of "unknown task".
-		const context = buildContext(ctx.cwd);
-		const visible = tasks.filter((t) => evaluateWhen(t, context));
 		const task = resolveTask(/^\d+$/.test(arg) ? visible : tasks, arg);
 		if (!task) {
 			const available = visible.map((t, i) => `${i + 1}=${t.name}`).join(", ");
@@ -587,6 +604,6 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(`do-always: "${task.name}" is hidden by its "when" condition`, "info");
 			return;
 		}
-		await fillPrompt(task, ctx);
+		await fillPrompt(task, ctx, context);
 	}
 }

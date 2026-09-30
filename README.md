@@ -147,6 +147,10 @@ injects “Review the changes on branch `fix/login-null` (3 changed files:
 |`{{files_changed}}`|Changed files from `git status` — comma-separated, capped at 20 entries (`none` when clean or not a git repo)|
 |`{{files_changed_count}}`|Number of changed files (`0` when clean or not a git repo)|
 |`{{user}}`|`git config user.name` (`unknown` when unset)|
+|`{{diff_stat}}`|`git diff --shortstat` output, e.g. `3 files changed, 41 insertions(+), 7 deletions(-)` (`none` when unavailable)|
+|`{{repo}}`|Basename of the git remote (or of the working directory when there is no remote) — disambiguates monorepo work|
+|`{{staged_files}}`|Files staged for commit, one per line (`none` when empty)|
+|`{{unstaged_files}}`|Modified-but-unstaged files, one per line (`none` when empty)|
 
 Unknown placeholders are left as-is, and a prompt without placeholders is
 injected unchanged, so existing configs keep working. The selector preview and
@@ -198,7 +202,7 @@ The `guards` array accepts these guard objects (all must pass):
 
 | `type` | `value` | Blocks when… |
 |---|---|---|
-| `requireDirty` | none | the working tree is clean (`files_changed_count === 0`) |
+| `requireDirty` | none | the working tree is clean (no changed files) |
 | `requireBranch` | branch name | the current branch is not the given name |
 | `requireRepo` | repo name | the git-remote basename context value is not the given name |
 | `requireFilePattern` | glob | no changed file matches the glob |

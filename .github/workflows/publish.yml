@@ -27,7 +27,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: https://registry.npmjs.org
 
       - name: Validate release and select npm tag
@@ -39,13 +39,25 @@ jobs:
           node --input-type=module <<'NODE'
           import { appendFileSync, readFileSync } from "node:fs";
           const { version } = JSON.parse(readFileSync("package.json", "utf8"));
-          if (process.env.RELEASE_TAG && process.env.RELEASE_TAG !== `v${version}` && process.env.RELEASE_TAG !== version) {
-            throw new Error(`Release tag (${process.env.RELEASE_TAG}) must match package.json version (v${version})`);
+          if (
+            process.env.RELEASE_TAG &&
+            process.env.RELEASE_TAG !== `v${version}` &&
+            process.env.RELEASE_TAG !== version
+          ) {
+            throw new Error(
+              `Release tag (${process.env.RELEASE_TAG}) must match ` +
+                `package.json version (v${version})`
+            );
           }
           const prerelease = version.split("+")[0].includes("-");
-          if (process.env.RELEASE_PRERELEASE && String(prerelease) !== process.env.RELEASE_PRERELEASE) {
+          if (
+            process.env.RELEASE_PRERELEASE &&
+            String(prerelease) !== process.env.RELEASE_PRERELEASE
+          ) {
             console.warn(
-              `Release prerelease flag (${process.env.RELEASE_PRERELEASE}) differs from version (${version}); proceeding with npm dist-tag based on version.`
+              `Release prerelease flag (${process.env.RELEASE_PRERELEASE}) ` +
+                `differs from version (${version}); proceeding with npm ` +
+                `dist-tag based on version.`
             );
           }
           const tag = prerelease ? "next" : "latest";

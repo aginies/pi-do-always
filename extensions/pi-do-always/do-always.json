@@ -4,9 +4,9 @@
 		{
 			"name": "Review changes",
 			"category": "Plan",
-			"requireDirty": true,
 			"description": "Review the current code changes (Plan)",
-			"prompt": "Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). Last commit: {{last_commit}}. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes if needed. Do a summary of your findings"
+			"requireDirty": true,
+			"prompt": "Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). Change summary: {{diff_stat}}. Last commit: {{last_commit}}. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes if needed. Do a summary of your findings"
 		},
 		{
 			"name": "Review code",
@@ -17,7 +17,6 @@
 		{
 			"name": "Cleanup",
 			"category": "Plan",
-			"autoRun": false,
 			"description": "Clean up dead code and duplicates (Plan)",
 			"prompt": "Scan the project for dead code, unused imports, commented-out blocks, and duplicated logic. Do a plan proposal for the removals and consolidations, keeping behavior unchanged. Do not make any changes yet."
 		},
@@ -61,13 +60,16 @@
 			"name": "Release",
 			"category": "Ops",
 			"description": "Prepare a release (version, changelog, tag)",
+			"when": "git",
 			"prompt": "Prepare a release for this project (branch {{branch}}): check `git log` since the last tag, update the version in package.json (or the equivalent location), add a changelog entry summarizing the changes, and create a git tag if git present. Do not push."
 		},
 		{
 			"name": "Commit",
 			"category": "Ops",
 			"description": "Prepare a clean commit",
-			"prompt": "Prepare the working tree on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}) for a clean commit: review `git status` and `git diff`, stage the relevant changes, and write a clear commit message describing what changed and why. Do not push."
+			"requireDirty": true,
+			"when": "git",
+			"prompt": "Prepare the working tree on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}) for a clean commit: stage the relevant changes, and write a clear commit message describing what changed and why. Do not push."
 		}
 	]
 }

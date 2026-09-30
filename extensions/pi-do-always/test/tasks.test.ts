@@ -1,12 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	DEFAULT_CATEGORY_ORDER,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
+	MAX_FILES_LISTED,
 	PROMPT_CONTEXT_KEYS,
 	evaluateGuards,
 	evaluateWhen,
@@ -17,19 +19,52 @@ import {
 	isValidWhen,
 	mergeTasks,
 	parseConfig,
+	parseStatusPorcelain,
 	orderTasksByCategory,
 	renderPrompt,
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
+	splitFileLines,
+	toPromptContext,
 	type DoAlwaysTask,
 	type PromptContext,
+	type TaskContext,
 } from "../tasks";
 
 const sample: DoAlwaysTask[] = [
 	{ name: "review", description: "Review code", prompt: "review prompt" },
 	{ name: "readme", description: "Update README", prompt: "readme prompt" },
 ];
+
+// Structured-context fixtures shared by the evaluateWhen / evaluateGuards tests.
+const dirtyCtx: TaskContext = {
+	cwd: "/tmp/proj",
+	date: "2026-09-29",
+	branch: "main",
+	lastCommit: "x",
+	files: ["a.ts"],
+	user: "y",
+	diffStat: "1 file changed",
+	repo: "proj",
+	stagedFiles: ["a.ts"],
+	unstagedFiles: ["a.ts"],
+	isGitRepo: true,
+};
+const cleanCtx: TaskContext = { ...dirtyCtx, files: [], diffStat: "none", stagedFiles: [], unstagedFiles: [] };
+// A non-git directory: git facts fall back to neutral values.
+const nonGitCtx: TaskContext = {
+	...dirtyCtx,
+	branch: "unknown",
+	lastCommit: "unknown",
+	files: [],
+	user: "unknown",
+	diffStat: "none",
+	repo: "notgit",
+	stagedFiles: [],
+	unstagedFiles: [],
+	isGitRepo: false,
+};
 
 // ---------------------------------------------------------------------------
 // parseConfig
@@ -544,12 +579,12 @@ test("evaluateWhen honors the repo condition", () => {
 test("evaluateWhen honors the file condition against the working tree", () => {
 	const dir = mkdtempSync(tmpdir() + "/do-always-when-");
 	writeFileSync(join(dir, "keep.txt"), "x");
-	const ctx: PromptContext = { ...dirtyCtx, cwd: dir };
+	const ctx: TaskContext = { ...dirtyCtx, cwd: dir };
 	try {
 		assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { file: "keep.txt" } }, ctx), true);
 		assert.equal(evaluateWhen({ name: "a", prompt: "p", when: { file: "missing.txt" } }, ctx), false);
 	} finally {
-		rmdirSync(dir, { recursive: true });
+		rmSync(dir, { recursive: true });
 	}
 });
 
@@ -575,32 +610,6 @@ test("parseConfig ignores a non-boolean requireDirty", () => {
 	assert.equal(out.tasks[0].requireDirty, undefined);
 });
 
-const dirtyCtx: PromptContext = {
-	cwd: "/tmp/proj",
-	date: "2026-09-29",
-	branch: "main",
-	last_commit: "x",
-	files_changed: "a.ts",
-	files_changed_count: "1",
-	user: "y",
-	diff_stat: "1 file changed",
-	repo: "proj",
-	staged_files: "a.ts",
-	unstaged_files: "a.ts",
-};
-const cleanCtx: PromptContext = { ...dirtyCtx, files_changed: "none", files_changed_count: "0" };
-// A non-git directory: branch falls back to "unknown" outside a repo.
-const nonGitCtx: PromptContext = {
-	...dirtyCtx,
-	branch: "unknown",
-	last_commit: "unknown",
-	files_changed: "none",
-	files_changed_count: "0",
-	repo: "notgit",
-	staged_files: "none",
-	unstaged_files: "none",
-};
-
 test("evaluateGuards lets a task through when no guard is set", () => {
 	assert.equal(evaluateGuards({ name: "a", prompt: "p" }, cleanCtx), null);
 });
@@ -612,50 +621,77 @@ test("evaluateGuards blocks a requireDirty task only on a clean tree", () => {
 });
 
 test("evaluateGuards honors requireBranch", () => {
-	const onBranch = { name: "a", prompt: "p", guards: [{ type: "requireBranch", value: "main" }] };
-	const otherBranch = { name: "a", prompt: "p", guards: [{ type: "requireBranch", value: "release" }] };
+	const onBranch: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireBranch", value: "main" }] };
+	const otherBranch: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireBranch", value: "release" }] };
 	assert.equal(evaluateGuards(onBranch, dirtyCtx), null, "branch passes");
-	assert.match(evaluateGuards(otherBranch, dirtyCtx), /not on branch "release"/);
+	assert.match(evaluateGuards(otherBranch, dirtyCtx)!, /not on branch "release"/);
 });
 
 test("evaluateGuards honors requireRepo", () => {
-	const thisRepo = { name: "a", prompt: "p", guards: [{ type: "requireRepo", value: "proj" }] };
-	const otherRepo = { name: "a", prompt: "p", guards: [{ type: "requireRepo", value: "elsewhere" }] };
+	const thisRepo: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireRepo", value: "proj" }] };
+	const otherRepo: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireRepo", value: "elsewhere" }] };
 	assert.equal(evaluateGuards(thisRepo, dirtyCtx), null, "repo passes");
-	assert.match(evaluateGuards(otherRepo, dirtyCtx), /not in repo "elsewhere"/);
+	assert.match(evaluateGuards(otherRepo, dirtyCtx)!, /not in repo "elsewhere"/);
 });
 
 test("evaluateGuards honors requireFilePattern within a segment", () => {
-	const tsMatch = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "*.ts" }] };
-	const jsOnly = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "*.js" }] };
+	const tsMatch: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "*.ts" }] };
+	const jsOnly: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "*.js" }] };
 	assert.equal(evaluateGuards(tsMatch, dirtyCtx), null, "matching file passes");
-	assert.match(evaluateGuards(jsOnly, dirtyCtx), /no changed files match "\*\.js"/);
+	assert.match(evaluateGuards(jsOnly, dirtyCtx)!, /no changed files match "\*\.js"/);
 });
 
 test("evaluateGuards honors requireFilePattern with a ** glob across segments", () => {
-	const ctx: PromptContext = { ...dirtyCtx, files_changed: "src/deep/nested/util.ts" };
-	const anyTs = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "**/*.ts" }] };
-	const deepOnly = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "src/**" }] };
-	const noMatch = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "**/*.py" }] };
+	const ctx: TaskContext = { ...dirtyCtx, files: ["src/deep/nested/util.ts"] };
+	const anyTs: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "**/*.ts" }] };
+	const deepOnly: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "src/**" }] };
+	const noMatch: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "**/*.py" }] };
 	assert.equal(evaluateGuards(anyTs, ctx), null, "** matches across segments");
 	assert.equal(evaluateGuards(deepOnly, ctx), null, "prefix glob passes");
-	assert.match(evaluateGuards(noMatch, ctx), /no changed files match "\*\*\/\*\.py"/);
+	assert.match(evaluateGuards(noMatch, ctx)!, /no changed files match "\*\*\/\*\.py"/);
 });
 
 test("evaluateGuards combines legacy requireDirty with new guards", () => {
 	// Dirty tree + branch matches -> passes even though requireDirty is set.
-	const combined = {
-name: "a",
-prompt: "p",
-requireDirty: true,
-guards: [{ type: "requireBranch", value: "main" }],
+	const combined: DoAlwaysTask = {
+		name: "a",
+		prompt: "p",
+		requireDirty: true,
+		guards: [{ type: "requireBranch", value: "main" }],
 	};
 	assert.equal(evaluateGuards(combined, dirtyCtx), null);
 	// Clean tree -> legacy requireDirty still blocks first.
 	assert.equal(evaluateGuards(combined, cleanCtx), "working tree is clean — nothing to review");
 	// Dirty but wrong branch -> the new guard blocks.
-	const otherCtx: PromptContext = { ...dirtyCtx, branch: "dev" };
-	assert.match(evaluateGuards(combined, otherCtx), /not on branch "main"/);
+	const otherCtx: TaskContext = { ...dirtyCtx, branch: "dev" };
+	assert.match(evaluateGuards(combined, otherCtx)!, /not on branch "main"/);
+});
+
+test("requireFilePattern sees files beyond the display cap", () => {
+	// 25 changed files: file 21 is past MAX_FILES_LISTED, so the capped
+	// `files_changed` string no longer contains it — the guard must still see it.
+	const files = Array.from({ length: 25 }, (_, i) => `f${i}.js`);
+	const ctx: TaskContext = { ...dirtyCtx, files };
+	const pastCap: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "f21.js" }] };
+	assert.equal(evaluateGuards(pastCap, ctx), null, "file past the cap still matches");
+	const noMatch: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "*.ts" }] };
+	assert.match(evaluateGuards(noMatch, ctx)!, /no changed files match/, "no match still blocks past the cap");
+});
+
+test("requireFilePattern handles filenames containing commas", () => {
+	const ctx: TaskContext = { ...dirtyCtx, files: ["src/a,b.ts"] };
+	const exact: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "src/a,b.ts" }] };
+	assert.equal(evaluateGuards(exact, ctx), null, "a comma in the filename does not split the file");
+	const glob: DoAlwaysTask = { name: "a", prompt: "p", guards: [{ type: "requireFilePattern", value: "src/*.ts" }] };
+	assert.equal(evaluateGuards(glob, ctx), null, "glob matches across the comma");
+});
+
+test("when:git uses the authoritative isGitRepo flag, not the branch sentinel", () => {
+	// A branch literally named "unknown" (detached HEAD reports "HEAD") must not
+	// make a git repo look non-git.
+	const oddBranch: TaskContext = { ...dirtyCtx, branch: "unknown", isGitRepo: true };
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: "git" }, oddBranch), true);
+	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: "!git" }, oddBranch), false);
 });
 
 test("parseGuard accepts a valid guard of each kind", () => {
@@ -743,6 +779,70 @@ test("DEFAULT_TASKS is non-empty and internally consistent", () => {
 });
 
 // ---------------------------------------------------------------------------
+// toPromptContext (structured → string view)
+// ---------------------------------------------------------------------------
+
+test("toPromptContext maps every structured fact to its string view", () => {
+	const out: PromptContext = toPromptContext(dirtyCtx);
+	assert.deepEqual(out, {
+		cwd: "/tmp/proj",
+		date: "2026-09-29",
+		branch: "main",
+		last_commit: "x",
+		files_changed: "a.ts",
+		files_changed_count: "1",
+		user: "y",
+		diff_stat: "1 file changed",
+		repo: "proj",
+		staged_files: "a.ts",
+		unstaged_files: "a.ts",
+	});
+});
+
+test("toPromptContext renders empty lists as 'none' with an exact count", () => {
+	const out = toPromptContext(cleanCtx);
+	assert.equal(out.files_changed, "none");
+	assert.equal(out.files_changed_count, "0");
+	assert.equal(out.staged_files, "none");
+	assert.equal(out.unstaged_files, "none");
+});
+
+test("toPromptContext caps files_changed at MAX_FILES_LISTED but keeps the exact count", () => {
+	const many: TaskContext = { ...dirtyCtx, files: Array.from({ length: 25 }, (_, i) => `f${i}.ts`) };
+	const out = toPromptContext(many);
+	assert.equal(out.files_changed_count, "25");
+	assert.ok(out.files_changed.startsWith("f0.ts, f1.ts"));
+	assert.ok(out.files_changed.endsWith("… (+5 more)"));
+	assert.equal(out.files_changed.split(", ").length, MAX_FILES_LISTED + 1); // 20 paths + suffix
+});
+
+test("toPromptContext joins staged/unstaged lists with newlines", () => {
+	const ctx: TaskContext = { ...dirtyCtx, stagedFiles: ["a.ts", "b.ts"], unstagedFiles: ["c.ts"] };
+	const out = toPromptContext(ctx);
+	assert.equal(out.staged_files, "a.ts\nb.ts");
+	assert.equal(out.unstaged_files, "c.ts");
+});
+
+// ---------------------------------------------------------------------------
+// parseStatusPorcelain / splitFileLines
+// ---------------------------------------------------------------------------
+
+test("parseStatusPorcelain extracts paths, skips short lines, dedupes, and sorts", () => {
+	const status = [" M zeta.ts", " M alpha.ts", "A  beta.ts", " M alpha.ts", "x", ""].join("\n");
+	assert.deepEqual(parseStatusPorcelain(status), ["alpha.ts", "beta.ts", "zeta.ts"]);
+});
+
+test("parseStatusPorcelain returns [] for empty input", () => {
+	assert.deepEqual(parseStatusPorcelain(""), []);
+});
+
+test("splitFileLines trims and drops empty lines", () => {
+	assert.deepEqual(splitFileLines("a.ts\nb.ts\n"), ["a.ts", "b.ts"]);
+	assert.deepEqual(splitFileLines(""), []);
+	assert.deepEqual(splitFileLines(undefined), []);
+});
+
+// ---------------------------------------------------------------------------
 // renderPrompt
 // ---------------------------------------------------------------------------
 
@@ -792,12 +892,24 @@ test("rendering every default prompt with a full context leaves no placeholders"
 		user: "Agine",
 		diff_stat: "3 files changed, 41 insertions(+), 7 deletions(-)",
 		repo: "pi-do-always",
-		staged_files: "a.ts, b.ts",
+		staged_files: "a.ts\nb.ts",
 		unstaged_files: "c.ts",
 	};
 	for (const t of DEFAULT_TASKS) {
 		assert.doesNotMatch(renderPrompt(t.prompt, ctx), /\{\{/, t.name);
 	}
+});
+
+test("the shipped sample config stays in sync with DEFAULT_TASKS", () => {
+	const samplePath = join(dirname(fileURLToPath(import.meta.url)), "..", "do-always.json");
+	const { tasks } = parseConfig(readFileSync(samplePath, "utf-8"), "do-always.json");
+	const key = (t: DoAlwaysTask) =>
+		JSON.stringify([t.name, t.category, t.description, t.prompt, t.requireDirty, t.when, t.autoRun]);
+	assert.deepEqual(
+		orderTasksByCategory(tasks).map(key),
+		orderTasksByCategory(DEFAULT_TASKS).map(key),
+		"extensions/pi-do-always/do-always.json drifted from DEFAULT_TASKS — regenerate it from tasks.ts",
+	);
 });
 
 test("rendering default prompts with a fallback (non-git) context leaves no placeholders", () => {

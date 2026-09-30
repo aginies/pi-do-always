@@ -98,6 +98,44 @@ export interface ParsedDoAlwaysConfig {
 	merge?: "append" | "override" | undefined;
 }
 
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+/**
+ * Structured facts about the working tree and git state, gathered once per
+ * use (see `buildContext` in index.ts). `when` conditions and guards are
+ * evaluated against this; `renderPrompt` consumes the derived string view
+ * from `toPromptContext`.
+ *
+ * Keeping the structured form here (instead of re-parsing the rendered
+ * strings) means guards see the complete file list — `files_changed` in the
+ * string view is capped for display, but `files` is never truncated.
+ */
+export interface TaskContext {
+	/** Absolute path of the working directory. */
+	cwd: string;
+	/** Local date, YYYY-MM-DD. */
+	date: string;
+	/** Current git branch, or "unknown" when unavailable. */
+	branch: string;
+	/** Subject of the latest commit, or "unknown" when unavailable. */
+	lastCommit: string;
+	/** All changed files (staged, unstaged, untracked), deduplicated and sorted. */
+	files: string[];
+	/** `git config user.name`, or "unknown" when unset. */
+	user: string;
+	/** Output of `git diff --shortstat`, or "none" when unavailable. */
+	diffStat: string;
+	/** Basename of the git remote (or cwd), to disambiguate monorepo work. */
+	repo: string;
+	/** Files staged for commit. */
+	stagedFiles: string[];
+	/** Modified-but-unstaged files. */
+	unstagedFiles: string[];
+	/** True when cwd is inside a git working tree (authoritative, not inferred from the branch name). */
+	isGitRepo: boolean;
+}
+
 /**
  * The set of context keys the extension can inject into prompts (see
  * `renderPrompt`). `index.ts` is responsible for supplying all of them (with
@@ -112,17 +150,75 @@ export const PROMPT_CONTEXT_KEYS = [
 	"files_changed",
 	"files_changed_count",
 	"user",
-	"diff_stat", // NEW: "3 files changed, 41 insertions(+), 7 deletions(-)"
-	"repo", // NEW: basename of cwd or git remote (disambiguates monorepos)
-	"staged_files", // NEW: files staged for commit
-	"unstaged_files", // NEW: modified-but-unstaged files
+	"diff_stat",
+	"repo",
+	"staged_files",
+	"unstaged_files",
 ] as const;
 
 /** A fully populated prompt context: one entry per PROMPT_CONTEXT_KEYS. */
 export type PromptContext = Record<(typeof PROMPT_CONTEXT_KEYS)[number], string>;
 
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+/** Max number of file paths listed in the `files_changed` string view (the count stays exact). */
+export const MAX_FILES_LISTED = 20;
+
+/**
+ * Derive the string view consumed by `renderPrompt` from a structured context.
+ * `files_changed` lists at most MAX_FILES_LISTED paths (with a "… (+N more)"
+ * suffix) and `files_changed_count` stays exact; `staged_files` and
+ * `unstaged_files` are newline-separated. Empty lists render as "none".
+ */
+export function toPromptContext(ctx: TaskContext): PromptContext {
+	return {
+		cwd: ctx.cwd,
+		date: ctx.date,
+		branch: ctx.branch,
+		last_commit: ctx.lastCommit,
+		files_changed: formatFileList(ctx.files),
+		files_changed_count: String(ctx.files.length),
+		user: ctx.user,
+		diff_stat: ctx.diffStat,
+		repo: ctx.repo,
+		staged_files: formatFileLines(ctx.stagedFiles),
+		unstaged_files: formatFileLines(ctx.unstagedFiles),
+	};
+}
+
+/** Comma-joined list, capped at MAX_FILES_LISTED entries; "none" when empty. */
+function formatFileList(files: string[]): string {
+	if (files.length === 0) return "none";
+	if (files.length > MAX_FILES_LISTED) {
+		return [...files.slice(0, MAX_FILES_LISTED), `… (+${files.length - MAX_FILES_LISTED} more)`].join(", ");
+	}
+	return files.join(", ");
+}
+
+/** Newline-joined list; "none" when empty. */
+function formatFileLines(files: string[]): string {
+	return files.length === 0 ? "none" : files.join("\n");
+}
+
+/**
+ * Parse `git status --porcelain` (v1) output into changed file paths. Lines
+ * are "XY <path>" (X = index, Y = worktree); short lines are skipped,
+ * duplicates removed, and the result sorted.
+ */
+export function parseStatusPorcelain(status: string): string[] {
+	const files: string[] = [];
+	for (const line of status.split("\n")) {
+		if (line.length < 4) continue;
+		const path = line.slice(3);
+		if (path && !files.includes(path)) files.push(path);
+	}
+	files.sort();
+	return files;
+}
+
+/** Split raw `git diff --name-only` output into file paths (trimmed, non-empty lines). */
+export function splitFileLines(raw: string | undefined): string[] {
+	if (!raw) return [];
+	return raw.split("\n").map((line) => line.trim()).filter(Boolean);
+}
 
 /** Used when neither config file defines any task. */
 export const DEFAULT_TASKS: DoAlwaysTask[] = [
@@ -415,15 +511,6 @@ export function isValidWhen(when: unknown): boolean {
 	return true;
 }
 
-/**
- * True when the current directory is inside a git working tree. The `branch`
- * context falls back to "unknown" outside a repo (and on an empty repo), so a
- * non-"unknown" branch is the git-repo signal.
- */
-function isGitRepo(ctx: PromptContext): boolean {
-	return ctx.branch !== "unknown";
-}
-
 /** True when `relativePath` exists (as file or directory) under `cwd`. */
 function pathExists(cwd: string, relativePath: string): boolean {
 	try {
@@ -434,14 +521,14 @@ function pathExists(cwd: string, relativePath: string): boolean {
 }
 
 /**
- * Evaluate a single `when` object entry against the current prompt context.
+ * Evaluate a single `when` object entry against the current context.
  * Unknown keys are treated as no-ops (permissive) so a typo never hides a task
  * at runtime (parse time rejects them with a warning instead).
  */
-function evaluateWhenEntry(key: string, value: unknown, ctx: PromptContext): boolean {
+function evaluateWhenEntry(key: string, value: unknown, ctx: TaskContext): boolean {
 	switch (key) {
 		case "git":
-			return typeof value === "boolean" ? isGitRepo(ctx) === value : false;
+			return typeof value === "boolean" ? ctx.isGitRepo === value : false;
 		case "branch":
 			return typeof value === "string" && ctx.branch === value;
 		case "file":
@@ -462,13 +549,13 @@ function evaluateWhenEntry(key: string, value: unknown, ctx: PromptContext): boo
  * set of conditions that must all hold (logical AND): `git`, `branch`, `file`,
  * or `repo` (see the `DoAlwaysTask.when` field).
  */
-export function evaluateWhen(task: DoAlwaysTask, ctx: PromptContext): boolean {
+export function evaluateWhen(task: DoAlwaysTask, ctx: TaskContext): boolean {
 	const when = task.when;
 	if (when === undefined || when === null) return true;
 	if (typeof when === "string") {
 		const negated = when.startsWith("!");
 		const key = negated ? when.slice(1) : when;
-		if (key === "git") return negated ? !isGitRepo(ctx) : isGitRepo(ctx);
+		if (key === "git") return negated ? !ctx.isGitRepo : ctx.isGitRepo;
 		return true; // an invalid string condition is rejected at parse time
 	}
 	if (typeof when === "object") {
@@ -550,7 +637,7 @@ export function shouldAutoRun(task: DoAlwaysTask): boolean {
  * Guards keep low-value round-trips down: e.g. `requireDirty` blocks Review and
  * Commit on a clean tree so the agent is never asked to inspect nothing.
  */
-export function evaluateGuards(task: DoAlwaysTask, ctx: PromptContext): string | null {
+export function evaluateGuards(task: DoAlwaysTask, ctx: TaskContext): string | null {
 	// Legacy `requireDirty` is folded into the guard table so the set of guards
 	// is extensible without touching this function's callers.
 	const guards: Guard[] = [];
@@ -568,38 +655,31 @@ export function evaluateGuards(task: DoAlwaysTask, ctx: PromptContext): string |
  * when the guard passes. All guards are evaluated against the current prompt
  * context, so a task is only injected when every guard is met.
  */
-function guardFailureMessage(g: Guard, ctx: PromptContext): string | null {
+function guardFailureMessage(g: Guard, ctx: TaskContext): string | null {
 	switch (g.type) {
 		case "requireDirty":
-			return ctx.files_changed_count === "0" ? "working tree is clean — nothing to review" : null;
+			return ctx.files.length === 0 ? "working tree is clean — nothing to review" : null;
 		case "requireBranch":
 			return ctx.branch === g.value ? null : `not on branch "${g.value}" (currently ${ctx.branch})`;
 		case "requireRepo":
 			return ctx.repo === g.value ? null : `not in repo "${g.value}" (currently ${ctx.repo})`;
 		case "requireFilePattern":
-			return filesMatchPattern(ctx, g.value!) ? null : `no changed files match "${g.value}"`;
+			return filesMatchPattern(ctx.files, g.value!) ? null : `no changed files match "${g.value}"`;
 		default:
 			return null; // an unknown type is rejected at parse time
 	}
 }
 
 /**
- * The changed files for `ctx`, split on commas (matching how `files_changed`
- * is rendered). Empty on a clean tree or outside a git repo.
- */
-function changedFiles(ctx: PromptContext): string[] {
-	if (ctx.files_changed_count === "0" || ctx.files_changed === "none") return [];
-	return ctx.files_changed.split(",");
-}
-
-/**
  * Whether any changed file matches `pattern`, treated as a glob: `*` matches
  * within a path segment, `**` crosses segments, `?` matches one non-separator
- * character, and other regex metacharacters are literal.
+ * character, and other regex metacharacters are literal. Matches against the
+ * complete file list (never the capped display string), so files beyond
+ * MAX_FILES_LISTED are still considered.
  */
-function filesMatchPattern(ctx: PromptContext, pattern: string): boolean {
+function filesMatchPattern(files: string[], pattern: string): boolean {
 	const re = globToRegex(pattern);
-	return changedFiles(ctx).some((f) => re.test(f.trim()));
+	return files.some((f) => re.test(f));
 }
 
 /** Regex metacharacters that must be escaped when matching a literal path char. */

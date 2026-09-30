@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-09-29
+
+### Changed
+
+- The prompt context is now a structured object (`TaskContext`) instead of a
+  flat string record: `when` conditions and guards are evaluated against the
+  structured data, and the string view for prompt rendering is derived from it
+  (`toPromptContext`). The rendered `files_changed` string is still capped at
+  20 paths for display, but `files_changed_count` and the guards always see
+  the complete file list.
+- `requireFilePattern` no longer re-parses the capped, comma-joined
+  `files_changed` string: it matches against the full changed-file list, so
+  files beyond the display cap are considered and filenames containing commas
+  are no longer split into false paths.
+- `requireDirty` is evaluated from the structured file list instead of the
+  stringly-typed `files_changed_count`.
+- `when: git` (and `{ "git": true|false }`) now uses an authoritative
+  `git rev-parse --is-inside-work-tree` check instead of inferring git status
+  from the branch name, so a branch literally named "unknown" (or a detached
+  HEAD) no longer makes a git repo look non-git.
+- Argument completions for `/do-always` now number tasks by position in the
+  visible (`when`-filtered) list — the same list the selector and
+  `/do-always <n>` use — instead of the unfiltered task list.
+- The selector shortcut is now registered from the `session_start` handler
+  using the session's cwd instead of `process.cwd()` at extension load, so a
+  project-local `shortcut` setting applies to the active project and a changed
+  shortcut takes effect on a new session.
+- The selector preview and the injected prompt are rendered from the same
+  context object, so the preview shows exactly what gets injected.
+- The shipped sample config `extensions/pi-do-always/do-always.json` now
+  matches the built-in `DEFAULT_TASKS` exactly (it had drifted: missing
+  `{{diff_stat}}` summary in `Review changes`, missing `when: git` on
+  `Release`/`Commit`, missing `requireDirty` on `Commit`, and a stray
+  `autoRun: false` on `Cleanup`). A unit test fails the build if the sample
+  drifts again.
+- The README placeholder table now documents every supported placeholder
+  (`{{diff_stat}}`, `{{repo}}`, `{{staged_files}}`, `{{unstaged_files}}`).
+
+### Fixed
+
+- Config validation warnings (malformed JSON, invalid tasks/shortcut/merge/
+  when/guards) are no longer silently swallowed: `loadConfig` threads an
+  `onError` callback and the extension reports problems via `ui.notify`
+  (warning) in TUI mode and `console.warn` otherwise, as the README promises.
+- The CI and publish workflows now run on Node 22, matching `engines.node`
+  (`>=22.19.0`) instead of Node 20.
+- The test suite is now typechecked: `tsconfig.json` includes the test
+  directory.
+
 ## [0.8.0] - 2026-09-29
 
 ### Added
