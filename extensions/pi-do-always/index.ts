@@ -592,7 +592,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * Task table with an ORDER column (the chain) and a pinned Run row:
 	 *
 	 *   #  TASK                  DESCRIPTION              ORDER
-	 *   1  ⚡ Review changes      Review the current       ▸[1]
+	 *   1  ⚡ Review changes      Review the current       ►[1]
 	 *   2  Build                 Build the project          ·
 	 *   ─────────────────────────────────────────────────────
 	 *   ▶ Run the chain (1)
@@ -759,6 +759,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				const lines: string[] = [];
 				const itemLine = new Map<number, DoAlwaysTask>();
 				let runLine = -1;
+				// Cursor marker: a large triangle in the accent color. The row
+				// background alone can be invisible (some themes map selectedBg
+				// to the terminal's default background), so the marker carries
+				// the cursor.
+				const cursorMark = theme.fg("accent", "►");
 
 				// Header.
 				lines.push(
@@ -798,7 +803,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const task = row.task;
 						const auto = shouldAutoRun(task);
 						const focused = cursor.kind === "cell" && cursor.row === idx;
-						// Cursor markers: ▸ in the left gutter = TASK column, ▸ in the
+						// Cursor markers: ► in the left gutter = TASK column, ► in the
 						// ORDER cell = ORDER column. The row background is applied too,
 						// but some themes map selectedBg to a color that is nearly
 						// indistinguishable from the terminal background, so the
@@ -808,7 +813,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const inOrderCol =
 							cursor.kind === "cell" && cursor.row === idx && cursor.col === "order";
 						const num = inTaskCol
-							? `▸ ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
+							? `${cursorMark} ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
 							: `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
 						// ⚡ is 2 columns wide, so "⚡ " takes 3 — reserve it so
 						// auto-run rows align with the others (ORDER cell is
@@ -820,10 +825,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const orderCell =
 							row.order !== undefined
 								? inOrderCol
-									? truncateToWidth(`▸[${row.order}]`, ORDER_COL_W, "", true)
+									? truncateToWidth(`${cursorMark}[${row.order}]`, ORDER_COL_W, "", true)
 									: ` [${row.order}] `
 								: inOrderCol
-									? "▸  · "
+									? `${cursorMark}  · `
 									: "  ·  ";
 						let line: string;
 						if (tier === "full") {
@@ -835,7 +840,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							line = truncateToWidth(`${num}  ${taskCell}`, width - 2, "…");
 						}
 						// Full-row background + bold where the theme makes it visible;
-						// the ▸ gutter/cell marker carries the cursor either way.
+						// the ► gutter/cell marker carries the cursor either way.
 						if (focused) line = theme.bg("selectedBg", theme.bold(line));
 						lines.push(line);
 						itemLine.set(lines.length - 1, task);
@@ -878,7 +883,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				const runLabel = chainRunLabel(chain.items.length);
 				runLine = lines.length;
 				if (cursor.kind === "run") {
-					lines.push(theme.bg("selectedBg", theme.bold(`▸ ▶ ${runLabel}`)));
+					lines.push(theme.bg("selectedBg", theme.bold(`${cursorMark} ▶ ${runLabel}`)));
 				} else if (chain.items.length === 0) {
 					lines.push(theme.fg("dim", `  ▶ ${runLabel}`));
 				} else {

@@ -12,7 +12,7 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
   do-always — pick a task
 
   PLAN
-▸ 1. ⚡ Review changes       Review the current code changes (Plan)
+► 1. ⚡ Review changes       Review the current code changes (Plan)
   2. ⚡ Review code          Review the whole project's code quality (Plan)
   3. ⚡ Cleanup              Clean up dead code and duplicates (Plan)
   4. ⚡ Security             Security audit (Plan)
@@ -71,10 +71,10 @@ Building a chain in the selector:
   the task column).
 - **→** moves the cursor to the ORDER column on the same row, where **Enter** toggles
   that task's chain membership (`·` → `[n]` → `·`). **←** goes back to the task column.
-- **↑ / ↓** move the cursor in either column. The cursor is a **▸** marker: in the left
-  gutter in the task column, in the ORDER cell in the order column (plus a row highlight
-  where your theme makes it visible). From the last task row, **↓** lands on the pinned
-  Run row (and **↑** back).
+- **↑ / ↓** move the cursor in either column. The cursor is a **►** marker in the
+  theme's accent color: in the left gutter in the task column, in the ORDER cell in
+  the order column (plus a row highlight where your theme makes it visible). From the
+  last task row, **↓** lands on the pinned Run row (and **↑** back).
 - **Enter on the `▶ Run the chain (n)` row** — or a mouse click on it — runs the chain.
   The row is dimmed while the chain is empty.
 - **Backspace** (with no filter typed) undoes the last add; **ctrl+u** clears the whole
