@@ -268,6 +268,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// early, and reset on session start.
 	let chainStatus: { steps: ChainStepView[]; note?: string } | null = null;
 	const CHAIN_WIDGET_KEY = "do-always-chain";
+	// The most recent command context, so event handlers (which carry no
+	// context of their own) can still refresh the widget.
+	let lastCtx: ExtensionContext | null = null;
 	// True while a chain's runner is in flight (from start to its final
 	// outcome). A second chain started while one is running would interleave
 	// their event waiters (the old chain's sendAndWait would resolve on the
@@ -359,6 +362,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_start", () => {
 		if (chainWaiter) chainWaiter.started = true;
+		// Fill-first: step 1 left the editor and is running — update the
+		// widget (and drop the "press Enter" note) as soon as the run starts.
+		if (lastCtx && chainStatus?.steps[0]?.status === "waiting") {
+			setChainStep(lastCtx, 0, "running", "");
+		}
 	});
 	pi.on("agent_end", (event) => {
 		if (!chainWaiter) return;
@@ -428,6 +436,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		lastCtx = ctx;
 		// Surface config validation problems (the README promises warnings);
 		// in non-TUI modes there is no UI, so fall back to the console.
 		const onError = (m: string) => {
@@ -1119,6 +1128,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	});
 
 	async function runDoAlways(args: string, ctx: ExtensionContext): Promise<void> {
+		lastCtx = ctx;
 		// Reload when the active directory changes, so switching projects
 		// mid-session serves the right config instead of stale tasks.
 		if (ctx.cwd !== loadedCwd) {
