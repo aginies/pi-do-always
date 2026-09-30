@@ -67,10 +67,11 @@ list runs the chain.
 
 Building a chain in the selector:
 
-- **Enter on a task row** adds it to the chain (adding it again moves it to the end).
-- **Enter on an `[n]` marker** removes the task from the chain.
-- **← / →** switch between the task column and the ORDER column (→ lands on the nearest
-  chained task). **↑ / ↓ while in the ORDER column** move the task earlier/later in the chain.
+- **Enter on a task row** runs just that task (the classic pick — the cursor starts in
+  the task column).
+- **→** moves the cursor to the ORDER column on the same row, where **Enter** toggles
+  that task's chain membership (`·` → `[n]` → `·`). **←** goes back to the task column.
+- **↑ / ↓** move the cursor in either column; the highlighted row is the cursor.
 - **Enter on the `▶ Run the chain (n)` row** — or a mouse click on it — runs the chain.
   The row is dimmed while the chain is empty.
 - **Backspace** (with no filter typed) undoes the last add; **ctrl+u** clears the whole
@@ -79,8 +80,10 @@ Building a chain in the selector:
 - The classic fast paths are unchanged: **1-9** runs a task immediately, and clicking a
   task row runs it — both close the selector and discard the chain.
 
-Chains are capped at 8 tasks. On narrow terminals the ORDER column is dropped and the
-chain is shown on its own line below the list (keyboard chaining still works).
+Chains are capped at 8 tasks. Reordering is done by removing a task and re-adding it
+(mouse drag reordering is planned for a future release). On narrow terminals the ORDER
+column is dropped and the chain is shown on its own line below the list (keyboard
+chaining still works).
 
 Running a chain sends each step as its own turn, strictly one after another — the next
 step starts only after the previous run has fully finished. Each step's guards are

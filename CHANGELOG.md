@@ -7,11 +7,11 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **Task chains**: the selector is now a task table with an `ORDER` column and a
-  pinned `▶ Run the chain (n)` row. Enter on a task row adds it to the chain,
-  Enter on an `[n]` marker removes it, and Enter (or a click) on the Run row runs
-  the chain. ←/→ switch columns, ↑/↓ in the ORDER column reorder the chain,
-  Backspace (no filter) undoes the last add, ctrl+u clears, and clicking an ORDER
-  cell toggles membership. Chains are capped at 8 tasks; on narrow terminals the
+  pinned `▶ Run the chain (n)` row. → moves the cursor to the ORDER column, where
+  Enter toggles the task's chain membership; Enter (or a click) on the Run row runs
+  the chain. ↑/↓ move the cursor in either column, Backspace (no filter) undoes the
+  last add, ctrl+u clears, and clicking an ORDER cell toggles membership. The cursor
+  is a full-row highlight. Chains are capped at 8 tasks; on narrow terminals the
   ORDER column is dropped in favor of a chain line below the list.
 - **Chain execution**: steps run strictly sequentially — each step is its own turn
   and the next starts only after the previous run has fully settled. Each step's
@@ -21,12 +21,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- The selector's Enter key is now context-dependent: on a task row it adds to the
-  chain (instead of immediately filling the prompt). Running a single task
-  immediately is still one action away via 1-9 or a click, so no workflow gets
-  slower; filling a single task's prompt is done by adding it to the chain and
-  running it, or by picking it with 1-9/click and letting the classic fill path
-  apply. All existing config fields, commands, and the shortcut are unchanged.
+- The selector's Enter key is now context-dependent: on a task row it runs just
+  that task (the 0.9.0 behavior, unchanged), on an ORDER cell it toggles chain
+  membership, and on the Run row it runs the chain. All existing config fields,
+  commands, and the shortcut are unchanged.
 
 ### Changed
 

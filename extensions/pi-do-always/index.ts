@@ -54,7 +54,6 @@ import {
 	buildTableRows,
 	chainAdd,
 	chainClear,
-	chainMove,
 	chainRemove,
 	chainRunLabel,
 	chainUndo,
@@ -64,7 +63,6 @@ import {
 	formatList,
 	groupTasksByCategory,
 	isValidKeyId,
-	landOnOrderColumn,
 	mergeTasks,
 	parseConfig,
 	parseStatusPorcelain,
@@ -436,15 +434,16 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * Task table with an ORDER column (the chain) and a pinned Run row:
 	 *
 	 *   #  TASK                  DESCRIPTION              ORDER
-	 * ▸ 1  ⚡ Review changes      Review the current       [1]
+	 *   1  ⚡ Review changes      Review the current       ▸[1]
 	 *   2  Build                 Build the project          ·
 	 *   ─────────────────────────────────────────────────────
 	 *   ▶ Run the chain (1)
 	 *
-	 * Enter is the universal confirm: on a task row it adds the task to the
-	 * chain, on an ORDER cell it removes it, on the Run row it runs the chain.
-	 * ←/→ switch columns, 1-9 still runs a task immediately (closing the
-	 * selector, discarding the chain). The context is built once per command
+	 * The TASK column is primary: Enter runs just the task under the cursor
+	 * (the classic pick). The ORDER column is the optional chain: Enter
+	 * toggles the task's membership, and the pinned Run row runs the whole
+	 * chain. ←/→ switch columns, 1-9 still runs a task immediately (closing
+	 * the selector, discarding the chain). The context is built once per command
 	 * run (never inside the render loop — no process spawning per frame) and
 	 * shared with `fillPrompt`.
 	 */
@@ -555,20 +554,17 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				return { bodyRows, itemRows, winStart, visibleHeaderNames };
 			}
 
-			// Keep the cursor valid after the rows or the chain change.
+			// Keep the cursor valid after the rows or the chain change. (The
+			// ORDER cell of a non-chained row is a valid cursor position: it is
+			// the "add" state.)
 			function clampCursor() {
 				const { itemRows } = getVisible();
 				if (itemRows.length === 0) {
 					cursor = { kind: "cell", row: 0, col: "task" };
 					return;
 				}
-				if (cursor.kind === "cell") {
-					if (cursor.row >= itemRows.length) {
-						cursor = { kind: "cell", row: itemRows.length - 1, col: "task" };
-					} else if (cursor.col === "order" && !chain.items.includes(itemRows[cursor.row].task.name)) {
-						// The row is no longer chained — fall back to the TASK column.
-						cursor = { kind: "cell", row: cursor.row, col: "task" };
-					}
+				if (cursor.kind === "cell" && cursor.row >= itemRows.length) {
+					cursor = { kind: "cell", row: itemRows.length - 1, col: "task" };
 				}
 			}
 
@@ -669,7 +665,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						} else {
 							line = truncateToWidth(`${num}  ${taskCell}`, width - 2, "…");
 						}
-						if (focused) line = theme.fg("accent", theme.bold(line));
+						// The cursor is a full-row background highlight so it is
+						// visible at a glance; the ▸ in the ORDER cell marks the
+						// column.
+						if (focused) line = theme.bg("selectedBg", theme.bold(line));
 						lines.push(line);
 						itemLine.set(lines.length - 1, task);
 					}
@@ -711,7 +710,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				const runLabel = chainRunLabel(chain.items.length);
 				runLine = lines.length;
 				if (cursor.kind === "run") {
-					lines.push(theme.fg("accent", theme.bold(`▸ ▶ ${runLabel}`)));
+					lines.push(theme.bg("selectedBg", theme.bold(`▸ ▶ ${runLabel}`)));
 				} else if (chain.items.length === 0) {
 					lines.push(theme.fg("dim", `  ▶ ${runLabel}`));
 				} else {
@@ -726,9 +725,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							? `  ⏎ run: ${formatChainSequence(visibleTasks, chain)}`
 							: "  ⏎ run the chain (chain is empty)";
 				} else if (cursor.col === "order") {
-					footer = "  ← tasks  •  ↑↓ move  •  ⏎ remove  •  esc";
+					const inChain = chain.items.includes(itemRows[cursor.row]?.task.name ?? "");
+					footer = inChain ? "  ← tasks  •  ⏎ remove  •  esc" : "  ← tasks  •  ⏎ add  •  esc";
 				} else {
-					footer = "  1-9 run now  •  ⏎ add to chain  •  → order  •  ⌫ undo  •  esc";
+					footer = "  1-9 run now  •  ⏎ select  •  → order  •  ⌫ undo  •  esc";
 				}
 				if (chain.items.length > 0 && cursor.kind !== "run") footer += "  •  ctrl+u clear";
 				lines.push(theme.fg("dim", truncateToWidth(footer, width - 2, "")));
@@ -793,18 +793,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						return;
 					}
 					if (matchesKey(data, "right")) {
-						if (cursor.kind !== "run" && cursor.col === "task") {
-							const land = landOnOrderColumn(itemRows.map((r) => r.task), chain, cursor.row);
-							if (land === null) {
-								ctx.ui.notify(
-									chain.items.length === 0
-										? "do-always: chain is empty — add a task first"
-										: "do-always: no chained task is visible",
-									"info",
-								);
-							} else {
-								cursor = { kind: "cell", row: land, col: "order" };
-							}
+						if (cursor.kind === "cell" && cursor.col === "task") {
+							// Same row: the ORDER cell shows whether this task is
+							// in the chain, and Enter toggles it.
+							cursor = { kind: "cell", row: cursor.row, col: "order" };
 						}
 						// (→ in the ORDER column and on the Run row is a no-op:
 						// the cursor is already at the right/bottom edge.)
@@ -813,16 +805,17 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						tui.requestRender();
 						return;
 					}
-					// Row navigation.
+					// Row navigation: the cursor moves in both columns (wrap at
+					// the edges); the Run row is reached from the last task row.
 					if (kb.matches(data, "tui.select.up")) {
 						if (cursor.kind === "run") {
 							cursor = { kind: "cell", row: itemRows.length - 1, col: "task" };
-						} else if (cursor.col === "task") {
-							cursor = { kind: "cell", row: cursor.row === 0 ? itemRows.length - 1 : cursor.row - 1, col: "task" };
 						} else {
-							// ORDER column: move the task within the chain.
-							const name = itemRows[cursor.row]?.task.name;
-							if (name) chain = chainMove(chain, name, -1);
+							cursor = {
+								kind: "cell",
+								row: cursor.row === 0 ? itemRows.length - 1 : cursor.row - 1,
+								col: cursor.col,
+							};
 						}
 						lastCellRow = cursor.kind === "cell" ? cursor.row : lastCellRow;
 						resetPreview();
@@ -832,11 +825,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					if (kb.matches(data, "tui.select.down")) {
 						if (cursor.kind === "run") {
 							cursor = { kind: "cell", row: 0, col: "task" };
-						} else if (cursor.col === "task") {
-							cursor = { kind: "cell", row: cursor.row === itemRows.length - 1 ? 0 : cursor.row + 1, col: "task" };
 						} else {
-							const name = itemRows[cursor.row]?.task.name;
-							if (name) chain = chainMove(chain, name, 1);
+							cursor = {
+								kind: "cell",
+								row: cursor.row === itemRows.length - 1 ? 0 : cursor.row + 1,
+								col: cursor.col,
+							};
 						}
 						lastCellRow = cursor.kind === "cell" ? cursor.row : lastCellRow;
 						resetPreview();
@@ -856,16 +850,20 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const row = itemRows[cursor.row];
 						if (!row) return;
 						if (cursor.col === "task") {
+							// The classic pick: run just this task (fill or
+							// auto-run per its autoRun), discarding the chain.
+							finishSingle(row.task);
+							return;
+						}
+						// ORDER column: toggle this task's chain membership.
+						if (chain.items.includes(row.task.name)) {
+							chain = chainRemove(chain, row.task.name);
+						} else {
 							const { state, result } = chainAdd(chain, row.task.name);
 							chain = state;
-							if (result === "movedToEnd") {
-								ctx.ui.notify(`do-always: moved "${row.task.name}" to the end of the chain`, "info");
-							} else if (result === "full") {
+							if (result === "full") {
 								ctx.ui.notify(`do-always: chain is full (${CHAIN_MAX}) — remove a task first`, "error");
 							}
-						} else {
-							chain = chainRemove(chain, row.task.name);
-							if (chain.items.length === 0) cursor = { kind: "cell", row: cursor.row, col: "task" };
 						}
 						lastCellRow = cursor.kind === "cell" ? cursor.row : lastCellRow;
 						resetPreview();
