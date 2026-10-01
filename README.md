@@ -81,16 +81,17 @@ Building a chain in the selector:
 - The classic fast paths are unchanged: **1-9** runs a task immediately, and clicking a
   task row runs it — both close the selector and discard the chain.
 
-Chains are capped at 8 tasks. Reordering is done by removing a task and re-adding it
-(mouse drag reordering is planned for a future release). On narrow terminals the ORDER
+Chains are capped at 8 tasks. Reordering is done by removing a task and re-adding it. On narrow terminals the ORDER
 column is dropped and the chain is shown on its own line below the list (keyboard
 chaining still works).
 
 Running a chain sends each step as its own turn, strictly one after another — the next
-step starts only after the previous run has fully finished. Each step's guards are
-re-evaluated at its turn against the current state; a step whose guards no longer hold
-stops the chain there (with a warning), as do an aborted step (Esc) or a step that
-errors. Steps already run are kept.
+step starts only after the previous run has fully finished. Before anything is sent,
+every step's guards are checked against the current state (fail fast: the first blocked
+step is reported and the chain doesn't start). All steps share the prompt context
+captured when the chain started, so each step's placeholders and guards see the tree as
+it was at that point. An aborted step (Esc), a step that errors, or a step whose send
+fails to start stops the chain; steps already run are kept.
 
 If the first task of a chain is a fill task (no `⚡`) in the TUI, step 1 is put in the
 editor and the rest of the chain starts automatically once you press Enter and that run
@@ -126,11 +127,12 @@ completed step and no step result text — e.g. step 1 errors before any output)
 file behind. Set `"report": false` in the config to disable
 it (the project file's value wins over the global one). See [Report file](#report-file).
 
-**Inline report in the chat.** When a chain completes fully (all steps done), the full
-Markdown report is sent as a message in the chat so you can read the results without
-opening the file. The message is automatically removed when you start the next
-prompt or session. A run that stops early (aborted, errored, or skipped steps) does
-not show the inline report — only the status trace widget below the prompt.
+**Inline report.** When a chain completes fully (all steps done), the full Markdown
+report opens in an editor view so you can read the results without opening the file —
+press Esc to dismiss it. Nothing is persisted to the session: the report lives only in
+that view and in the report file on disk. A run that stops early (aborted, errored, or
+skipped steps) does not show the inline report — only the status trace widget below
+the prompt.
 
 ## Install
 

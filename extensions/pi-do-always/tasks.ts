@@ -46,23 +46,25 @@ export interface DoAlwaysTask {
 	guards?: Guard[];
 }
 
-/**
- * A selection-time guard that blocks a task when its condition is not met.
- * The task stays visible but selecting it notifies instead of injecting.
- * `requireDirty` needs no `value`; the others require a string `value`.
- */
-interface Guard {
-	type: "requireDirty" | "requireBranch" | "requireRepo" | "requireFilePattern";
-	value?: string;
-}
-
 /** The set of known guard types (used for validation at parse time). */
-const GUARD_TYPES = [
+export const GUARD_TYPES = [
 	"requireDirty",
 	"requireBranch",
 	"requireRepo",
 	"requireFilePattern",
 ] as const;
+
+export type GuardType = (typeof GUARD_TYPES)[number];
+
+/**
+ * A selection-time guard that blocks a task when its condition is not met.
+ * The task stays visible but selecting it notifies instead of injecting.
+ * `requireDirty` needs no `value`; the others require a string `value`.
+ */
+export interface Guard {
+	type: GuardType;
+	value?: string;
+}
 
 /**
  * A config file can be a bare array of tasks, or {"tasks": [...], "shortcut": ...}.
@@ -169,7 +171,7 @@ export const PROMPT_CONTEXT_KEYS = [
 /** A fully populated prompt context: one entry per PROMPT_CONTEXT_KEYS. */
 export type PromptContext = Record<(typeof PROMPT_CONTEXT_KEYS)[number], string>;
 
-/** Max number of file paths listed in the `files_changed` string view (the count stays exact). */
+/** Max number of file paths listed in the `files_changed` string view (the count stays exact). Exported for tests. */
 export const MAX_FILES_LISTED = 20;
 
 /**
@@ -194,6 +196,9 @@ export function toPromptContext(ctx: TaskContext): PromptContext {
 	};
 }
 
+/** Max number of file paths listed in the `staged_files` / `unstaged_files` string views. Exported for tests. */
+export const MAX_FILE_LINES = 50;
+
 /** Comma-joined list, capped at MAX_FILES_LISTED entries; "none" when empty. */
 function formatFileList(files: string[]): string {
 	if (files.length === 0) return "none";
@@ -203,9 +208,31 @@ function formatFileList(files: string[]): string {
 	return files.join(", ");
 }
 
-/** Newline-joined list; "none" when empty. */
+/** Newline-joined list, capped at MAX_FILE_LINES entries; "none" when empty. */
 function formatFileLines(files: string[]): string {
-	return files.length === 0 ? "none" : files.join("\n");
+	if (files.length === 0) return "none";
+	if (files.length > MAX_FILE_LINES) {
+		const shown = files.slice(0, MAX_FILE_LINES);
+		const remaining = files.length - MAX_FILE_LINES;
+		return [...shown, `… (+${remaining} more)`].join("\n");
+	}
+	return files.join("\n");
+}
+
+/**
+ * Extract and normalize a file path from a git status porcelain line (v1).
+ * Handles rename targets (`old -> new`) and unquotes quoted paths (`"file with space"`).
+ */
+function extractPorcelainPath(line: string): string | null {
+	if (line.length < 4) return null;
+	let path = line.slice(3).trim();
+	if (path.includes(" -> ")) {
+		path = path.split(" -> ").pop()!.trim();
+	}
+	if (path.startsWith('"') && path.endsWith('"') && path.length >= 2) {
+		path = path.slice(1, -1).replace(/\\"/g, '"');
+	}
+	return path || null;
 }
 
 /**
@@ -217,8 +244,7 @@ export function parseStatusPorcelain(status: string): string[] {
 	const files: string[] = [];
 	const seen = new Set<string>();
 	for (const line of status.split("\n")) {
-		if (line.length < 4) continue;
-		const path = line.slice(3);
+		const path = extractPorcelainPath(line);
 		if (path && !seen.has(path)) {
 			seen.add(path);
 			files.push(path);
@@ -228,10 +254,58 @@ export function parseStatusPorcelain(status: string): string[] {
 	return files;
 }
 
-/** Split raw `git diff --name-only` output into file paths (trimmed, non-empty lines). */
-export function splitFileLines(raw: string | undefined): string[] {
-	if (!raw) return [];
-	return raw.split("\n").map((line) => line.trim()).filter(Boolean);
+/**
+ * Split `git status --porcelain` (v1) output into staged and unstaged file
+ * lists. Lines are "XY <path>" (X = index, Y = worktree; the path starts at
+ * index 3): a space in the X column means the change is unstaged (worktree
+ * only), anything else is staged or untracked. Short lines are skipped and
+ * paths are deduplicated across both lists.
+ */
+export function parseStatusStagedUnstaged(
+	status: string,
+): { staged: string[]; unstaged: string[] } {
+	const staged: string[] = [];
+	const unstaged: string[] = [];
+	const seen = new Set<string>();
+	for (const line of status.split("\n")) {
+		const path = extractPorcelainPath(line);
+		if (!path || seen.has(path)) continue;
+		seen.add(path);
+		if (line[0] === " ") unstaged.push(path);
+		else staged.push(path);
+	}
+	return { staged, unstaged };
+}
+
+/**
+ * Extract the commit subject from a `git log --format=%H %s` line
+ * ("<hash> <subject>"). The subject may contain spaces, so everything after
+ * the first space is the subject. Returns "unknown" when the line is missing
+ * or carries no subject.
+ */
+export function parseCommitSubject(commitLine: string | undefined): string {
+	if (!commitLine) return "unknown";
+	const space = commitLine.indexOf(" ");
+	return space > 0 ? commitLine.slice(space + 1) || "unknown" : "unknown";
+}
+
+/**
+ * Extract one key's value from `git config --get-regexp` output (one
+ * "key value" pair per line). The value may contain spaces (e.g.
+ * user.name "John Doe"), so everything after the first space is the value.
+ * Returns undefined when the key is absent or its value is empty.
+ */
+export function parseConfigRegexpValueForKey(
+	raw: string | undefined,
+	key: string,
+): string | undefined {
+	if (!raw) return undefined;
+	for (const line of raw.split("\n")) {
+		if (!line.startsWith(key + " ")) continue;
+		const value = line.slice(key.length + 1);
+		return value || undefined;
+	}
+	return undefined;
 }
 
 /** Used when neither config file defines any task. */
@@ -246,7 +320,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 			"Change summary: {{diff_stat}}. Last commit: {{last_commit}}. " +
 			"Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, " +
 			"edge cases, security issues, and consistency with the rest of the codebase. " +
-			"Do a plan proposal for the fixes if needed. Do a summary of your findings",
+			"Do a plan proposal for the fixes if needed. Do a summary of your findings.",
 	},
 	{
 		name: "Review code",
@@ -320,7 +394,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		category: "Plan",
 		description: "Propose new features (Plan)",
 		prompt:
-			"Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in term of changes, if this will breaks API, compatibility issue.",
+			"Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in terms of changes, whether this will break APIs, or introduce compatibility issues.",
 	},
 ];
 
@@ -591,7 +665,7 @@ export function evaluateWhen(task: DoAlwaysTask, ctx: TaskContext): boolean {
 	return true;
 }
 
-/** Default order for category headers in the selector. */
+/** Default order for category headers in the selector. Exported for tests. */
 export const DEFAULT_CATEGORY_ORDER = ["Plan", "Do", "Docs", "Ops", "Other"];
 
 /** A category group: a display name and the tasks that belong to it. */
@@ -908,20 +982,6 @@ export function chainUndo(state: ChainState): { state: ChainState; removed: stri
 }
 
 /**
- * Move a task one position up (-1) or down (1) in the chain. No-op at the
- * ends or when the name is not in the chain.
- */
-export function chainMove(state: ChainState, name: string, dir: -1 | 1): ChainState {
-	const idx = state.items.indexOf(name);
-	const target = idx + dir;
-	if (idx < 0 || target < 0 || target >= state.items.length) return state;
-	const items = [...state.items];
-	items[idx] = items[target];
-	items[target] = name;
-	return { ...state, items };
-}
-
-/**
  * Label for the pinned Run row: a dimmed placeholder for an empty chain,
  * singular for one task, plural with the count otherwise.
  */
@@ -1016,7 +1076,7 @@ function reportTime(d: Date): string {
 	return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-/** File name for one chain run's report, e.g. do-always-report-tasks-2025-01-15-1432.md. */
+/** File name for one chain run's report, e.g. do-always-report-tasks-2025-01-15-1432.md. Exported for tests. */
 export function reportFileName(now: Date): string {
 	const p = (n: number) => String(n).padStart(2, "0");
 	return `do-always-report-tasks-${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}.md`;
@@ -1121,4 +1181,85 @@ export function assistantText(
 	return content
 		.flatMap((part) => (part && part.type === "text" && typeof part.text === "string" ? [part.text] : []))
 		.join("\n");
+}
+
+// ── Chain step summary ───────────────────────────────────────────────────
+//
+// Compact per-step and chain-end summary strings for notifications.
+// These are derived from the existing report data (outcome, timing, file count)
+// and provide immediate, scannable feedback after each chain step.
+
+/** Outcome of one chain step's run (see `sendAndWait`). */
+export type ChainStepOutcome = "completed" | "aborted" | "error" | "failed-to-start";
+
+/**
+ * Generate a compact per-step summary string for notifications.
+ * Examples:
+ *   "✓ Build — 3 files changed — 2m14s"
+ *   "✗ Tests — 45s"
+ *   "⊘ Review changes"
+ *
+ * @param outcome      the step outcome
+ * @param stepName     the task name
+ * @param durationMs   how long the step took (0 if not timed)
+ * @param fileCount    number of changed files after the step (0 if unknown)
+ * @returns the summary string
+ */
+export function stepSummary(
+	outcome: ChainStepOutcome,
+	stepName: string,
+	durationMs: number,
+	fileCount: number,
+): string {
+	const marker = outcomeToMarker(outcome);
+	const parts: string[] = [marker, stepName];
+	if (fileCount > 0) {
+		parts.push(`${fileCount} file${fileCount === 1 ? "" : "s"} changed`);
+	}
+	if (durationMs > 0) {
+		parts.push(formatDuration(durationMs));
+	}
+	// Only add " — " separator when there are parts beyond marker+name.
+	if (parts.length > 2) {
+		return `${marker} ${stepName} — ${parts.slice(2).join(" — ")}`;
+	}
+	return `${marker} ${stepName}`;
+}
+
+/**
+ * Generate a compact chain-end summary string, e.g.
+ * "✅ 4/4 steps completed in 6m42s". Only reachable when every step
+ * completed — the stop paths return early with their own per-step
+ * notification, so `completed` always equals `total` here.
+ */
+export function chainSummary(completed: number, total: number, totalMs: number): string {
+	const time = totalMs > 0 ? formatDuration(totalMs) : "";
+	return `✅ ${completed}/${total} steps completed${time ? ` in ${time}` : ""}`;
+}
+
+/** Format milliseconds to a human-readable duration string. Exported for tests. */
+export function formatDuration(ms: number): string {
+	if (ms < 1000) return `${ms}ms`;
+	const s = Math.floor(ms / 1000);
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	const rem = s % 60;
+	return rem > 0 ? `${m}m${rem}s` : `${m}m`;
+}
+
+/** Map a step outcome to its display marker character. */
+function outcomeToMarker(outcome: ChainStepOutcome): string {
+	switch (outcome) {
+		case "completed":
+			return "✓";
+		case "aborted":
+			return "⊘";
+		case "error":
+			return "✗";
+		case "failed-to-start":
+			return "✗";
+		default:
+			// Exhaustive check: the type is a literal union, so this is unreachable.
+			throw new Error(`unexpected outcome: ${outcome as string}`);
+	}
 }

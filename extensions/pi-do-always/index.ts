@@ -33,10 +33,10 @@
  * If no config file exists, built-in default tasks are used.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	type KeyId,
@@ -59,6 +59,7 @@ import {
 	chainClear,
 	chainRemove,
 	chainRunLabel,
+	chainSummary,
 	chainUndo,
 	evaluateGuards,
 	evaluateWhen,
@@ -68,7 +69,10 @@ import {
 	isValidKeyId,
 	mergeTasks,
 	parseConfig,
+	parseConfigRegexpValueForKey,
+	parseCommitSubject,
 	parseStatusPorcelain,
+	parseStatusStagedUnstaged,
 	orderTasksByCategory,
 	reportAbandonedFooter,
 	reportFooter,
@@ -80,8 +84,10 @@ import {
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
+	stepSummary,
 	toPromptContext,
 	validateChain,
+	type ChainStepOutcome,
 	type DoAlwaysTask,
 	type TaskContext,
 	type TableRow,
@@ -101,6 +107,20 @@ type SelectorResult =
  * pinned Run row.
  */
 type Cursor = { kind: "cell"; row: number; col: "task" | "order" } | { kind: "run" };
+
+/**
+ * Safely read a config file's contents, returning null if missing or unreadable.
+ * Read errors are reported through `onError`.
+ */
+function readConfigFile(filePath: string, onError: (message: string) => void): string | null {
+	if (!existsSync(filePath)) return null;
+	try {
+		return readFileSync(filePath, "utf-8");
+	} catch (err) {
+		onError(`do-always: could not read ${filePath}: ${err}`);
+		return null;
+	}
+}
 
 /**
  * Load tasks and the selector shortcut from config files.
@@ -124,11 +144,14 @@ function loadConfig(
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
 
-	const global = existsSync(globalPath)
-		? parseConfig(readFileSync(globalPath, "utf-8"), globalPath, onError)
+	const globalRaw = readConfigFile(globalPath, onError);
+	const projectRaw = readConfigFile(projectPath, onError);
+
+	const global = globalRaw !== null
+		? parseConfig(globalRaw, globalPath, onError)
 		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined };
-	const project = existsSync(projectPath)
-		? parseConfig(readFileSync(projectPath, "utf-8"), projectPath, onError)
+	const project = projectRaw !== null
+		? parseConfig(projectRaw, projectPath, onError)
 		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined };
 
 	// The project file's merge mode wins; otherwise the global value; otherwise
@@ -152,36 +175,25 @@ function loadConfig(
  * empty repo, …) so callers can fall back to a neutral value.
  * No shell is involved (argument array), so file names cannot inject commands.
  */
-function git(cwd: string, args: string[]): string | undefined {
-	try {
-		const out = execFileSync("git", args, {
-			cwd,
-			encoding: "utf-8",
-			stdio: ["ignore", "pipe", "ignore"],
-		});
-		const trimmed = out.trim();
-		return trimmed === "" ? undefined : trimmed;
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Cache that deduplicates `buildContext` calls for the same cwd within a
- * single user action (chain run, /do-always invocation, session_start).
- * The cache is created fresh for each action entry point.
- */
-function createContextCache(): {
-	get(cwd: string): TaskContext;
-} {
-	let cached: { cwd: string; ctx: TaskContext } | null = null;
-	return {
-		get(cwd: string): TaskContext {
-			if (cached && cached.cwd === cwd) return cached.ctx;
-			cached = { cwd, ctx: buildContext(cwd) };
-			return cached.ctx;
-		},
-	};
+function git(cwd: string, args: string[]): Promise<string | undefined> {
+	return new Promise((resolve) => {
+		// No stdio option: execFile's string-encoding overload doesn't accept
+		// it, and stdin/stderr need no special handling here (no input is
+		// written; stderr is simply ignored by the callback).
+		execFile(
+			"git",
+			args,
+			{ cwd, encoding: "utf-8" },
+			(error, stdout) => {
+				if (error) {
+					resolve(undefined);
+					return;
+				}
+				const trimmed = stdout.trim();
+				resolve(trimmed === "" ? undefined : trimmed);
+			},
+		);
+	});
 }
 
 /**
@@ -189,57 +201,67 @@ function createContextCache(): {
  * to neutral values when unavailable (non-git dir, no git, empty repo) so
  * default prompts read cleanly in any directory.
  *
- * Batches the 9 individual git calls into 5:
- *  1. rev-parse --abbrev-ref HEAD --is-inside-work-tree → branch + isGitRepo
- *  2. log -1 --format="%H %s" → commit hash + subject
- *  3. config --get-regexp "^user.name$|^remote.origin.url$" → user + remote
- *  4. status --porcelain → stagedFiles + unstagedFiles (parsed from porcelain)
- *  5. diff --shortstat → diffStat
+ * Collects the git facts the prompts interpolate:
+ *  1. rev-parse --is-inside-work-tree → isGitRepo
+ *  2. branch --show-current → branch (fallback: rev-parse --abbrev-ref HEAD)
+ *  3. log -1 --format="%H %s" → commit hash + subject
+ *  4. config --get-regexp "^(user.name|remote.origin.url)$" → user + repo
+ *  5. status --porcelain → files + stagedFiles + unstagedFiles
+ *  6. diff --shortstat → diffStat
+ *
+ * Outside a work tree only call 1 runs; inside one, calls 2–6 run in
+ * parallel, so wall time is about one spawn.
  */
-function buildContext(cwd: string): TaskContext {
-	// 1. Branch + isGitRepo in one call.
-	//    rev-parse --abbrev-ref HEAD --is-inside-work-tree outputs two lines:
-	//      <branch-name>
-	//      true|false
-	//    Fails (exit != 0) when not in a work tree.
-	const revParse = git(cwd, ["rev-parse", "--abbrev-ref", "HEAD", "--is-inside-work-tree"]);
-	const lines = revParse ? revParse.split("\n") : [];
-	const branch = lines[0] ?? "unknown";
-	const isGitRepo = lines[1] === "true";
+async function buildContext(cwd: string): Promise<TaskContext> {
+	// 1. Authoritative check: are we inside a work tree?
+	//    rev-parse --is-inside-work-tree outputs "true" when inside a work tree,
+	//    and fails (exit != 0) when outside.
+	const inside = await git(cwd, ["rev-parse", "--is-inside-work-tree"]);
+	const isGitRepo = inside === "true";
 
-	// 2. Commit subject (hash is unused but cheap to fetch alongside).
-	const commitLine = isGitRepo ? git(cwd, ["log", "-1", "--format=%H %s"]) : undefined;
-	const lastCommit = commitLine ? commitLine.split(" ", 2).pop() ?? "unknown" : "unknown";
+	// Outside a work tree the remaining facts don't exist; skip the spawns
+	// and return the neutral fallbacks directly.
+	if (!isGitRepo) {
+		return {
+			cwd,
+			date: new Date().toLocaleDateString("en-CA"), // local YYYY-MM-DD
+			branch: "unknown",
+			lastCommit: "unknown",
+			files: [],
+			user: "unknown",
+			diffStat: "none",
+			repo: cwd.split(/[\\/]/).filter(Boolean).pop() ?? "unknown",
+			stagedFiles: [],
+			unstagedFiles: [],
+			isGitRepo: false,
+		};
+	}
 
-	// 3. User + remote in one config call.
-	const user = isGitRepo ? git(cwd, ["config", "--get-regexp", "^user\\.name$"]) : undefined;
-	const remoteUrl = isGitRepo ? git(cwd, ["config", "--get-regexp", "^remote\\.origin\\.url$"]) : undefined;
+	// 2–6. In a work tree: query branch and the remaining facts in parallel.
+	const [branchOut, lastCommitLine, configLine, porcelain, diffStat] = await Promise.all([
+		// branch --show-current works on both normal and unborn (empty repo) branches;
+		// returns empty on detached HEAD.
+		git(cwd, ["branch", "--show-current"]),
+		// "%H %s" prints "<hash> <subject>"; the subject may contain spaces.
+		git(cwd, ["log", "-1", "--format=%H %s"]),
+		// --get-regexp prints "key value" lines; one call covers both keys.
+		git(cwd, ["config", "--get-regexp", "^(user\\.name|remote\\.origin\\.url)$"]),
+		git(cwd, ["status", "--porcelain"]),
+		git(cwd, ["diff", "--shortstat"]),
+	]);
+
+	const branch = branchOut || (await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])) || "unknown";
+	const lastCommit = parseCommitSubject(lastCommitLine);
+	const user = parseConfigRegexpValueForKey(configLine, "user.name");
+	const remoteUrl = parseConfigRegexpValueForKey(configLine, "remote.origin.url");
 	const repo = remoteUrl
 		? (remoteUrl.replace(/\.git$/, "").split("/").pop() ?? "unknown")
 		: cwd.split(/[\\/]/).filter(Boolean).pop() ?? "unknown";
 
-	// 4. status --porcelain gives staged + unstaged in one call.
-	//    Lines starting with a space are unstaged; others are staged/untracked.
-	const porcelain = isGitRepo ? git(cwd, ["status", "--porcelain"]) : "";
-	const stagedFiles: string[] = [];
-	const unstagedFiles: string[] = [];
-	const fileSet = new Set<string>();
-	if (porcelain) {
-		for (const line of porcelain.split("\n")) {
-			if (line.length < 2) continue;
-			const file = line.slice(2);
-			if (fileSet.has(file)) continue; // deduplicate
-			fileSet.add(file);
-			if (line[0] === " ") {
-				unstagedFiles.push(file);
-			} else {
-				stagedFiles.push(file);
-			}
-		}
-	}
-
-	// 5. diff --shortstat.
-	const diffStat = isGitRepo ? git(cwd, ["diff", "--shortstat"]) : undefined;
+	// status --porcelain gives staged + unstaged in one call.
+	// Porcelain v1 lines are "XY <path>" (path starts at index 3); a space
+	// in the X column means unstaged, anything else is staged/untracked.
+	const { staged: stagedFiles, unstaged: unstagedFiles } = parseStatusStagedUnstaged(porcelain ?? "");
 
 	return {
 		cwd,
@@ -267,8 +289,6 @@ const PREVIEW_DELAY_MS = 2000;
 const PREVIEW_MAX_LINES = 3;
 
 /** Outcome of one chain step's run (see sendAndWait). */
-type ChainStepOutcome = "completed" | "aborted" | "error" | "failed-to-start";
-
 /**
  * Status of one chain step for the below-prompt status widget: pending
  * (not reached yet), running (its turn is in flight), waiting (fill-first:
@@ -319,6 +339,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		resolve: (outcome: ChainStepOutcome) => void;
 		/** Which chain step (0-based) this waiter belongs to — for the report. */
 		stepIndex: number;
+		startTime?: number;
 	} | null = null;
 
 	function settleChainWaiter(outcome: ChainStepOutcome) {
@@ -326,6 +347,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		const waiter = chainWaiter;
 		chainWaiter = null;
 		if (waiter.timer) clearTimeout(waiter.timer);
+		if (waiter.startTime !== undefined) {
+			chainDurations[waiter.stepIndex] = performance.now() - waiter.startTime;
+		}
 		waiter.resolve(outcome);
 	}
 
@@ -343,15 +367,38 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// their event waiters (the old chain's sendAndWait would resolve on the
 	// new chain's step), so starting one is refused until the first ends.
 	let chainActive = false;
+	// Per-step durations (ms) for the chain-end summary. Indexed by step
+	// position; 0 means the step was not timed (e.g. blocked before running).
+	let chainDurations: number[] = [];
+	// For single auto-run tasks: the task name whose summary we post after
+	// agent_end. Only set when a Plan task (auto-run) is sent via
+	// pi.sendUserMessage (which does NOT arm a chainWaiter). The grace timer
+	// mirrors the chain's failed-to-start handling: a send that fails before
+	// the run starts emits no agent events at all, so without it the stale
+	// flag would post a spurious summary for the next unrelated turn.
+	let pendingSummaryTask: string | null = null;
+	let pendingSummaryTimer: NodeJS.Timeout | null = null;
+
+	/** Clear the auto-run summary flag and its grace timer (session start). */
+	function resetPendingSummary(): void {
+		pendingSummaryTask = null;
+		if (pendingSummaryTimer) {
+			clearTimeout(pendingSummaryTimer);
+			pendingSummaryTimer = null;
+		}
+	}
 	// Whether chain runs write a Markdown report file (config `report`,
 	// default true). Refreshed whenever the config is (re)loaded.
 	let reportEnabled = true;
 	// The in-flight chain's report file: its path (absolute + relative for
-	// display), when the current step's run actually started (agent_start;
-	// null until then and for failed-to-start steps), whether the footer has
-	// been appended, the index of the last step section written (dedupes
-	// retried runs), and whether any step section carried result text (the
-	// file is worth keeping).
+	// display), the precomputed header (deferred — written together with the
+	// first step section, so a chain that dies before that leaves no
+	// header-only file behind), whether the file exists on disk yet, when the
+	// current step's run actually started (agent_start; null until then and
+	// for failed-to-start steps), whether the footer has been appended, the
+	// index of the last step section written (dedupes retried runs), and
+	// whether any step section carried result text (the file is worth
+	// keeping).
 	// Max in-memory sections kept for inline display; the file on disk retains
 	// all steps. Bounded to avoid holding 400KB–2MB of assistant text per chain.
 	const MAX_INLINE_SECTIONS = 3;
@@ -359,6 +406,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	let chainReport: {
 		path: string;
 		display: string;
+		/** Precomputed header; written together with the first section. */
+		header: string;
+		/** True once the file exists on disk (header written). */
+		written: boolean;
 		stepStartedAt: Date | null;
 		/** True once the summary (or abandoned) footer has been appended. */
 		footerWritten: boolean;
@@ -369,9 +420,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		/**
 		 * In-memory section data for inline display (populated in agent_end,
 		 * bounded to the last MAX_INLINE_SECTIONS). `index` is the step's
-		 * position in the chain (retries share it); `name` matches the file.
+		 * position in the chain (retries share it); `markdown` is the formatted section.
 		 */
-		sections: Array<{ index: number; name: string; outcome: string; text: string }>;
+		sections: Array<{ index: number; markdown: string }>;
 	} | null = null;
 
 	/** Status marker glyph (all one column wide) with its color. */
@@ -433,7 +484,25 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * removes the status widget so nothing lingers below the prompt; otherwise
 	 * keeps it as a trace with the report path in the note.
 	 */
-	function finishReport(ctx: ExtensionContext): void {
+	/**
+	 * Write the deferred report header so the file exists before the first
+	 * section/footer append. Returns false when there is no report or the
+	 * write failed (a warning was shown); the chain runs on without a file.
+	 */
+	function ensureReportFile(ctx: ExtensionContext | null): boolean {
+		const report = chainReport;
+		if (!report || report.written) return report !== null;
+		try {
+			writeFileSync(report.path, report.header);
+			report.written = true;
+			return true;
+		} catch (err) {
+			ctx?.ui.notify(`do-always: could not create the report file: ${err}`, "warning");
+			return false;
+		}
+	}
+
+	async function finishReport(ctx: ExtensionContext): Promise<void> {
 		if (!chainReport || !chainStatus) return;
 		const statuses = chainStatus.steps.map((s) => s.status);
 		// Nothing worth keeping — remove the (mostly) empty file so a quick
@@ -443,19 +512,21 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			chainReport = null;
 			return;
 		}
-		try {
-			appendFileSync(chainReport.path, reportFooter(statuses, new Date()));
-			chainReport.footerWritten = true;
-		} catch (err) {
-			ctx.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
+		if (ensureReportFile(ctx)) {
+			try {
+				appendFileSync(chainReport.path, reportFooter(statuses, new Date()));
+				chainReport.footerWritten = true;
+			} catch (err) {
+				ctx.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
+			}
 		}
 		const prev = chainStatus.note ? `${chainStatus.note} • ` : "";
 		chainStatus.note = `${prev}📄 ${chainReport.display}`;
-		// Chain fully done → show inline report above editor, then clear the
+		// Chain fully done → show the inline report, then clear the
 		// trace widget. Chain stopped early → keep the trace widget.
 		const allDone = statuses.every((s) => s === "completed");
 		if (allDone) {
-			showInlineReport();
+			await showInlineReport(ctx);
 			clearChainWidget(ctx);
 		} else {
 			updateChainWidget(ctx);
@@ -463,11 +534,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Send the full chain report as a markdown message in the chat when a chain
-	 * completes. Built from in-memory section data (no file read needed).
-	 * Auto-cleared on the next agent_start / session_start.
+	 * Show the full chain report in an ephemeral editor view when a chain
+	 * completes (TUI only). Built from in-memory section data (no file read
+	 * needed). Nothing is persisted to the session — the view closes with
+	 * Esc and the report file on disk is the permanent artifact. In non-TUI
+	 * modes the editor is a no-op; the final notification carries the file
+	 * path.
 	 */
-	function showInlineReport(): void {
+	async function showInlineReport(ctx: ExtensionContext): Promise<void> {
+		if (ctx.mode !== "tui") return;
 		if (!chainReport || !chainStatus || chainReport.sections.length === 0) return;
 		// Reconstruct the report from in-memory sections. Only the last
 		// MAX_INLINE_SECTIONS are kept (the file on disk has all of them), so
@@ -485,49 +560,43 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			lines.push("");
 		}
 		for (const sec of chainReport.sections) {
-			const section = reportStepSection(
-				sec.index,
-				sec.name,
-				sec.outcome,
-				new Date(), // approximate start
-				new Date(), // approximate end
-				sec.text,
-			);
-			lines.push(section);
-			lines.push("");
+			lines.push(sec.markdown);
 		}
 		// Footer.
 		const statuses = chainStatus.steps.map((s) => s.status);
 		lines.push(reportFooter(statuses, new Date()));
 
-		// Send as a markdown message in the chat (renders as markdown, not plain text).
-		pi.sendMessage({
-			customType: "do-always-report",
-			content: lines.join("\n"),
-			display: true,
-			details: chainReport.display,
-		});
+		// Ephemeral editor view: read the report, Esc to dismiss. Unlike
+		// pi.sendMessage this persists nothing to the session.
+		await ctx.ui.editor("do-always — chain report", lines.join("\n"));
 	}
 
 	/**
 	 * Close an in-flight report that never reached a terminal path (e.g.,
 	 * the session ended mid-chain): delete the file when the run produced
-	 * nothing worth keeping, otherwise append an "abandoned" footer so it
-	 * does not stay header-only on disk.
+	 * nothing worth keeping (a no-op when the deferred header was never
+	 * written), otherwise append an "abandoned" footer so it does not stay
+	 * header-only on disk.
 	 */
 	function closeAbandonedReport(statuses: string[]): void {
 		if (!chainReport || chainReport.footerWritten) return;
 		if (!reportWorthKeeping(statuses, chainReport.hasContent)) {
-			// Nothing worth keeping — remove the (mostly) empty file.
-			try {
-				unlinkSync(chainReport.path);
-			} catch {
-				// Best effort — the file stays on disk.
+			// Nothing worth keeping — remove the file if it was written.
+			if (chainReport.written) {
+				try {
+					unlinkSync(chainReport.path);
+				} catch {
+					// Best effort — the file stays on disk.
+				}
 			}
 			return;
 		}
 		try {
-			appendFileSync(chainReport.path, reportAbandonedFooter(statuses, new Date()));
+			if (chainReport.written) {
+				appendFileSync(chainReport.path, reportAbandonedFooter(statuses, new Date()));
+			} else {
+				writeFileSync(chainReport.path, chainReport.header + reportAbandonedFooter(statuses, new Date()));
+			}
 		} catch {
 			// Best effort — the report file stays as-is on disk.
 		}
@@ -581,7 +650,16 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("agent_start", () => {
-		if (chainWaiter) chainWaiter.started = true;
+		if (chainWaiter) {
+			chainWaiter.started = true;
+			chainWaiter.startTime = performance.now();
+		}
+		// The run actually began — cancel the auto-run task's failed-to-start
+		// grace timer (its summary posts at agent_end).
+		if (pendingSummaryTimer) {
+			clearTimeout(pendingSummaryTimer);
+			pendingSummaryTimer = null;
+		}
 		// The run actually began — time the step for the report.
 		if (chainReport) chainReport.stepStartedAt = new Date();
 		// Fill-first: step 1 left the editor and is running — update the
@@ -595,12 +673,47 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			clearChainWidget(lastCtx);
 		}
 	});
+	/** The turn's last assistant message (backward scan — no copy/reverse). */
+	function lastAssistantMessage(messages: AgentEndEvent["messages"]) {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i];
+			if (m.role === "assistant") return m;
+		}
+		return null;
+	}
+
+	/** Map an assistant message's stopReason to a chain step outcome. */
+	function outcomeFromStopReason(stopReason: string | undefined): "completed" | "aborted" | "error" {
+		if (stopReason === "aborted") return "aborted";
+		if (stopReason === "error") return "error";
+		return "completed";
+	}
+
 	pi.on("agent_end", (event) => {
+		// The agent may have changed the repo — drop the TTL context cache so
+		// the next action sees the new tree (a running chain keeps its own
+		// per-action snapshot and is unaffected).
+		contextCache = null;
+		// Single auto-run task summary (no chainWaiter: pi.sendUserMessage is
+		// fire-and-forget, so no armWaiter is called).
+		if (!chainWaiter && pendingSummaryTask) {
+			if (pendingSummaryTimer) {
+				clearTimeout(pendingSummaryTimer);
+				pendingSummaryTimer = null;
+			}
+			const lastAssistant = lastAssistantMessage(event.messages);
+			if (lastAssistant) {
+				const outcome = outcomeFromStopReason(lastAssistant.stopReason);
+				const summary = stepSummary(outcome, pendingSummaryTask, 0, 0);
+				lastCtx?.ui.notify(`do-always: ${summary}`, "info");
+			}
+			pendingSummaryTask = null;
+			return;
+		}
 		if (!chainWaiter) return;
-		const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
+		const lastAssistant = lastAssistantMessage(event.messages);
 		if (lastAssistant) {
-			const stopReason = lastAssistant.stopReason;
-			const outcome = stopReason === "aborted" ? "aborted" : stopReason === "error" ? "error" : "completed";
+			const outcome = outcomeFromStopReason(lastAssistant.stopReason);
 			chainWaiter.outcome = outcome;
 			// Append this step's result to the report while the transcript is
 			// fresh (the step's final assistant message is its result).
@@ -621,18 +734,20 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					new Date(),
 					text,
 				);
-				try {
-					appendFileSync(chainReport.path, section);
-					chainReport.lastStepSection = idx;
-					if (text.trim() !== "") chainReport.hasContent = true;
-					// Keep in-memory section data for inline display (bounded);
-					// index + display name let it number sections like the file.
-					chainReport.sections.push({ index: idx, name: displayName, outcome, text });
-					if (chainReport.sections.length > MAX_INLINE_SECTIONS) {
-						chainReport.sections.splice(0, chainReport.sections.length - MAX_INLINE_SECTIONS);
+				if (ensureReportFile(lastCtx)) {
+					try {
+						appendFileSync(chainReport.path, section);
+						chainReport.lastStepSection = idx;
+						if (text.trim() !== "") chainReport.hasContent = true;
+						// Keep in-memory section data for inline display (bounded);
+						// index lets it number sections like the file.
+						chainReport.sections.push({ index: idx, markdown: section });
+						if (chainReport.sections.length > MAX_INLINE_SECTIONS) {
+							chainReport.sections.splice(0, chainReport.sections.length - MAX_INLINE_SECTIONS);
+						}
+					} catch (err) {
+						lastCtx?.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
 					}
-				} catch (err) {
-					lastCtx?.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
 				}
 				chainReport.stepStartedAt = null;
 			}
@@ -698,7 +813,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		});
 	}
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
 		// Surface config validation problems (the README promises warnings);
 		// in non-TUI modes there is no UI, so fall back to the console.
@@ -709,13 +824,54 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// A failed chain's status widget is a trace of the previous session;
 		// start each session clean.
 		clearChainWidget(ctx);
+		// Likewise a stale auto-run summary flag (e.g., a send that never
+		// started) must not post a spurious summary for this session's turns.
+		resetPendingSummary();
 		loadedCwd = ctx.cwd;
 		const config = loadConfig(ctx.cwd, onError);
 		tasks = config.tasks;
 		reportEnabled = config.report;
-		refreshVisible(ctx.cwd, buildContext(ctx.cwd));
+		refreshVisible(ctx.cwd, await getContext(ctx.cwd));
 		registerShortcut(config.shortcut, onError);
 	});
+
+	// Extension-level git context cache, keyed by cwd with a short TTL:
+	// buildContext spawns git, and the repo rarely changes between actions,
+	// so the session_start precompute feeds the first /do-always and
+	// repeated invocations within the window reuse the same context.
+	// Invalidated on agent_end (the agent may have changed the repo); a
+	// running chain keeps its own per-action snapshot (createContextCache),
+	// so its steps reuse one context across the run.
+	let contextCache: { cwd: string; at: number; ctx: TaskContext } | null = null;
+	const CONTEXT_TTL_MS = 5_000;
+
+	async function getContext(cwd: string): Promise<TaskContext> {
+		if (contextCache && contextCache.cwd === cwd && Date.now() - contextCache.at < CONTEXT_TTL_MS) {
+			return contextCache.ctx;
+		}
+		const ctx = await buildContext(cwd);
+		contextCache = { cwd, at: Date.now(), ctx };
+		return ctx;
+	}
+
+	/**
+	 * Per-action context cache: the first build consults the extension-level
+	 * TTL cache (getContext), and later builds within the same action reuse
+	 * that snapshot — what the user saw in the preview is what gets injected.
+	 * Created fresh at each action entry point (runDoAlways, runChain).
+	 */
+	function createContextCache(): {
+		get(cwd: string): Promise<TaskContext>;
+	} {
+		let cached: { cwd: string; ctx: TaskContext } | null = null;
+		return {
+			async get(cwd: string): Promise<TaskContext> {
+				if (cached && cached.cwd === cwd) return cached.ctx;
+				cached = { cwd, ctx: await getContext(cwd) };
+				return cached.ctx;
+			},
+		};
+	}
 
 	/** Put the task prompt into the editor (TUI) or send it as a user message (other modes). */
 	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext, context: TaskContext): Promise<void> {
@@ -730,6 +886,19 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		if (shouldAutoRun(task)) {
 			// Fire-and-forget: sendUserMessage returns void; the run proceeds
 			// independently (see the chain control notes for why).
+			// Track the task so we can post a summary after agent_end.
+			pendingSummaryTask = task.name;
+			// If the run never starts (no agent events at all — same failure
+			// mode the chain's grace timer handles), drop the flag so a later
+			// unrelated turn can't post a spurious summary for this task.
+			if (pendingSummaryTimer) clearTimeout(pendingSummaryTimer);
+			pendingSummaryTimer = setTimeout(() => {
+				pendingSummaryTimer = null;
+				if (!pendingSummaryTask) return;
+				const name = pendingSummaryTask;
+				pendingSummaryTask = null;
+				lastCtx?.ui.notify(`do-always: "${name}" failed to start (check model/API key)`, "error");
+			}, 10_000);
 			pi.sendUserMessage(prompt);
 			ctx.ui.notify(`do-always: auto-ran "${task.name}"`, "info");
 			return;
@@ -768,33 +937,37 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return;
 		}
 		// Fail fast: report the first blocked step before sending anything.
-		const blocked = validateChain(tasks, { items: names, history: [] }, cache.get(ctx.cwd));
+		const blocked = validateChain(tasks, { items: names, history: [] }, await cache.get(ctx.cwd));
 		if (blocked) {
 			ctx.ui.notify(`do-always: chain blocked at step ${blocked.step} (${blocked.task.name}): ${blocked.message}`, "warning");
 			return;
 		}
 		chainActive = true;
-		// Report file: one per run, in the project root, appended as each step
-		// finishes (see the report section in tasks.ts). A write failure is not
+		// Per-step durations for the chain-end summary. Re-initialized each
+		// chain run so stale durations from a previous run don't leak in.
+		// Pre-filled with 0 so the fill-first step (index 0, timed outside
+		// runChainSteps) and any unrun steps don't leave `undefined` holes
+		// that would poison the reduce with NaN.
+		chainDurations = Array.from({ length: steps.length }, () => 0);
+		// Report file: one per run, in the project root. The header is
+		// deferred until the first step section (a chain that dies before
+		// that leaves no file), and each step is appended as it finishes
+		// (see the report section in tasks.ts). A write failure is not
 		// fatal — the chain still runs, just without a report.
 		if (reportEnabled) {
 			const now = new Date();
 			const path = resolveReportPath(ctx.cwd, now);
-			try {
-				writeFileSync(path, reportHeader(ctx.cwd, steps.map((t) => t.name), now));
-				chainReport = {
-					path,
-					display: relative(ctx.cwd, path),
-					stepStartedAt: null,
-					footerWritten: false,
-					lastStepSection: -1,
-					hasContent: false,
-					sections: [],
-				};
-			} catch (err) {
-				ctx.ui.notify(`do-always: could not create the report file: ${err}`, "warning");
-				chainReport = null;
-			}
+			chainReport = {
+				path,
+				display: relative(ctx.cwd, path),
+				header: reportHeader(ctx.cwd, steps.map((t) => t.name), now),
+				written: false,
+				stepStartedAt: null,
+				footerWritten: false,
+				lastStepSection: -1,
+				hasContent: false,
+				sections: [],
+			};
 		}
 		const first = steps[0];
 		if (shouldAutoRun(first) || ctx.mode !== "tui") {
@@ -803,7 +976,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					ctx,
 					steps.map((t, i) => ({ name: t.name, status: i === 0 ? "running" : "pending" })),
 				);
-				await runChainSteps(steps, ctx, 0, cache);
+				await runChainSteps(steps, ctx, 0);
 			} finally {
 				chainActive = false;
 			}
@@ -819,7 +992,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			steps.map((t, i) => ({ name: t.name, status: i === 0 ? "waiting" : "pending" })),
 			"step 1 is in the editor — press Enter to start",
 		);
-		ctx.ui.setEditorText(renderPrompt(first.prompt, toPromptContext(cache.get(ctx.cwd))));
+		const firstContext = await cache.get(ctx.cwd);
+		ctx.ui.setEditorText(renderPrompt(first.prompt, toPromptContext(firstContext)));
 		ctx.ui.notify(
 			`do-always: step 1 of ${steps.length} in the editor — press Enter to run; steps 2–${steps.length} follow automatically`,
 			"info",
@@ -828,12 +1002,17 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			try {
 				if (outcome !== "completed") {
 					markChainStopped(ctx, 0, outcome);
-					finishReport(ctx);
+					await finishReport(ctx);
 					ctx.ui.notify(`do-always: step 1 — ${outcome}; chain stopped`, "error");
 					return;
 				}
 				setChainStep(ctx, 0, "completed");
-				await runChainSteps(steps, ctx, 1, cache);
+				// Post-step summary for step 1 (fill-first)
+				const postContext = await getContext(ctx.cwd);
+				const fileCount = postContext.files.length;
+				const summary = stepSummary(outcome, first.name, chainDurations[0], fileCount);
+				ctx.ui.notify(`do-always: step 1/${steps.length} — ${summary}`, "info");
+				await runChainSteps(steps, ctx, 1);
 			} finally {
 				chainActive = false;
 			}
@@ -841,24 +1020,23 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Send chain steps `startAt..end` sequentially. Each step gets a fresh
-	 * context (so its guards see the tree as it is now) and is awaited until
-	 * its run has fully settled; an aborted/errored step (or a send that
-	 * failed to start) stops the chain.
+	 * Send chain steps `startAt..end` sequentially. Each step evaluates guards
+	 * and renders prompts against fresh repository context, and each step is
+	 * awaited until its run has fully settled; an aborted/errored step (or a
+	 * send that failed to start) stops the chain.
 	 */
 	async function runChainSteps(
 		steps: DoAlwaysTask[],
 		ctx: ExtensionContext,
 		startAt: number,
-		cache: ReturnType<typeof createContextCache>,
 	): Promise<void> {
 		for (let i = startAt; i < steps.length; i++) {
 			const step = steps[i];
-			const context = cache.get(ctx.cwd);
+			const context = await getContext(ctx.cwd);
 			const blocked = evaluateGuards(step, context);
 			if (blocked) {
 				markChainStopped(ctx, i, "skipped", blocked);
-				finishReport(ctx);
+				await finishReport(ctx);
 				ctx.ui.notify(`do-always: chain stopped at step ${i + 1} (${step.name}): ${blocked}`, "warning");
 				return;
 			}
@@ -866,19 +1044,28 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const label = `do-always: step ${i + 1}/${steps.length} — ${step.name}`;
 			setChainStep(ctx, i, "running");
 			ctx.ui.notify(`${label} — starting`, "info");
+			const stepStart = performance.now();
 			const outcome = await sendAndWait(prompt, 10_000, i);
+			const stepDuration = chainDurations[i] || performance.now() - stepStart;
+			chainDurations[i] = stepDuration;
 			if (outcome === "completed") {
 				setChainStep(ctx, i, "completed");
+				// Post-step summary: files changed + duration.
+				const postContext = await getContext(ctx.cwd);
+				const fileCount = postContext.files.length;
+				const summary = stepSummary(outcome, step.name, stepDuration, fileCount);
+				ctx.ui.notify(`do-always: step ${i + 1}/${steps.length} — ${summary}`, "info");
 				continue;
 			}
 			markChainStopped(ctx, i, outcome);
-			finishReport(ctx);
+			await finishReport(ctx);
+			const summary = stepSummary(outcome, step.name, stepDuration, 0);
 			if (outcome === "failed-to-start") {
-				ctx.ui.notify(`${label} — failed to start (check model/API key); chain stopped`, "error");
+				ctx.ui.notify(`${label} — ${summary} (check model/API key); chain stopped`, "error");
 			} else if (outcome === "aborted") {
-				ctx.ui.notify(`${label} — aborted; chain stopped`, "error");
+				ctx.ui.notify(`${label} — ${summary}; chain stopped`, "error");
 			} else {
-				ctx.ui.notify(`${label} — run errored; chain stopped`, "error");
+				ctx.ui.notify(`${label} — ${summary}; chain stopped`, "error");
 			}
 			return;
 		}
@@ -887,12 +1074,16 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// the prompt. Capture the display path first — finishReport clears
 		// `chainReport` when the chain is fully done.
 		const reportDisplay = chainReport?.display;
+		// Chain-end summary.
+		const completed = chainDurations.filter((d) => d > 0).length;
+		const totalMs = chainDurations.reduce((a, b) => a + b, 0);
+		const chainSum = chainSummary(completed, steps.length, totalMs);
 		if (chainReport) {
-			finishReport(ctx);
-			ctx.ui.notify(`do-always: chain complete (${steps.length} steps) — report: ${reportDisplay}`, "info");
+			await finishReport(ctx);
+			ctx.ui.notify(`do-always: ${chainSum} — report: ${reportDisplay}`, "info");
 		} else {
 			clearChainWidget(ctx);
-			ctx.ui.notify(`do-always: chain complete (${steps.length} steps)`, "info");
+			ctx.ui.notify(`do-always: ${chainSum}`, "info");
 		}
 	}
 
@@ -1025,12 +1216,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				);
 				return { bodyRows, itemRows, winStart, visibleHeaderNames };
 			}
+			// One pass's visible state, computed once per input event / render
+			// and shared by clampCursor, buildTable, and the navigation logic.
+			type Visible = ReturnType<typeof getVisible>;
 
 			// Keep the cursor valid after the rows or the chain change. (The
 			// ORDER cell of a non-chained row is a valid cursor position: it is
 			// the "add" state.)
-			function clampCursor() {
-				const { itemRows } = getVisible();
+			function clampCursor(visible: Visible) {
+				const { itemRows } = visible;
 				if (itemRows.length === 0) {
 					cursor = { kind: "cell", row: 0, col: "task" };
 					return;
@@ -1075,8 +1269,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			// Build the full selector output for a width, plus the line map for
 			// mouse handling (itemLine: line -> task, runLine: the Run row,
 			// orderColX: where the ORDER cell starts, or null in the narrow tier).
-			function buildTable(width: number): Table {
-				const { bodyRows, itemRows, winStart, visibleHeaderNames } = getVisible();
+			function buildTable(width: number, visible: Visible = getVisible()): Table {
+				const { bodyRows, itemRows, winStart, visibleHeaderNames } = visible;
 				const { tier, taskCol, descCol, orderColX } = tableGeometry(width);
 				const lines: string[] = [];
 				const itemLine = new Map<number, DoAlwaysTask>();
@@ -1138,7 +1332,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							cursor.kind === "cell" && cursor.row === idx && cursor.col === "order";
 						const num = inTaskCol
 							? `${cursorMark} ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
-							: `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
+							: inOrderCol && tier === "narrow"
+								? `${theme.fg("warning", "►")} ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
+								: `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
 						// ⚡ is 2 columns wide, so "⚡ " takes 3 — reserve it so
 						// auto-run rows align with the others (ORDER cell is
 						// hit-tested at a fixed x).
@@ -1237,10 +1433,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 			return {
 				render(width: number) {
-					lastTable = buildTable(width);
+					lastTable = buildTable(width, getVisible());
 					return lastTable.lines;
 				},
-				invalidate() {},
+				invalidate() {
+					clearPreviewTimer();
+				},
 				handleInput(data: string) {
 					// Direct pick by number (1-9) — runs the task immediately (the
 					// classic fast path), closing the selector and discarding the
@@ -1251,16 +1449,17 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						return;
 					}
 					// Filter typing (Backspace edits the filter; with an empty
-					// filter it undoes the last chain add).
+					// filter it undoes the last chain add). The filter change
+					// invalidates the visible set, so the clamp gets a fresh pass.
 					if (kb.matches(data, "tui.editor.deleteCharBackward")) {
 						if (filter.length > 0) {
 							filter = filter.slice(0, -1);
-							clampCursor();
+							clampCursor(getVisible());
 						} else {
 							const { state, removed } = chainUndo(chain);
 							if (removed) {
 								chain = state;
-								clampCursor();
+								clampCursor(getVisible());
 							}
 						}
 						resetPreview();
@@ -1269,12 +1468,16 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					}
 					if (isPrintable(data)) {
 						filter += data;
-						clampCursor();
+						clampCursor(getVisible());
 						resetPreview();
 						tui.requestRender();
 						return;
 					}
-					const { itemRows } = getVisible();
+					// One pass for the rest of the event: navigation, confirm,
+					// and clear below all share this result (chain edits don't
+					// change itemRows, so it stays valid).
+					const visible = getVisible();
+					const { itemRows } = visible;
 					if (itemRows.length === 0) {
 						// Nothing to navigate; only Esc is useful here.
 						if (kb.matches(data, "tui.select.cancel")) finishCancel();
@@ -1341,6 +1544,51 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						tui.requestRender();
 						return;
 					}
+					// Extended navigation: home, end, pageup, pagedown.
+					if (matchesKey(data, "home")) {
+						cursor = { kind: "cell", row: 0, col: cursor.kind === "cell" ? cursor.col : "task" };
+						lastCellRow = 0;
+						resetPreview();
+						tui.requestRender();
+						return;
+					}
+					if (matchesKey(data, "end")) {
+						cursor = { kind: "run" };
+						lastCellRow = itemRows.length - 1;
+						resetPreview();
+						tui.requestRender();
+						return;
+					}
+					if (matchesKey(data, "pageUp")) {
+						if (cursor.kind === "run") {
+							cursor = { kind: "cell", row: Math.max(0, itemRows.length - maxVisible), col: "task" };
+						} else {
+							cursor = {
+								kind: "cell",
+								row: Math.max(0, cursor.row - maxVisible),
+								col: cursor.col,
+							};
+						}
+						lastCellRow = cursor.row;
+						resetPreview();
+						tui.requestRender();
+						return;
+					}
+					if (matchesKey(data, "pageDown")) {
+						if (cursor.kind === "cell") {
+							const next = cursor.row + maxVisible;
+							if (next >= itemRows.length) {
+								cursor = { kind: "run" };
+								lastCellRow = itemRows.length - 1;
+							} else {
+								cursor = { kind: "cell", row: next, col: cursor.col };
+								lastCellRow = next;
+							}
+						}
+						resetPreview();
+						tui.requestRender();
+						return;
+					}
 					// Confirm: context-dependent.
 					if (kb.matches(data, "tui.select.confirm")) {
 						if (cursor.kind === "run") {
@@ -1378,7 +1626,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					if (matchesKey(data, "ctrl+u")) {
 						if (chain.items.length > 0) {
 							chain = chainClear();
-							clampCursor();
+							clampCursor(visible);
 							resetPreview();
 							tui.requestRender();
 						}
@@ -1406,7 +1654,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				// the table twice per mouse event). The table is always fresh
 				// because handleInput calls requestRender before the next mouse
 				// event can arrive; build one if no render has happened yet.
-				const { itemLine, runLine, orderColX } = lastTable ?? buildTable(event.width);
+				// One getVisible() per event, shared by the (possibly fresh)
+				// table and the itemRows lookup below.
+				const visible = getVisible();
+				const { itemLine, runLine, orderColX } = lastTable ?? buildTable(event.width, visible);
 					// Pinned Run row: press runs the chain.
 					if (runLine >= 0 && event.y === runLine) {
 						if (event.type === "press" && chain.items.length > 0) {
@@ -1416,14 +1667,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					}
 					const task = itemLine.get(event.y);
 					if (!task) return undefined;
-					const { itemRows } = getVisible();
+					const { itemRows } = visible;
 					const idx = itemRows.findIndex((r) => r.task === task);
 					if (idx < 0) return undefined;
 					// ORDER cell: press toggles chain membership.
 					if (orderColX !== null && event.x >= orderColX) {
 						if (event.type === "press") {
 							chain = chain.items.includes(task.name) ? chainRemove(chain, task.name) : chainAdd(chain, task.name).state;
-							clampCursor();
+							clampCursor(visible);
 							resetPreview();
 							return { handled: true, render: true };
 						}
@@ -1495,7 +1746,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// One context per command run: shared by visibility filtering, rendering,
 		// and the completion cache (never inside a render loop).
 		const cache = createContextCache();
-		const context = cache.get(ctx.cwd);
+		const context = await cache.get(ctx.cwd);
 		const visible = refreshVisible(ctx.cwd, context);
 
 		const arg = args.trim();

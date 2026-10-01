@@ -6,7 +6,7 @@
 			"category": "Plan",
 			"description": "Review the current code changes (Plan)",
 			"requireDirty": true,
-			"prompt": "Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). Change summary: {{diff_stat}}. Last commit: {{last_commit}}. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes if needed. Do a summary of your findings"
+			"prompt": "Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). Change summary: {{diff_stat}}. Last commit: {{last_commit}}. Check `git status` and `git diff` to see what changed, then double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. Do a plan proposal for the fixes if needed. Do a summary of your findings."
 		},
 		{
 			"name": "Review code",
@@ -36,7 +36,7 @@
 			"name": "Propose features",
 			"category": "Plan",
 			"description": "Propose new features (Plan)",
-			"prompt": "Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in term of changes, if this will breaks API, compatibility issue."
+			"prompt": "Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in terms of changes, whether this will break APIs, or introduce compatibility issues."
 		},
 		{
 			"name": "Build",

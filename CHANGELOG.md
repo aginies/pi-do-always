@@ -2,6 +2,77 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2026-10-01
+
+### Fixed
+
+- `{{last_commit}}` now renders the full commit subject (previously truncated
+  to the first word, e.g. `chore:` instead of `chore: release 0.11.0`).
+- `{{user}}` no longer includes the `user.name ` key prefix printed by
+  `git config --get-regexp` (it rendered as `user.name aginies`).
+- `{{staged_files}}` / `{{unstaged_files}}` paths no longer carry a leading
+  space: the inline porcelain parse in `buildContext` now shares the
+  `slice(3)`-based parsing of `parseStatusPorcelain` via the new
+  `parseStatusStagedUnstaged` helper (the two parsers no longer disagree).
+- The inline chain report is now an ephemeral editor view (Esc to dismiss)
+  instead of a `pi.sendMessage` chat message, which was persisted to the
+  session file and context projection with no removal path. Nothing is
+  persisted to the session anymore; the report file on disk is the permanent
+  artifact. README updated to match.
+- The report file's header is deferred until the first step section is
+  written, so a session that dies before its first step finishes no longer
+  leaves a header-only report file behind.
+
+### Removed
+
+- `chainMove` (exported, tested, but never wired into the selector — the
+  README's remove-and-re-add remains the reordering method; wiring
+  ↑/↓ reordering into the ORDER column is planned as a separate feature).
+- `splitFileLines` (leftover from an earlier implementation, never called).
+- `chainSummary`'s unreachable partial branch and `failedStep` parameter
+  (the chain-end summary is only reached when every step completed; stop
+  paths notify with their own per-step strings).
+
+### Changed
+
+- A single auto-run task whose send fails to start (no agent events at all)
+  no longer leaves a stale summary flag: a 10 s grace timer (mirroring the
+  chain's failed-to-start handling) clears it and notifies
+  `"<task>" failed to start (check model/API key)`, so the next unrelated
+  turn can no longer receive a spurious `✓ <task>` summary. The flag is
+  also reset on session start.
+- Test-only exports (`MAX_FILES_LISTED`, `DEFAULT_CATEGORY_ORDER`,
+  `reportFileName`, `formatDuration`) now carry the same "exported for
+  tests" doc note `PROMPT_CONTEXT_KEYS` already had, making the convention
+  consistent.
+
+### Performance
+
+- The two `git config --get-regexp` calls in context building are merged
+  into one (combined regex `^(user.name|remote.origin.url)$`), so a context
+  build makes five git calls instead of six. `parseConfigRegexpValue` is
+  replaced by `parseConfigRegexpValueForKey(raw, key)`, which extracts one
+  key's value from the multi-line output.
+- Context building is now async: inside a work tree the four remaining git
+  calls run in parallel (`Promise.all` over promisified `execFile`), so
+  wall time drops from ~5 sequential spawns to ~1. Outside a work tree only
+  the single `rev-parse` call runs, as before. The `session_start`
+  precompute is async as a result.
+- A new extension-level context cache (keyed by cwd, 5 s TTL) sits under
+  the per-action cache: the `session_start` precompute now feeds the first
+  `/do-always` invocation, and repeated invocations within the window reuse
+  the same context instead of rebuilding it. The cache is invalidated on
+  `agent_end` (the agent may have changed the repo); a running chain keeps
+  its per-action snapshot, so all of its steps still share one context.
+- The selector computes the visible table state once per input event /
+  render pass and reuses it (`clampCursor` and `buildTable` now take the
+  precomputed state), cutting the per-keystroke recomputation from 2–3
+  passes to 1.
+- The two `[...event.messages].reverse().find(...)` scans in the
+  `agent_end` handler are replaced by a single backward-scan helper
+  (`lastAssistantMessage`) plus a shared `outcomeFromStopReason` mapping —
+  no per-turn array copy, and the duplicated outcome logic is deduped.
+
 ## [0.11.0] - 2026-09-30
 
 ### Changed

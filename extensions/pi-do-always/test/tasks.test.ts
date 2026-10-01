@@ -14,7 +14,6 @@ import {
 	buildTableRows,
 	chainAdd,
 	chainClear,
-	chainMove,
 	chainRemove,
 	chainRunLabel,
 	chainUndo,
@@ -28,7 +27,10 @@ import {
 	isValidWhen,
 	mergeTasks,
 	parseConfig,
+	parseConfigRegexpValueForKey,
+	parseCommitSubject,
 	parseStatusPorcelain,
+	parseStatusStagedUnstaged,
 	orderTasksByCategory,
 	renderPrompt,
 	reportAbandonedFooter,
@@ -42,10 +44,16 @@ import {
 	resolveShortcut,
 	resolveTask,
 	shouldAutoRun,
-	splitFileLines,
+	stepSummary,
+	chainSummary,
+	formatDuration,
+	MAX_FILE_LINES,
 	toPromptContext,
 	validateChain,
+	GUARD_TYPES,
 	type DoAlwaysTask,
+	type Guard,
+	type GuardType,
 	type PromptContext,
 	type TaskContext,
 } from "../tasks";
@@ -737,6 +745,16 @@ test("parseGuard rejects an invalid guard and reports it", () => {
 	assert.equal(errors.length, 3);
 });
 
+test("GUARD_TYPES and Guard interfaces are properly exported", () => {
+	assert.ok(Array.isArray(GUARD_TYPES));
+	assert.ok(GUARD_TYPES.includes("requireDirty"));
+	assert.ok(GUARD_TYPES.includes("requireBranch"));
+	assert.ok(GUARD_TYPES.includes("requireRepo"));
+	assert.ok(GUARD_TYPES.includes("requireFilePattern"));
+	const g: Guard = { type: "requireBranch", value: "main" };
+	assert.equal(g.type, "requireBranch");
+});
+
 test("parseConfig parses a guards array and drops invalid entries", () => {
 	const on = parseConfig(
 JSON.stringify([{ name: "x", prompt: "p", guards: [{ type: "requireBranch", value: "main" }] }]),
@@ -841,8 +859,24 @@ test("toPromptContext joins staged/unstaged lists with newlines", () => {
 	assert.equal(out.unstaged_files, "c.ts");
 });
 
+test("toPromptContext caps staged_files and unstaged_files at MAX_FILE_LINES", () => {
+	const manyStaged = Array.from({ length: 65 }, (_, i) => `staged-${i}.ts`);
+	const manyUnstaged = Array.from({ length: 55 }, (_, i) => `unstaged-${i}.ts`);
+	const ctx: TaskContext = { ...dirtyCtx, stagedFiles: manyStaged, unstagedFiles: manyUnstaged };
+	const out = toPromptContext(ctx);
+	const stagedLines = out.staged_files.split("\n");
+	assert.equal(stagedLines.length, MAX_FILE_LINES + 1);
+	assert.equal(stagedLines[0], "staged-0.ts");
+	assert.equal(stagedLines[MAX_FILE_LINES], "… (+15 more)");
+	const unstagedLines = out.unstaged_files.split("\n");
+	assert.equal(unstagedLines.length, MAX_FILE_LINES + 1);
+	assert.equal(unstagedLines[0], "unstaged-0.ts");
+	assert.equal(unstagedLines[MAX_FILE_LINES], "… (+5 more)");
+});
+
 // ---------------------------------------------------------------------------
-// parseStatusPorcelain / splitFileLines
+// parseStatusPorcelain / parseStatusStagedUnstaged / parseCommitSubject /
+// parseConfigRegexpValueForKey
 // ---------------------------------------------------------------------------
 
 test("parseStatusPorcelain extracts paths, skips short lines, dedupes, and sorts", () => {
@@ -850,14 +884,74 @@ test("parseStatusPorcelain extracts paths, skips short lines, dedupes, and sorts
 	assert.deepEqual(parseStatusPorcelain(status), ["alpha.ts", "beta.ts", "zeta.ts"]);
 });
 
+test("parseStatusPorcelain handles quoted paths and rename arrows", () => {
+	const status = [
+		' M "file with spaces.ts"',
+		"R  old-name.ts -> new-name.ts",
+		'R  "old space.ts" -> "new space.ts"',
+	].join("\n");
+	assert.deepEqual(parseStatusPorcelain(status), [
+		"file with spaces.ts",
+		"new space.ts",
+		"new-name.ts",
+	]);
+});
+
 test("parseStatusPorcelain returns [] for empty input", () => {
 	assert.deepEqual(parseStatusPorcelain(""), []);
 });
 
-test("splitFileLines trims and drops empty lines", () => {
-	assert.deepEqual(splitFileLines("a.ts\nb.ts\n"), ["a.ts", "b.ts"]);
-	assert.deepEqual(splitFileLines(""), []);
-	assert.deepEqual(splitFileLines(undefined), []);
+test("parseStatusStagedUnstaged splits staged, unstaged, and untracked files", () => {
+	const status = [" M a.ts", "M  b.ts", "?? c.ts", "MM d.ts", " D e.ts", "D  f.ts"].join("\n");
+	const { staged, unstaged } = parseStatusStagedUnstaged(status);
+	// Porcelain v1: the path starts at index 3 — no leading spaces in the results.
+	assert.deepEqual(staged, ["b.ts", "c.ts", "d.ts", "f.ts"]);
+	assert.deepEqual(unstaged, ["a.ts", "e.ts"]);
+});
+
+test("parseStatusStagedUnstaged handles quoted paths and rename arrows", () => {
+	const status = [
+		' M "unstaged with space.ts"',
+		'M  "staged with space.ts"',
+		'R  "old name.ts" -> "new renamed.ts"',
+	].join("\n");
+	const { staged, unstaged } = parseStatusStagedUnstaged(status);
+	assert.deepEqual(staged, ["staged with space.ts", "new renamed.ts"]);
+	assert.deepEqual(unstaged, ["unstaged with space.ts"]);
+});
+
+test("parseStatusStagedUnstaged skips short lines and dedupes paths", () => {
+	const { staged, unstaged } = parseStatusStagedUnstaged("M\n M x.ts\nM  x.ts\n");
+	assert.deepEqual(staged, []);
+	assert.deepEqual(unstaged, ["x.ts"]);
+});
+
+test("parseStatusStagedUnstaged returns empty lists for empty input", () => {
+	assert.deepEqual(parseStatusStagedUnstaged(""), { staged: [], unstaged: [] });
+});
+
+test("parseCommitSubject keeps the full subject after the hash", () => {
+	assert.equal(parseCommitSubject("abc123 Fix login null check"), "Fix login null check");
+	assert.equal(parseCommitSubject("abc123 fix: a and b"), "fix: a and b");
+});
+
+test("parseCommitSubject returns unknown for missing or subject-less lines", () => {
+	assert.equal(parseCommitSubject(undefined), "unknown");
+	assert.equal(parseCommitSubject("abc123"), "unknown");
+	assert.equal(parseCommitSubject("abc123 "), "unknown");
+});
+
+test("parseConfigRegexpValueForKey extracts the named key's value", () => {
+	const raw = "user.name John Doe\nremote.origin.url git@github.com:aginies/pi-do-always.git";
+	assert.equal(parseConfigRegexpValueForKey(raw, "user.name"), "John Doe");
+	assert.equal(parseConfigRegexpValueForKey(raw, "remote.origin.url"), "git@github.com:aginies/pi-do-always.git");
+});
+
+test("parseConfigRegexpValueForKey returns undefined for missing keys or empty values", () => {
+	assert.equal(parseConfigRegexpValueForKey(undefined, "user.name"), undefined);
+	assert.equal(parseConfigRegexpValueForKey("user.email a@b.c", "user.name"), undefined);
+	assert.equal(parseConfigRegexpValueForKey("user.name", "user.name"), undefined);
+	assert.equal(parseConfigRegexpValueForKey("user.name ", "user.name"), undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -1011,21 +1105,6 @@ test("chainUndo skips names that were already removed", () => {
 test("chainUndo returns null when nothing is left to undo", () => {
 	const s = chainClear();
 	assert.deepEqual(chainUndo(s), { state: s, removed: null });
-});
-
-test("chainMove swaps with the neighbor in the given direction", () => {
-	let s = chainClear();
-	for (const n of ["a", "b", "c"]) s = chainAdd(s, n).state;
-	assert.deepEqual(chainMove(s, "a", 1).items, ["b", "a", "c"]);
-	assert.deepEqual(chainMove(s, "c", -1).items, ["a", "c", "b"]);
-});
-
-test("chainMove is a no-op at the ends and for absent names", () => {
-	let s = chainClear();
-	for (const n of ["a", "b"]) s = chainAdd(s, n).state;
-	assert.equal(chainMove(s, "a", -1), s);
-	assert.equal(chainMove(s, "b", 1), s);
-	assert.equal(chainMove(s, "zzz", 1), s);
 });
 
 test("formatChainSequence numbers tasks and marks auto-run ones", () => {
@@ -1236,4 +1315,66 @@ test("parseConfig reads the report flag (default on, explicit off honored)", () 
 	const invalid = parseConfig(JSON.stringify({ tasks: [], report: "yes" }), "t.json", (m) => (warned = m));
 	assert.equal(invalid.report, undefined);
 	assert.match(warned, /report/);
+});
+
+// ── Chain step summary ───────────────────────────────────────────────────
+
+test("formatDuration formats milliseconds", () => {
+	assert.equal(formatDuration(500), "500ms");
+	assert.equal(formatDuration(1000), "1s");
+	assert.equal(formatDuration(3500), "3s");
+	assert.equal(formatDuration(60000), "1m");
+	assert.equal(formatDuration(125000), "2m5s");
+	assert.equal(formatDuration(3661000), "61m1s");
+});
+
+test("stepSummary formats completed step with files and duration", () => {
+	assert.equal(
+		stepSummary("completed", "Build", 134000, 3),
+		"✓ Build — 3 files changed — 2m14s",
+	);
+});
+
+test("stepSummary formats completed step with no files", () => {
+	assert.equal(
+		stepSummary("completed", "Review code", 45000, 0),
+		"✓ Review code — 45s",
+	);
+});
+
+test("stepSummary formats completed step without duration", () => {
+	assert.equal(
+		stepSummary("completed", "Readme", 0, 1),
+		"✓ Readme — 1 file changed",
+	);
+});
+
+test("stepSummary formats completed step without files or duration", () => {
+	assert.equal(stepSummary("completed", "Commit", 0, 0), "✓ Commit");
+});
+
+test("stepSummary formats error step", () => {
+	assert.equal(
+		stepSummary("error", "Tests", 45000, 0),
+		"✗ Tests — 45s",
+	);
+});
+
+test("stepSummary formats aborted step", () => {
+	assert.equal(stepSummary("aborted", "Review changes", 0, 0), "⊘ Review changes");
+});
+
+test("stepSummary formats failed-to-start step", () => {
+	assert.equal(
+		stepSummary("failed-to-start", "Deploy", 0, 0),
+		"✗ Deploy",
+	);
+});
+
+test("chainSummary shows all-done with time", () => {
+	assert.equal(chainSummary(4, 4, 402000), "✅ 4/4 steps completed in 6m42s");
+});
+
+test("chainSummary shows all-done without time", () => {
+	assert.equal(chainSummary(3, 3, 0), "✅ 3/3 steps completed");
 });
