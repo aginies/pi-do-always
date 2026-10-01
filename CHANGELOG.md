@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2026-10-01
+
+### Fixed
+
+- Commit selector: fixed bug where `rows[cursorRow]` used the wrong array index (line vs. row) and `runLine` was misaligned with the run label.
+- Commit selector: fixed bug where `cursorRow` was not clamped after filter changes, potentially causing out-of-bounds errors.
+- Commit selector: removed dead code (`commitLine` Map and `clearPreviewTimer` no-op).
+
 ## [0.12.0] - 2026-10-01
 
 ### Fixed
