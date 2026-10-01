@@ -51,6 +51,8 @@ import {
 } from "@earendil-works/pi-tui";
 import {
 	CHAIN_MAX,
+	COMMIT_BROWSER_MAX,
+	COMMIT_SELECT_MAX,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
 	assistantText,
@@ -64,13 +66,16 @@ import {
 	evaluateGuards,
 	evaluateWhen,
 	formatChainSequence,
+	formatCommitReviewPrompt,
 	formatList,
+	groupCommitsByDate,
 	groupTasksByCategory,
 	isValidKeyId,
 	mergeTasks,
 	parseConfig,
 	parseConfigRegexpValueForKey,
 	parseCommitSubject,
+	parseGitLogOutput,
 	parseStatusPorcelain,
 	parseStatusStagedUnstaged,
 	orderTasksByCategory,
@@ -88,7 +93,10 @@ import {
 	toPromptContext,
 	validateChain,
 	type ChainStepOutcome,
+	type CommitInfo,
+	type DateGroup,
 	type DoAlwaysTask,
+	type SelectedCommit,
 	type TaskContext,
 	type TableRow,
 } from "./tasks";
@@ -276,6 +284,440 @@ async function buildContext(cwd: string): Promise<TaskContext> {
 		unstagedFiles,
 		isGitRepo,
 	};
+}
+
+/**
+ * Fetch a page of commits from git with lightweight stats via a single log call.
+ * Fetches pageSize + 1 commits to determine if more commits are available.
+ */
+async function fetchCommitsPage(
+	cwd: string,
+	page = 0,
+	pageSize = COMMIT_BROWSER_MAX,
+): Promise<{ commits: CommitInfo[]; groups: DateGroup[]; hasMore: boolean }> {
+	const countToFetch = pageSize + 1;
+	const skip = page * pageSize;
+	const format = "COMMIT%x09%H%x09%h%x09%s%x09%ad%x09%an";
+	const logOutput = await git(cwd, [
+		"log",
+		"-n",
+		`${countToFetch}`,
+		`--skip=${skip}`,
+		`--format=${format}`,
+		"--shortstat",
+		"--date=short",
+	]);
+	if (!logOutput) {
+		return { commits: [], groups: [], hasMore: false };
+	}
+
+	const allParsed = parseGitLogOutput(logOutput);
+	const hasMore = allParsed.length > pageSize;
+	const commits = hasMore ? allParsed.slice(0, pageSize) : allParsed;
+	const groups = groupCommitsByDate(commits);
+	return { commits, groups, hasMore };
+}
+
+/**
+ * Date-grouped commit browser: browse recent commits in pages of 20, select some,
+ * then review them. Reuses the task-selector interaction model (↑↓, Space toggle,
+ * type-to-filter, Ctrl+U clear, Esc cancel, ←/→ or PgUp/PgDn for paging).
+ *
+ * Returns the selected commits (ordered by user selection), or null on cancel.
+ */
+function browseCommits(
+	ctx: ExtensionContext,
+	initialData?: { commits: CommitInfo[]; groups: DateGroup[]; hasMore: boolean },
+): Promise<SelectedCommit[] | null> {
+	return new Promise<SelectedCommit[] | null>((resolve) => {
+		const pageCache = new Map<number, { commits: CommitInfo[]; groups: DateGroup[]; hasMore: boolean }>();
+		let page = 0;
+		if (initialData) {
+			pageCache.set(0, initialData);
+		}
+
+		type CommitCursor = { kind: "commit"; index: number } | { kind: "run" };
+		const maxVisible = 14; // commits visible in the scroll window
+		const selectedMap = new Map<string, SelectedCommit>(); // hash -> SelectedCommit
+		let cursor: CommitCursor = { kind: "commit", index: 0 };
+		let lastCommitIndex = 0;
+		let filter = "";
+		let settled = false;
+		let isLoading = false;
+
+		ctx.ui.custom<SelectedCommit[] | null>((tui, theme, _kb, done) => {
+			const kb = getKeybindings();
+
+			function finish(selectedCommits: SelectedCommit[]) {
+				if (settled) return;
+				settled = true;
+				done(selectedCommits);
+				resolve(selectedCommits);
+			}
+
+			function finishCancel() {
+				if (settled) return;
+				settled = true;
+				done(null);
+				resolve(null);
+			}
+
+			async function loadPage(newPage: number) {
+				if (isLoading || newPage < 0) return;
+				page = newPage;
+				if (!pageCache.has(page)) {
+					isLoading = true;
+					tui.requestRender();
+					try {
+						const fetched = await fetchCommitsPage(ctx.cwd, page);
+						pageCache.set(page, fetched);
+					} finally {
+						isLoading = false;
+					}
+				}
+				cursor = { kind: "commit", index: 0 };
+				lastCommitIndex = 0;
+				tui.requestRender();
+			}
+
+			function getCurrentPageData() {
+				return pageCache.get(page) ?? { commits: [], groups: [], hasMore: false };
+			}
+
+			function getVisibleCommits(): CommitInfo[] {
+				const { commits } = getCurrentPageData();
+				if (!filter) return commits;
+				const f = filter.toLowerCase();
+				return commits.filter(
+					(c) => c.subject.toLowerCase().includes(f) || c.shortHash.toLowerCase().includes(f),
+				);
+			}
+
+			function render(width: number): string[] {
+				const currentData = getCurrentPageData();
+				const visibleCommits = getVisibleCommits();
+				const lines: string[] = [];
+
+				// Clamp cursor index if visible list changed
+				if (cursor.kind === "commit") {
+					if (visibleCommits.length === 0) {
+						cursor = { kind: "run" };
+					} else if (cursor.index >= visibleCommits.length) {
+						cursor = { kind: "commit", index: visibleCommits.length - 1 };
+						lastCommitIndex = cursor.index;
+					}
+				}
+
+				// Header
+				const startNum = page * COMMIT_BROWSER_MAX + 1;
+				const endNum = page * COMMIT_BROWSER_MAX + (visibleCommits.length || 0);
+				const pageLabel = currentData.hasMore
+					? `Page ${page + 1} (${startNum}–${endNum}+)`
+					: `Page ${page + 1} (${startNum}–${endNum})`;
+
+				lines.push(
+					theme.fg(
+						"muted",
+						truncateToWidth(
+							`   #  DATE       HASH     FILES  ORDER  SUBJECT  [${pageLabel}]`,
+							width - 2,
+							"",
+						),
+					),
+				);
+
+				if (isLoading) {
+					lines.push(theme.fg("accent", "  Loading commits from git…"));
+				} else if (visibleCommits.length === 0) {
+					lines.push(
+						filter
+							? theme.fg("warning", `  No commits matching "${filter}" on this page`)
+							: theme.fg("muted", "  No commits found"),
+					);
+				} else {
+					const anchor = cursor.kind === "commit" ? cursor.index : lastCommitIndex;
+					const winStart = visibleCommits.length > maxVisible
+						? Math.max(0, Math.min(anchor + 1 - maxVisible, visibleCommits.length - maxVisible))
+						: 0;
+					const winEnd = Math.min(winStart + maxVisible, visibleCommits.length);
+
+					for (let i = winStart; i < winEnd; i++) {
+						const c = visibleCommits[i];
+						// Show date divider if it's the first commit in window or date changed
+						if (i === winStart || c.date !== visibleCommits[i - 1].date) {
+							lines.push(theme.fg("dim", `  ── ${c.date} ──`));
+						}
+
+						const isCursor = cursor.kind === "commit" && cursor.index === i;
+						const isSelected = selectedMap.has(c.hash);
+						const order = isSelected ? [...selectedMap.keys()].indexOf(c.hash) + 1 : 0;
+						const cursorMark = isCursor ? theme.fg("accent", "►") : " ";
+						const globalIdx = page * COMMIT_BROWSER_MAX + i + 1;
+						const num = `${cursorMark} ${String(globalIdx).padStart(2)}`;
+						const marker = isSelected ? `${theme.fg("accent", "◉")} [${order}]` : "  ·  ";
+						const hash = theme.fg("dim", c.shortHash.slice(0, 7));
+						const statStr = c.filesChanged > 0 ? `${c.filesChanged}f` : "";
+						const statCell = statStr.padStart(3);
+						const dateShort = c.date.slice(5); // MM-DD
+						const subject = truncateToWidth(c.subject, Math.max(10, width - 36), "…");
+
+						const rowText = `${num}  ${dateShort}  ${hash}  ${statCell}  ${marker}  ${subject}`;
+						if (isCursor) {
+							lines.push(theme.bg("selectedBg", theme.bold(rowText)));
+						} else {
+							lines.push(rowText);
+						}
+					}
+
+					if (visibleCommits.length > maxVisible) {
+						lines.push(
+							theme.fg(
+								"dim",
+								truncateToWidth(
+									`  (${cursor.kind === "commit" ? cursor.index + 1 : lastCommitIndex + 1}/${visibleCommits.length} on page ${page + 1})`,
+									width - 2,
+									"",
+								),
+							),
+						);
+					}
+				}
+
+				// Run row
+				lines.push("");
+				lines.push(theme.fg("dim", "  " + "─".repeat(Math.max(1, width - 4))));
+				const runLabel = selectedMap.size === 0
+					? "review the chain (no commits selected)"
+					: `review the chain (${selectedMap.size} commit${selectedMap.size !== 1 ? "s" : ""})`;
+				if (cursor.kind === "run") {
+					lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", "►")} ${runLabel}`)));
+				} else if (selectedMap.size === 0) {
+					lines.push(theme.fg("dim", `  ${runLabel}`));
+				} else {
+					lines.push(theme.fg("accent", `  ${runLabel}`));
+				}
+
+				// Footer
+				const pageNavHints: string[] = [];
+				if (page > 0) pageNavHints.push("← prev page");
+				if (currentData.hasMore) pageNavHints.push("→ next page");
+				const pageHintStr = pageNavHints.length > 0 ? `  •  ${pageNavHints.join("  •  ")}` : "";
+
+				let footer = `  space/⏎ select  •  ↑/↓ move${pageHintStr}  •  esc`;
+				if (selectedMap.size > 0) {
+					footer += "  •  ctrl+u clear";
+				}
+				if (filter) {
+					footer += `  •  filter: "${filter}"`;
+				}
+				lines.push(theme.fg("dim", truncateToWidth(footer, width - 2, "")));
+
+				return lines;
+			}
+
+			async function handleInput(data: string) {
+				if (settled) return;
+				const currentData = getCurrentPageData();
+				const visibleCommits = getVisibleCommits();
+
+				// Space: toggle selection on current commit
+				if (matchesKey(data, "space")) {
+					if (cursor.kind === "commit" && visibleCommits[cursor.index]) {
+						const c = visibleCommits[cursor.index];
+						if (selectedMap.has(c.hash)) {
+							selectedMap.delete(c.hash);
+							let i = 1;
+							for (const sc of selectedMap.values()) {
+								sc.selectionOrder = i++;
+							}
+						} else if (selectedMap.size < COMMIT_SELECT_MAX) {
+							selectedMap.set(c.hash, { ...c, selectionOrder: selectedMap.size + 1 });
+						} else {
+							ctx.ui.notify(`do-always: chain is full (${COMMIT_SELECT_MAX}) — remove a commit first`, "error");
+						}
+						tui.requestRender();
+					}
+					return;
+				}
+
+				// Confirm (Enter): run the chain if on run row, or toggle selection if on a commit
+				if (kb.matches(data, "tui.select.confirm") || matchesKey(data, "enter")) {
+					if (cursor.kind === "run") {
+						if (selectedMap.size === 0) {
+							ctx.ui.notify("do-always: no commits selected", "info");
+						} else {
+							finish([...selectedMap.values()]);
+						}
+						return;
+					}
+					if (cursor.kind === "commit" && visibleCommits[cursor.index]) {
+						const c = visibleCommits[cursor.index];
+						if (selectedMap.has(c.hash)) {
+							selectedMap.delete(c.hash);
+							let i = 1;
+							for (const sc of selectedMap.values()) {
+								sc.selectionOrder = i++;
+							}
+						} else if (selectedMap.size < COMMIT_SELECT_MAX) {
+							selectedMap.set(c.hash, { ...c, selectionOrder: selectedMap.size + 1 });
+						} else {
+							ctx.ui.notify(`do-always: chain is full (${COMMIT_SELECT_MAX}) — remove a commit first`, "error");
+						}
+						tui.requestRender();
+					}
+					return;
+				}
+
+				// Cancel (Esc / Ctrl+C)
+				if (kb.matches(data, "tui.select.cancel") || matchesKey(data, "escape")) {
+					finishCancel();
+					return;
+				}
+
+				// Ctrl+U: clear selections
+				if (matchesKey(data, "ctrl+u")) {
+					if (selectedMap.size > 0) {
+						selectedMap.clear();
+						tui.requestRender();
+					}
+					return;
+				}
+
+				// Backspace: delete character from filter, or undo last selection
+				if (kb.matches(data, "tui.editor.deleteCharBackward") || matchesKey(data, "backspace")) {
+					if (filter.length > 0) {
+						filter = filter.slice(0, -1);
+						cursor = { kind: "commit", index: 0 };
+						lastCommitIndex = 0;
+					} else if (selectedMap.size > 0) {
+						const lastHash = [...selectedMap.keys()].pop()!;
+						selectedMap.delete(lastHash);
+					}
+					tui.requestRender();
+					return;
+				}
+
+				// Page navigation: Next page (Right arrow, or PageDown when at the end)
+				if (matchesKey(data, "right")) {
+					if (currentData.hasMore) {
+						await loadPage(page + 1);
+					}
+					return;
+				}
+				if (kb.matches(data, "tui.select.pageDown") || matchesKey(data, "pageDown")) {
+					if (cursor.kind === "commit") {
+						const next = cursor.index + maxVisible;
+						if (next < visibleCommits.length) {
+							cursor = { kind: "commit", index: next };
+							lastCommitIndex = next;
+							tui.requestRender();
+						} else if (currentData.hasMore) {
+							await loadPage(page + 1);
+						} else {
+							cursor = { kind: "run" };
+							tui.requestRender();
+						}
+					} else if (currentData.hasMore) {
+						await loadPage(page + 1);
+					}
+					return;
+				}
+
+				// Page navigation: Previous page (Left arrow, or PageUp when at the top)
+				if (matchesKey(data, "left")) {
+					if (page > 0) {
+						await loadPage(page - 1);
+					}
+					return;
+				}
+				if (kb.matches(data, "tui.select.pageUp") || matchesKey(data, "pageUp")) {
+					if (cursor.kind === "commit") {
+						const prev = cursor.index - maxVisible;
+						if (prev >= 0) {
+							cursor = { kind: "commit", index: prev };
+							lastCommitIndex = prev;
+							tui.requestRender();
+						} else if (page > 0) {
+							await loadPage(page - 1);
+						} else {
+							cursor = { kind: "commit", index: 0 };
+							lastCommitIndex = 0;
+							tui.requestRender();
+						}
+					} else if (visibleCommits.length > 0) {
+						cursor = { kind: "commit", index: Math.max(0, visibleCommits.length - maxVisible) };
+						lastCommitIndex = cursor.index;
+						tui.requestRender();
+					}
+					return;
+				}
+
+				// Up arrow
+				if (kb.matches(data, "tui.select.up") || matchesKey(data, "up")) {
+					if (cursor.kind === "run") {
+						if (visibleCommits.length > 0) {
+							cursor = { kind: "commit", index: visibleCommits.length - 1 };
+							lastCommitIndex = visibleCommits.length - 1;
+						}
+					} else if (cursor.index > 0) {
+						cursor = { kind: "commit", index: cursor.index - 1 };
+						lastCommitIndex = cursor.index;
+					} else {
+						cursor = { kind: "run" };
+					}
+					tui.requestRender();
+					return;
+				}
+
+				// Down arrow
+				if (kb.matches(data, "tui.select.down") || matchesKey(data, "down")) {
+					if (cursor.kind === "run") {
+						if (visibleCommits.length > 0) {
+							cursor = { kind: "commit", index: 0 };
+							lastCommitIndex = 0;
+						}
+					} else if (cursor.index < visibleCommits.length - 1) {
+						cursor = { kind: "commit", index: cursor.index + 1 };
+						lastCommitIndex = cursor.index;
+					} else {
+						cursor = { kind: "run" };
+					}
+					tui.requestRender();
+					return;
+				}
+
+				// Home / End
+				if (matchesKey(data, "home")) {
+					if (visibleCommits.length > 0) {
+						cursor = { kind: "commit", index: 0 };
+						lastCommitIndex = 0;
+						tui.requestRender();
+					}
+					return;
+				}
+				if (matchesKey(data, "end")) {
+					cursor = { kind: "run" };
+					tui.requestRender();
+					return;
+				}
+
+				// Filter typing (printable chars, excluding Space which toggles)
+				if (isPrintable(data) && data !== " ") {
+					filter += data;
+					cursor = { kind: "commit", index: 0 };
+					lastCommitIndex = 0;
+					tui.requestRender();
+					return;
+				}
+			}
+
+			return {
+				render,
+				handleInput,
+				invalidate: () => {},
+			};
+		});
+	});
 }
 
 /** True for a single printable ASCII character (used for filter typing). */
@@ -875,6 +1317,48 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 	/** Put the task prompt into the editor (TUI) or send it as a user message (other modes). */
 	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext, context: TaskContext): Promise<void> {
+		// "Review commits" — open the date-grouped browser, then trigger LLM review of selected commits.
+		if (task.name === "Review commits") {
+			let selected: SelectedCommit[] = [];
+			if (ctx.mode !== "tui") {
+				const initialData = await fetchCommitsPage(ctx.cwd, 0, 1);
+				if (initialData.commits.length === 0) {
+					ctx.ui.notify("do-always: no commits found", "info");
+					return;
+				}
+				selected = [{ ...initialData.commits[0], selectionOrder: 1 }];
+			} else {
+				const initialData = await fetchCommitsPage(ctx.cwd, 0);
+				if (initialData.commits.length === 0) {
+					ctx.ui.notify("do-always: no commits found", "info");
+					return;
+				}
+				const result = await browseCommits(ctx, initialData);
+				if (!result) {
+					ctx.ui.notify("do-always: commit browser cancelled", "info");
+					return;
+				}
+				if (result.length === 0) {
+					ctx.ui.notify("do-always: no commits selected", "info");
+					return;
+				}
+				selected = result;
+			}
+
+			const reviewPrompt = formatCommitReviewPrompt(selected);
+			pendingSummaryTask = task.name;
+			if (pendingSummaryTimer) clearTimeout(pendingSummaryTimer);
+			pendingSummaryTimer = setTimeout(() => {
+				pendingSummaryTimer = null;
+				if (!pendingSummaryTask) return;
+				const name = pendingSummaryTask;
+				pendingSummaryTask = null;
+				lastCtx?.ui.notify(`do-always: "${name}" failed to start (check model/API key)`, "error");
+			}, 10_000);
+			pi.sendUserMessage(reviewPrompt);
+			ctx.ui.notify(`do-always: reviewing ${selected.length} commit${selected.length !== 1 ? "s" : ""} (Plan)`, "info");
+			return;
+		}
 		const blocked = evaluateGuards(task, context);
 		if (blocked) {
 			ctx.ui.notify(`do-always: ${blocked}`, "info");

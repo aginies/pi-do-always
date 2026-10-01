@@ -19,8 +19,9 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
    4  ⚡ Security               Security audit (Plan)                                            ·  
    5  ⚡ Performance            Performance review (Plan)                                      ►[3] 
    6  ⚡ Propose features       Propose new features (Plan)                                      ·  
+   7  ⚡ Review commits        Browse and select commits to review (Plan)                       ·  
   DO
-   7  Build                     Test build is ok and fix issues                                  ·  
+   8  Build                     Test build is ok and fix issues                                  ·  
    8  Tests                     Run tests and fix failures                                       ·  
   DOCS
    9  Readme                    Update the README.md                                             ·  
@@ -163,7 +164,7 @@ Tasks are read from JSON files (an array of tasks, or the object form `{"tasks":
 |`~/.pi/agent/do-always.json`|Global (all projects)|
 |`<project>/.pi/do-always.json`|Project-local; overrides global tasks with the same `name`|
 
-If neither file exists, the built-in defaults (Review changes, Review code, Cleanup, Security, Performance, Propose features, Build, Tests, Readme, Release, Commit) are used.
+If neither file exists, the built-in defaults (Review changes, Review code, Cleanup, Security, Performance, Propose features, Review commits, Build, Tests, Readme, Release, Commit) are used.
 This repo ships a sample in [`do-always.json`](./extensions/pi-do-always/do-always.json) — copy it to one of the
 locations above to make it your own:
 

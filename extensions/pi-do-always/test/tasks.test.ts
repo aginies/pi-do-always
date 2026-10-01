@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	CHAIN_MAX,
+	COMMIT_BROWSER_MAX,
+	COMMIT_SELECT_MAX,
 	DEFAULT_CATEGORY_ORDER,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
@@ -20,7 +22,10 @@ import {
 	evaluateGuards,
 	evaluateWhen,
 	formatChainSequence,
+	formatCommitReviewPrompt,
 	formatList,
+	groupCommitsByDate,
+	parseGitLogOutput,
 	parseGuard,
 	groupTasksByCategory,
 	isValidKeyId,
@@ -51,10 +56,12 @@ import {
 	toPromptContext,
 	validateChain,
 	GUARD_TYPES,
+	type CommitInfo,
+	type DateGroup,
 	type DoAlwaysTask,
 	type Guard,
-	type GuardType,
 	type PromptContext,
+	type SelectedCommit,
 	type TaskContext,
 } from "../tasks";
 
@@ -1377,4 +1384,183 @@ test("chainSummary shows all-done with time", () => {
 
 test("chainSummary shows all-done without time", () => {
 	assert.equal(chainSummary(3, 3, 0), "✅ 3/3 steps completed");
+});
+
+// ── Commit browser constants & types ─────────────────────────────────────
+
+test("COMMIT_BROWSER_MAX is 20", () => {
+	assert.equal(COMMIT_BROWSER_MAX, 20);
+});
+
+test("COMMIT_SELECT_MAX is 20", () => {
+	assert.equal(COMMIT_SELECT_MAX, 20);
+});
+
+// Verify the 'Review commits' task exists in DEFAULT_TASKS and auto-runs (Plan category).
+const reviewTask = DEFAULT_TASKS.find((t) => t.name === "Review commits");
+test("'Review commits' task exists in DEFAULT_TASKS", () => {
+	assert.ok(reviewTask, "'Review commits' should be in DEFAULT_TASKS");
+});
+test("'Review commits' auto-runs (Plan category)", () => {
+	assert.ok(reviewTask?.category === "Plan", "'Review commits' is in Plan category");
+	assert.ok(shouldAutoRun(reviewTask!), "'Review commits' should auto-run via Plan category");
+});
+
+test("formatCommitReviewPrompt formats single commit prompt", () => {
+	const commits: SelectedCommit[] = [
+		{
+			hash: "a".repeat(40),
+			shortHash: "abc1234",
+			subject: "feat: new feature",
+			date: "2025-01-15",
+			author: "Alice",
+			filesChanged: 3,
+			insertions: 50,
+			deletions: 2,
+			selectionOrder: 1,
+		},
+	];
+	const prompt = formatCommitReviewPrompt(commits);
+	assert.ok(prompt.includes("Review the following git commit:"));
+	assert.ok(prompt.includes("Commit abc1234 (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"));
+	assert.ok(prompt.includes("feat: new feature"));
+	assert.ok(prompt.includes("git show aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+});
+
+test("formatCommitReviewPrompt formats multiple commits prompt", () => {
+	const commits: SelectedCommit[] = [
+		{
+			hash: "a".repeat(40),
+			shortHash: "abc1234",
+			subject: "feat: first",
+			date: "2025-01-15",
+			author: "Alice",
+			filesChanged: 1,
+			insertions: 10,
+			deletions: 0,
+			selectionOrder: 1,
+		},
+		{
+			hash: "b".repeat(40),
+			shortHash: "def5678",
+			subject: "fix: second",
+			date: "2025-01-14",
+			author: "Bob",
+			filesChanged: 2,
+			insertions: 5,
+			deletions: 3,
+			selectionOrder: 2,
+		},
+	];
+	const prompt = formatCommitReviewPrompt(commits);
+	assert.ok(prompt.includes("Review the following git commits:"));
+	assert.ok(prompt.includes("1. Commit abc1234"));
+	assert.ok(prompt.includes("2. Commit def5678"));
+	assert.ok(prompt.includes("git show <hash>"));
+});
+
+// Verify parseGitLogOutput
+test("parseGitLogOutput handles empty output", () => {
+	assert.deepEqual(parseGitLogOutput(""), []);
+	assert.deepEqual(parseGitLogOutput("   \n\n  "), []);
+});
+
+test("parseGitLogOutput parses commits with and without stats", () => {
+	const logSample = [
+		`COMMIT\t${"a".repeat(40)}\tabc1234\tfeat: first commit\t2025-01-15\tAlice`,
+		"",
+		" 3 files changed, 50 insertions(+), 2 deletions(-)",
+		`COMMIT\t${"b".repeat(40)}\tdef5678\tfix: second commit\t2025-01-15\tBob`,
+		"",
+		" 1 file changed, 10 insertions(+)",
+		`COMMIT\t${"c".repeat(40)}\tghi9012\tdocs: third commit\t2025-01-14\tCarol`,
+		"",
+		" 2 files changed, 5 deletions(-)",
+		`COMMIT\t${"d".repeat(40)}\tjkl3456\tempty commit\t2025-01-14\tDave`,
+	].join("\n");
+
+	const parsed = parseGitLogOutput(logSample);
+	assert.equal(parsed.length, 4);
+
+	assert.equal(parsed[0].hash, "a".repeat(40));
+	assert.equal(parsed[0].shortHash, "abc1234");
+	assert.equal(parsed[0].subject, "feat: first commit");
+	assert.equal(parsed[0].date, "2025-01-15");
+	assert.equal(parsed[0].author, "Alice");
+	assert.equal(parsed[0].filesChanged, 3);
+	assert.equal(parsed[0].insertions, 50);
+	assert.equal(parsed[0].deletions, 2);
+
+	assert.equal(parsed[1].hash, "b".repeat(40));
+	assert.equal(parsed[1].filesChanged, 1);
+	assert.equal(parsed[1].insertions, 10);
+	assert.equal(parsed[1].deletions, 0);
+
+	assert.equal(parsed[2].hash, "c".repeat(40));
+	assert.equal(parsed[2].filesChanged, 2);
+	assert.equal(parsed[2].insertions, 0);
+	assert.equal(parsed[2].deletions, 5);
+
+	assert.equal(parsed[3].hash, "d".repeat(40));
+	assert.equal(parsed[3].filesChanged, 0);
+	assert.equal(parsed[3].insertions, 0);
+	assert.equal(parsed[3].deletions, 0);
+});
+
+test("parseGitLogOutput handles subjects with tabs", () => {
+	const logSample = `COMMIT\t${"e".repeat(40)}\txyz9999\tsubject\twith\ttabs\t2025-01-13\tEve\n\n 1 file changed, 1 insertion(+)`;
+	const parsed = parseGitLogOutput(logSample);
+	assert.equal(parsed.length, 1);
+	assert.equal(parsed[0].subject, "subject\twith\ttabs");
+	assert.equal(parsed[0].date, "2025-01-13");
+	assert.equal(parsed[0].author, "Eve");
+});
+
+// Verify groupCommitsByDate
+test("groupCommitsByDate groups commits sharing the same date", () => {
+	const commits: CommitInfo[] = [
+		{ hash: "1".repeat(40), shortHash: "1111111", subject: "c1", date: "2025-01-15", author: "A", filesChanged: 1, insertions: 1, deletions: 0 },
+		{ hash: "2".repeat(40), shortHash: "2222222", subject: "c2", date: "2025-01-15", author: "B", filesChanged: 2, insertions: 2, deletions: 1 },
+		{ hash: "3".repeat(40), shortHash: "3333333", subject: "c3", date: "2025-01-14", author: "C", filesChanged: 0, insertions: 0, deletions: 0 },
+	];
+	const groups = groupCommitsByDate(commits);
+	assert.equal(groups.length, 2);
+	assert.equal(groups[0].date, "2025-01-15");
+	assert.equal(groups[0].count, 2);
+	assert.equal(groups[0].commits.length, 2);
+	assert.equal(groups[1].date, "2025-01-14");
+	assert.equal(groups[1].count, 1);
+	assert.equal(groups[1].commits.length, 1);
+});
+
+// Verify DateGroup shape via a manual construction.
+const sampleGroup: DateGroup = {
+	date: "2025-01-15",
+	count: 2,
+	commits: [
+		{ hash: "a".repeat(40), shortHash: "abc1234", subject: "feat: add x", date: "2025-01-15", author: "A", filesChanged: 3, insertions: 50, deletions: 2 },
+		{ hash: "b".repeat(40), shortHash: "def5678", subject: "fix: y", date: "2025-01-15", author: "B", filesChanged: 1, insertions: 10, deletions: 5 },
+	],
+};
+test("DateGroup has correct shape", () => {
+	assert.equal(sampleGroup.date, "2025-01-15");
+	assert.equal(sampleGroup.count, 2);
+	assert.equal(sampleGroup.commits.length, 2);
+});
+
+// Verify SelectedCommit shape.
+const sampleSelected: SelectedCommit = {
+	hash: "c".repeat(40),
+	shortHash: "ghi9012",
+	subject: "chore: z",
+	date: "2025-01-14",
+	author: "C",
+	filesChanged: 0,
+	insertions: 0,
+	deletions: 0,
+	selectionOrder: 1,
+};
+test("SelectedCommit has correct shape", () => {
+	assert.equal(sampleSelected.selectionOrder, 1);
+	assert.equal(sampleSelected.hash.length, 40);
 });

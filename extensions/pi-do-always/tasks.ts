@@ -396,6 +396,12 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		prompt:
 			"Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in terms of changes, whether this will break APIs, or introduce compatibility issues.",
 	},
+	{
+		name: "Review commits",
+		category: "Plan",
+		description: "Browse and select commits to review (Plan)",
+		prompt: "Browse recent commits, select some, and review their diffs.",
+	},
 ];
 
 /**
@@ -427,7 +433,7 @@ export function parseConfig(
 	const tasks: DoAlwaysTask[] = [];
 	for (const entry of list) {
 		const t = entry as Partial<DoAlwaysTask> | null;
-		if (t && typeof t.name === "string" && t.name.length > 0 && typeof t.prompt === "string" && t.prompt.length > 0) {
+		if (t && typeof t.name === "string" && t.name.length > 0 && typeof t.prompt === "string" && (t.prompt.length > 0 || t.autoRun === true)) {
 			const task: DoAlwaysTask = {
 				name: t.name,
 				prompt: t.prompt,
@@ -1262,4 +1268,143 @@ function outcomeToMarker(outcome: ChainStepOutcome): string {
 			// Exhaustive check: the type is a literal union, so this is unreachable.
 			throw new Error(`unexpected outcome: ${outcome as string}`);
 	}
+}
+
+// ── Commit browser types ─────────────────────────────────────────────────
+//
+// Types and constants for the date-grouped commit browser (used by
+// the "Review commits" task in index.ts). Pure data — no Pi dependencies.
+
+/** Maximum commits shown per page in the date-grouped browser. */
+export const COMMIT_BROWSER_MAX = 20;
+
+/** Maximum commits that can be selected for a review chain. */
+export const COMMIT_SELECT_MAX = 20;
+
+/** A single commit as returned by `git log --format`. */
+export interface CommitInfo {
+	/** Full 40-char SHA. */
+	hash: string;
+	/** Short 7-char SHA. */
+	shortHash: string;
+	/** Commit subject line. */
+	subject: string;
+	/** Commit date (YYYY-MM-DD). */
+	date: string;
+	/** Commit author name. */
+	author: string;
+	/** Number of files changed in this commit. */
+	filesChanged: number;
+	/** Insertions in this commit. */
+	insertions: number;
+	/** Deletions in this commit. */
+	deletions: number;
+}
+
+/** A commit selected by the user for review. */
+export interface SelectedCommit extends CommitInfo {
+	/** 1-based position in the user's selection order. */
+	selectionOrder: number;
+}
+
+/** Group of commits sharing the same date. */
+export interface DateGroup {
+	/** Date string (YYYY-MM-DD). */
+	date: string;
+	/** Number of commits in this group. */
+	count: number;
+	/** Commits in this group (newest first). */
+	commits: CommitInfo[];
+}
+
+/**
+ * Parse git log output formatted with:
+ * `COMMIT%x09%H%x09%h%x09%s%x09%ad%x09%an` and optional `--shortstat`.
+ */
+export function parseGitLogOutput(output: string): CommitInfo[] {
+	if (!output) return [];
+	const commits: CommitInfo[] = [];
+	let current: CommitInfo | null = null;
+	for (const rawLine of output.split("\n")) {
+		const line = rawLine.trim();
+		if (line.startsWith("COMMIT\t")) {
+			if (current) commits.push(current);
+			const parts = line.split("\t");
+			if (parts.length >= 6) {
+				const hash = parts[1];
+				const shortHash = parts[2];
+				const date = parts[parts.length - 2];
+				const author = parts[parts.length - 1];
+				const subject = parts.slice(3, parts.length - 2).join("\t") || "(no subject)";
+				current = {
+					hash,
+					shortHash,
+					subject,
+					date,
+					author,
+					filesChanged: 0,
+					insertions: 0,
+					deletions: 0,
+				};
+			} else {
+				current = null;
+			}
+			continue;
+		}
+		if (current && line.includes("changed")) {
+			const mFiles = line.match(/(\d+) file/);
+			const mIns = line.match(/(\d+) insertion/);
+			const mDel = line.match(/(\d+) deletion/);
+			if (mFiles) current.filesChanged = Number(mFiles[1]);
+			if (mIns) current.insertions = Number(mIns[1]);
+			if (mDel) current.deletions = Number(mDel[1]);
+		}
+	}
+	if (current) commits.push(current);
+	return commits;
+}
+
+/** Group commits by date (preserving existing order within and between groups). */
+export function groupCommitsByDate(commits: CommitInfo[]): DateGroup[] {
+	const groups = new Map<string, CommitInfo[]>();
+	for (const c of commits) {
+		if (!groups.has(c.date)) groups.set(c.date, []);
+		groups.get(c.date)!.push(c);
+	}
+	return [...groups.entries()].map(([date, groupCommits]) => ({
+		date,
+		count: groupCommits.length,
+		commits: groupCommits,
+	}));
+}
+
+/**
+ * Build the review prompt for the selected commits to send to the agent.
+ */
+export function formatCommitReviewPrompt(commits: SelectedCommit[]): string {
+	const count = commits.length;
+	const commitDetails = commits
+		.map((c, i) => {
+			const num = count > 1 ? `${i + 1}. ` : "";
+			return (
+				`${num}Commit ${c.shortHash} (${c.hash})\n` +
+				`   Subject: ${c.subject}\n` +
+				`   Author:  ${c.author} on ${c.date}\n` +
+				`   Stats:   ${c.filesChanged} file${c.filesChanged !== 1 ? "s" : ""} changed, +${c.insertions}/-${c.deletions} lines`
+			);
+		})
+		.join("\n\n");
+
+	const showCmd = count === 1 ? `git show ${commits[0].hash}` : "git show <hash>";
+
+	return (
+		`Review the following git commit${count !== 1 ? "s" : ""}:\n\n` +
+		`${commitDetails}\n\n` +
+		`Please inspect the changes using \`${showCmd}\` (and any related files in the repository). ` +
+		`Double-check the changes for:\n` +
+		`1. Bugs, edge cases, potential regressions, and logic errors.\n` +
+		`2. Code quality, security, and unintended side effects.\n` +
+		`3. Consistency with surrounding project patterns and tests.\n\n` +
+		`Summarize your findings for each commit and propose a plan for any fixes if needed. Do not make changes yet.`
+	);
 }

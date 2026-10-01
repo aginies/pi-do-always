@@ -39,6 +39,12 @@
 			"prompt": "Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in terms of changes, whether this will break APIs, or introduce compatibility issues."
 		},
 		{
+			"name": "Review commits",
+			"category": "Plan",
+			"description": "Browse and select commits to review (Plan)",
+			"prompt": "Browse recent commits, select some, and review their diffs."
+		},
+		{
 			"name": "Build",
 			"category": "Do",
 			"description": "Test build is ok and fix issues",
