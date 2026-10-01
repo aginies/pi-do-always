@@ -8,30 +8,6 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
 **filled into the input editor**. Review it, tweak it, press Enter to run. Tasks marked `⚡`
 (the `Plan` category by default) auto-run on selection instead — see `autoRun` below.
 
-```text
-  do-always — pick a task
-
-   #  TASK                      DESCRIPTION                                                    ORDER
-  PLAN
-   1  ⚡ Review changes         Review the current code changes (Plan)                           ·  
-   2  ⚡ Review code            Review the whole project's code quality (Plan)                  [1] 
-   3  ⚡ Cleanup                Clean up dead code and duplicates (Plan)                        [2] 
-   4  ⚡ Security               Security audit (Plan)                                            ·  
-   5  ⚡ Performance            Performance review (Plan)                                      ►[3] 
-   6  ⚡ Propose features       Propose new features (Plan)                                      ·  
-   7  ⚡ Review commits        Browse and select commits to review (Plan)                       ·  
-  DO
-   8  Build                     Test build is ok and fix issues                                  ·  
-   8  Tests                     Run tests and fix failures                                       ·  
-  DOCS
-   9  Readme                    Update the README.md                                             ·  
-
-  ──────────────────────────────────────────────────────────────────────────────────────────────────
-  Run the chain (3)
-  ← tasks  •  ⏎ remove  •  esc  •  ctrl+u clear
-
-  1-9 pick by number  •  type to filter  •  ↑↓ navigate  •  enter select  •  esc cancel  •  ⚡ auto-runs
-```
 
 ![do-always — the numbered task selector](pi.image.png)
 
