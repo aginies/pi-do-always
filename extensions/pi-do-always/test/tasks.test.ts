@@ -24,10 +24,12 @@ import {
 	formatChainSequence,
 	formatCommitReviewPrompt,
 	formatList,
+	formatSelectedCommits,
 	groupCommitsByDate,
 	parseGitLogOutput,
 	parseGuard,
 	groupTasksByCategory,
+	isTaskVisible,
 	isValidKeyId,
 	isValidWhen,
 	mergeTasks,
@@ -82,6 +84,7 @@ const dirtyCtx: TaskContext = {
 	repo: "proj",
 	stagedFiles: ["a.ts"],
 	unstagedFiles: ["a.ts"],
+	selectedCommits: "none",
 	isGitRepo: true,
 };
 const cleanCtx: TaskContext = { ...dirtyCtx, files: [], diffStat: "none", stagedFiles: [], unstagedFiles: [] };
@@ -180,6 +183,35 @@ test("parseConfig reads a boolean autoRun and omits it when absent", () => {
 test("parseConfig ignores a non-boolean autoRun", () => {
 	const out = parseConfig(JSON.stringify([{ name: "x", prompt: "p", autoRun: "yes" }]), "test.json");
 	assert.equal(out.tasks[0].autoRun, undefined);
+});
+
+test("parseConfig reads a valid browser field and omits it when absent", () => {
+	const on = parseConfig(JSON.stringify([{ name: "x", prompt: "p", browser: "commits" }]), "test.json");
+	assert.equal(on.tasks[0].browser, "commits");
+	const absent = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
+	assert.ok(!("browser" in absent.tasks[0]), "browser key omitted when not set");
+});
+
+test("parseConfig ignores an invalid browser field and reports it", () => {
+	const errors: string[] = [];
+	const out = parseConfig(JSON.stringify([{ name: "x", prompt: "p", browser: "nope" }]), "test.json", (m) => errors.push(m));
+	assert.equal(out.tasks[0].browser, undefined);
+	assert.equal(errors.length, 1);
+	assert.match(errors[0], /invalid "browser"/);
+});
+
+test("parseConfig reads a boolean hidden flag and omits it when absent", () => {
+	const on = parseConfig(JSON.stringify([{ name: "x", prompt: "p", hidden: true }]), "test.json");
+	assert.equal(on.tasks[0].hidden, true);
+	const absent = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
+	assert.ok(!("hidden" in absent.tasks[0]), "hidden key omitted when not set");
+});
+
+test("parseConfig reads a boolean notForCommits flag and omits it when absent", () => {
+	const on = parseConfig(JSON.stringify([{ name: "x", prompt: "p", notForCommits: true }]), "test.json");
+	assert.equal(on.tasks[0].notForCommits, true);
+	const absent = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
+	assert.ok(!("notForCommits" in absent.tasks[0]), "notForCommits key omitted when not set");
 });
 
 test("parseConfig reads a string shortcut from the object form", () => {
@@ -387,6 +419,23 @@ test("orderTasksByCategory places unknown categories after the known ones", () =
 	assert.deepEqual(
 		out.map((t) => t.name),
 		["b", "c", "a"],
+	);
+});
+
+test("DEFAULT_CATEGORY_ORDER includes Browse right after Plan", () => {
+	assert.deepEqual(DEFAULT_CATEGORY_ORDER, ["Plan", "Browse", "Do", "Docs", "Ops", "Other"]);
+});
+
+test("orderTasksByCategory places Browse between Plan and Do", () => {
+	const tasks: DoAlwaysTask[] = [
+		{ name: "a", category: "Do", prompt: "" },
+		{ name: "b", category: "Browse", prompt: "" },
+		{ name: "c", category: "Plan", prompt: "" },
+	];
+	const out = orderTasksByCategory(tasks);
+	assert.deepEqual(
+		out.map((t) => t.name),
+		["c", "b", "a"],
 	);
 });
 
@@ -628,6 +677,36 @@ test("evaluateWhen ANDs multiple object conditions", () => {
 	assert.equal(evaluateWhen({ name: "a", prompt: "p", when: conflicting }, dirtyCtx), false);
 });
 
+// ---------------------------------------------------------------------------
+// isTaskVisible (selector + list visibility: hidden flag AND when condition)
+// ---------------------------------------------------------------------------
+
+test("isTaskVisible shows a plain task", () => {
+	assert.equal(isTaskVisible({ name: "a", prompt: "p" }, dirtyCtx), true);
+	assert.equal(isTaskVisible({ name: "a", prompt: "p" }, nonGitCtx), true);
+});
+
+test("isTaskVisible hides a hidden task even when its when condition passes", () => {
+	const hidden = { name: "a", prompt: "p", hidden: true };
+	assert.equal(isTaskVisible(hidden, dirtyCtx), false);
+	assert.equal(isTaskVisible({ ...hidden, when: "git" }, dirtyCtx), false);
+});
+
+test("isTaskVisible hides a task whose when condition fails, even when not hidden", () => {
+	const gitOnly = { name: "a", prompt: "p", when: "git" };
+	assert.equal(isTaskVisible(gitOnly, dirtyCtx), true);
+	assert.equal(isTaskVisible(gitOnly, nonGitCtx), false);
+});
+
+test("isTaskVisible matches the built-in Review commits (hidden) and Browse commits (when: git)", () => {
+	const review = DEFAULT_TASKS.find((t) => t.name === "Review commits");
+	const browse = DEFAULT_TASKS.find((t) => t.name === "Browse commits");
+	assert.ok(review && browse);
+	assert.equal(isTaskVisible(review, dirtyCtx), false, "hidden Review commits is never in the selector");
+	assert.equal(isTaskVisible(browse, dirtyCtx), true, "Browse commits shows in a git repo");
+	assert.equal(isTaskVisible(browse, nonGitCtx), false, "Browse commits hides outside git");
+});
+
 test("parseConfig reads a boolean requireDirty and omits it when absent", () => {
 	const on = parseConfig(JSON.stringify([{ name: "x", prompt: "p", requireDirty: true }]), "test.json");
 	assert.equal(on.tasks[0].requireDirty, true);
@@ -839,6 +918,7 @@ test("toPromptContext maps every structured fact to its string view", () => {
 		repo: "proj",
 		staged_files: "a.ts",
 		unstaged_files: "a.ts",
+		selected_commits: "none",
 	});
 });
 
@@ -864,6 +944,15 @@ test("toPromptContext joins staged/unstaged lists with newlines", () => {
 	const out = toPromptContext(ctx);
 	assert.equal(out.staged_files, "a.ts\nb.ts");
 	assert.equal(out.unstaged_files, "c.ts");
+});
+
+test("PROMPT_CONTEXT_KEYS includes selected_commits", () => {
+	assert.ok((PROMPT_CONTEXT_KEYS as readonly string[]).includes("selected_commits"));
+});
+
+test("toPromptContext passes selectedCommits through", () => {
+	const ctx = { ...dirtyCtx, selectedCommits: "Commit aaaaaaa (…)" };
+	assert.equal(toPromptContext(ctx).selected_commits, "Commit aaaaaaa (…)");
 });
 
 test("toPromptContext caps staged_files and unstaged_files at MAX_FILE_LINES", () => {
@@ -1013,6 +1102,7 @@ test("rendering every default prompt with a full context leaves no placeholders"
 		repo: "pi-do-always",
 		staged_files: "a.ts\nb.ts",
 		unstaged_files: "c.ts",
+		selected_commits: "none",
 	};
 	for (const t of DEFAULT_TASKS) {
 		assert.doesNotMatch(renderPrompt(t.prompt, ctx), /\{\{/, t.name);
@@ -1023,7 +1113,7 @@ test("the shipped sample config stays in sync with DEFAULT_TASKS", () => {
 	const samplePath = join(dirname(fileURLToPath(import.meta.url)), "..", "do-always.json");
 	const { tasks } = parseConfig(readFileSync(samplePath, "utf-8"), "do-always.json");
 	const key = (t: DoAlwaysTask) =>
-		JSON.stringify([t.name, t.category, t.description, t.prompt, t.requireDirty, t.when, t.autoRun]);
+		JSON.stringify([t.name, t.category, t.description, t.prompt, t.requireDirty, t.when, t.autoRun, t.browser, t.hidden, t.notForCommits]);
 	assert.deepEqual(
 		orderTasksByCategory(tasks).map(key),
 		orderTasksByCategory(DEFAULT_TASKS).map(key),
@@ -1044,6 +1134,7 @@ test("rendering default prompts with a fallback (non-git) context leaves no plac
 		repo: "notgit",
 		staged_files: "none",
 		unstaged_files: "none",
+		selected_commits: "none",
 	};
 	for (const t of DEFAULT_TASKS) {
 		assert.doesNotMatch(renderPrompt(t.prompt, ctx), /\{\{/, t.name);
@@ -1396,6 +1487,60 @@ test("COMMIT_SELECT_MAX is 20", () => {
 	assert.equal(COMMIT_SELECT_MAX, 20);
 });
 
+// ---------------------------------------------------------------------------
+// formatSelectedCommits (commit detail block)
+// ---------------------------------------------------------------------------
+
+test("formatSelectedCommits formats a single commit without numbering", () => {
+	const c: SelectedCommit = {
+		hash: "a1b2c3d4".padEnd(40, "a"),
+		shortHash: "a1b2c3d",
+		subject: "fix: handle null user",
+		date: "2026-10-01",
+		author: "Agine",
+		filesChanged: 2,
+		insertions: 10,
+		deletions: 3,
+		selectionOrder: 1,
+	};
+	assert.equal(
+		formatSelectedCommits([c]),
+		`Commit a1b2c3d (${c.hash})\n   Subject: fix: handle null user\n   Author:  Agine on 2026-10-01\n   Stats:   2 files changed, +10/-3 lines`,
+	);
+});
+
+test("formatSelectedCommits numbers multiple commits", () => {
+	const mk = (i: number): SelectedCommit => ({
+		hash: `${i}${"0".repeat(39)}`,
+		shortHash: `${i}000000`,
+		subject: `commit ${i}`,
+		date: "2026-10-01",
+		author: "Agine",
+		filesChanged: 1,
+		insertions: 1,
+		deletions: 0,
+		selectionOrder: i,
+	});
+	const out = formatSelectedCommits([mk(1), mk(2)]);
+	assert.ok(out.startsWith("1. Commit 1000000"));
+	assert.ok(out.includes("2. Commit 2000000"));
+});
+
+test("formatCommitReviewPrompt embeds the formatSelectedCommits block", () => {
+	const c: SelectedCommit = {
+		hash: "a".repeat(40),
+		shortHash: "aaaaaaa",
+		subject: "s",
+		date: "2026-10-01",
+		author: "A",
+		filesChanged: 1,
+		insertions: 1,
+		deletions: 1,
+		selectionOrder: 1,
+	};
+	assert.ok(formatCommitReviewPrompt([c]).includes(formatSelectedCommits([c])));
+});
+
 // Verify the 'Review commits' task exists in DEFAULT_TASKS and auto-runs (Plan category).
 const reviewTask = DEFAULT_TASKS.find((t) => t.name === "Review commits");
 test("'Review commits' task exists in DEFAULT_TASKS", () => {
@@ -1404,6 +1549,46 @@ test("'Review commits' task exists in DEFAULT_TASKS", () => {
 test("'Review commits' auto-runs (Plan category)", () => {
 	assert.ok(reviewTask?.category === "Plan", "'Review commits' is in Plan category");
 	assert.ok(shouldAutoRun(reviewTask!), "'Review commits' should auto-run via Plan category");
+});
+
+test("'Review commits' declares browser: commits", () => {
+	assert.equal(reviewTask?.browser, "commits");
+});
+
+test("'Review commits' is hidden from the selector (commit-picker option only)", () => {
+	assert.equal(reviewTask?.hidden, true);
+	// Still a Plan task whose `when` passes, so the commit picker offers it.
+	assert.equal(reviewTask?.category, "Plan");
+	assert.equal(evaluateWhen(reviewTask, dirtyCtx), true);
+});
+
+test("commit picker candidates: notForCommits Plan tasks excluded, the rest kept", () => {
+	const byName = (n: string) => DEFAULT_TASKS.find((t) => t.name === n);
+	for (const n of ["Review changes", "Review code", "Propose features"]) {
+		assert.equal(byName(n)?.notForCommits, true, `${n} should be notForCommits`);
+	}
+	for (const n of ["Cleanup", "Security", "Performance", "Review commits"]) {
+		assert.ok(!byName(n)?.notForCommits, `${n} should stay a picker candidate`);
+	}
+});
+
+test("DEFAULT_TASKS includes Browse commits (Browse category, commits browser, git only)", () => {
+	const browse = DEFAULT_TASKS.find((t) => t.name === "Browse commits");
+	assert.ok(browse, "'Browse commits' should be in DEFAULT_TASKS");
+	assert.equal(browse?.category, "Browse");
+	assert.equal(browse?.browser, "commits");
+	assert.equal(browse?.when, "git");
+});
+
+test("Browse commits is only shown inside a git repo (when: git)", () => {
+	const browse = DEFAULT_TASKS.find((t) => t.name === "Browse commits");
+	assert.ok(browse);
+	assert.equal(evaluateWhen(browse, nonGitCtx), false);
+	assert.equal(evaluateWhen(browse, dirtyCtx), true);
+});
+
+test("DEFAULT_TASKS 'Review commits' prompt consumes {{selected_commits}}", () => {
+	assert.match(reviewTask?.prompt ?? "", /\{\{\s*selected_commits\s*\}\}/);
 });
 
 test("formatCommitReviewPrompt formats single commit prompt", () => {

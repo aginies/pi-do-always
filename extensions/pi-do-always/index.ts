@@ -66,10 +66,11 @@ import {
 	evaluateGuards,
 	evaluateWhen,
 	formatChainSequence,
-	formatCommitReviewPrompt,
 	formatList,
+	formatSelectedCommits,
 	groupCommitsByDate,
 	groupTasksByCategory,
+	isTaskVisible,
 	isValidKeyId,
 	mergeTasks,
 	parseConfig,
@@ -205,6 +206,17 @@ function git(cwd: string, args: string[]): Promise<string | undefined> {
 }
 
 /**
+ * Count changed files (staged, unstaged, untracked) with a single git spawn.
+ * Lighter than a full `buildContext` when only the count is needed (chain
+ * step summaries). Returns 0 when git is unavailable — the same neutral
+ * result `buildContext` yields via its empty file list.
+ */
+async function changedFileCount(cwd: string): Promise<number> {
+	const porcelain = await git(cwd, ["status", "--porcelain"]);
+	return porcelain ? parseStatusPorcelain(porcelain).length : 0;
+}
+
+/**
  * Build the structured context for the current directory. Git facts fall back
  * to neutral values when unavailable (non-git dir, no git, empty repo) so
  * default prompts read cleanly in any directory.
@@ -241,6 +253,7 @@ async function buildContext(cwd: string): Promise<TaskContext> {
 			repo: cwd.split(/[\\/]/).filter(Boolean).pop() ?? "unknown",
 			stagedFiles: [],
 			unstagedFiles: [],
+			selectedCommits: "none",
 			isGitRepo: false,
 		};
 	}
@@ -282,6 +295,7 @@ async function buildContext(cwd: string): Promise<TaskContext> {
 		repo,
 		stagedFiles,
 		unstagedFiles,
+		selectedCommits: "none",
 		isGitRepo,
 	};
 }
@@ -487,8 +501,8 @@ function browseCommits(
 				lines.push("");
 				lines.push(theme.fg("dim", "  " + "─".repeat(Math.max(1, width - 4))));
 				const runLabel = selectedMap.size === 0
-					? "review the chain (no commits selected)"
-					: `review the chain (${selectedMap.size} commit${selectedMap.size !== 1 ? "s" : ""})`;
+					? "do on the commits (no commits selected)"
+					: `do on the commits (${selectedMap.size} commit${selectedMap.size !== 1 ? "s" : ""})`;
 				if (cursor.kind === "run") {
 					lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", "►")} ${runLabel}`)));
 				} else if (selectedMap.size === 0) {
@@ -723,6 +737,122 @@ function browseCommits(
 /** True for a single printable ASCII character (used for filter typing). */
 function isPrintable(data: string): boolean {
 	return data.length === 1 && data >= " " && data <= "~";
+}
+
+/**
+ * Task picker shown after a commit selection: proposes the Plan tasks (hidden
+ * ones included — e.g. "Review commits" exists to be picked here) to run on
+ * the selected commits. Type to filter, ↑/↓ move, Enter runs, Esc cancels.
+ * Returns the chosen task, or null on cancel.
+ */
+function pickPlanTaskForCommits(
+	ctx: ExtensionContext,
+	candidates: DoAlwaysTask[],
+	commitCount: number,
+): Promise<DoAlwaysTask | null> {
+	return new Promise<DoAlwaysTask | null>((resolve) => {
+		ctx.ui.custom<DoAlwaysTask | null>((tui, theme, _kb, done) => {
+			const kb = getKeybindings();
+			let settled = false;
+			let filter = "";
+			let cursor = 0;
+
+			const visible = () => {
+				if (!filter) return candidates;
+				const f = filter.toLowerCase();
+				return candidates.filter(
+					(t) =>
+						t.name.toLowerCase().includes(f) ||
+						(t.description ?? "").toLowerCase().includes(f),
+				);
+			};
+
+			function finish(task: DoAlwaysTask | null) {
+				if (settled) return;
+				settled = true;
+				done(task);
+				resolve(task);
+			}
+
+			function render(width: number): string[] {
+				const items = visible();
+				if (items.length === 0) cursor = 0;
+				else if (cursor >= items.length) cursor = items.length - 1;
+				const lines: string[] = [];
+				lines.push(
+					theme.fg(
+						"accent",
+						theme.bold(
+							truncateToWidth(
+								`  do-always — run on ${commitCount} selected commit${commitCount !== 1 ? "s" : ""}`,
+								width - 2,
+								"",
+							),
+						),
+					),
+				);
+				lines.push(theme.fg("muted", "   #  TASK"));
+				if (items.length === 0) {
+					lines.push(theme.fg("warning", `  No Plan tasks matching "${filter}"`));
+				} else {
+					for (let i = 0; i < items.length; i++) {
+						const t = items[i];
+						const auto = shouldAutoRun(t);
+						const name = truncateToWidth(t.name, Math.max(10, width - 8 - (auto ? 3 : 0)), "…", true);
+						const rowText = `  ${String(i + 1).padStart(2)}  ${auto ? "⚡ " : ""}${name}`;
+						lines.push(i === cursor ? theme.bg("selectedBg", theme.bold(rowText)) : rowText);
+					}
+				}
+				lines.push(
+					theme.fg(
+						"dim",
+						truncateToWidth(
+							`  ↑/↓ move  •  ⏎ run  •  esc${filter ? `  •  filter: "${filter}"` : ""}`,
+							width - 2,
+							"",
+						),
+					),
+				);
+				return lines;
+			}
+
+			function handleInput(data: string) {
+				if (settled) return;
+				const items = visible();
+				if (kb.matches(data, "tui.select.cancel") || matchesKey(data, "escape")) {
+					finish(null);
+					return;
+				}
+				if (kb.matches(data, "tui.select.confirm") || matchesKey(data, "enter")) {
+					finish(items[cursor] ?? null);
+					return;
+				}
+				if (kb.matches(data, "tui.select.up") || matchesKey(data, "up")) {
+					if (items.length > 0) cursor = cursor === 0 ? items.length - 1 : cursor - 1;
+					tui.requestRender();
+					return;
+				}
+				if (kb.matches(data, "tui.select.down") || matchesKey(data, "down")) {
+					if (items.length > 0) cursor = cursor === items.length - 1 ? 0 : cursor + 1;
+					tui.requestRender();
+					return;
+				}
+				if (kb.matches(data, "tui.editor.deleteCharBackward") || matchesKey(data, "backspace")) {
+					filter = filter.slice(0, -1);
+					cursor = 0;
+					tui.requestRender();
+					return;
+				}
+				if (isPrintable(data)) {
+					filter += data;
+					cursor = 0;
+					tui.requestRender();
+				}
+			}
+
+			return { render, handleInput, invalidate: () => {} };
+		});
+	});
 }
 
 /** Delay before the selector reveals the selected task's prompt preview. */
@@ -1229,9 +1359,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		return done;
 	}
 
-	/** Filter tasks by their `when` condition and refresh the completion cache. */
+	/** Filter tasks by visibility (`hidden` flag + `when` condition) and refresh the completion cache. */
 	function refreshVisible(cwd: string, context: TaskContext): DoAlwaysTask[] {
-		const visible = tasks.filter((t) => evaluateWhen(t, context));
+		const visible = tasks.filter((t) => isTaskVisible(t, context));
 		visibleCache = { cwd, visible };
 		return visible;
 	}
@@ -1317,8 +1447,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 	/** Put the task prompt into the editor (TUI) or send it as a user message (other modes). */
 	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext, context: TaskContext): Promise<void> {
-		// "Review commits" — open the date-grouped browser, then trigger LLM review of selected commits.
-		if (task.name === "Review commits") {
+		// Commit browser: any task with `browser: "commits"` opens the
+		// date-grouped browser first. The name check keeps configs that
+		// predate the field working. After the selection: a task whose prompt
+		// references {{selected_commits}} runs itself on the selection; a
+		// generic entry (e.g. "Browse commits") proposes the Plan tasks to
+		// run on it — hidden tasks included, since they exist to be picked
+		// here (non-TUI: the first one whose guards pass).
+		if (task.browser === "commits" || task.name === "Review commits") {
 			let selected: SelectedCommit[] = [];
 			if (ctx.mode !== "tui") {
 				const initialData = await fetchCommitsPage(ctx.cwd, 0, 1);
@@ -1345,8 +1481,57 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				selected = result;
 			}
 
-			const reviewPrompt = formatCommitReviewPrompt(selected);
-			pendingSummaryTask = task.name;
+			// Which task runs on the selection: the originating task when its
+			// prompt consumes {{selected_commits}}; otherwise a Plan task
+			// picked by the user (TUI) or the first whose guards pass (non-TUI).
+			const planTasks = tasks.filter(
+				(t) =>
+					!t.notForCommits &&
+					evaluateWhen(t, context) &&
+					(t.category ?? "").trim().toLowerCase() === "plan",
+			);
+			if (planTasks.length === 0) {
+				ctx.ui.notify("do-always: no Plan task available to run on the selected commits", "info");
+				return;
+			}
+			let chosen: DoAlwaysTask | undefined;
+			if (/\{\{\s*selected_commits\s*\}\}/.test(task.prompt)) {
+				chosen = task;
+			} else if (ctx.mode === "tui") {
+				const picked = await pickPlanTaskForCommits(ctx, planTasks, selected.length);
+				if (!picked) {
+					ctx.ui.notify("do-always: no task chosen — commits not used", "info");
+					return;
+				}
+				chosen = picked;
+			} else {
+				// Non-TUI: no picker — the first Plan task whose guards pass.
+				chosen = planTasks.find((t) => evaluateGuards(t, context) === null);
+			}
+			if (!chosen) {
+				ctx.ui.notify("do-always: no Plan task available to run on the selected commits (guards unmet)", "info");
+				return;
+			}
+
+			// Guards apply to the commit run too: a picked (or originating)
+			// task blocked for the current tree is not sent — same as the
+			// non-browser path below.
+			const blocked = evaluateGuards(chosen, context);
+			if (blocked) {
+				ctx.ui.notify(`do-always: ${blocked}`, "info");
+				return;
+			}
+
+			// Inject the selection: substitute {{selected_commits}} when the
+			// prompt references it, otherwise append the detail block. The run
+			// is a single turn (not a chain): sendUserMessage + summary.
+			const details = formatSelectedCommits(selected);
+			const strings = toPromptContext(context);
+			const prompt = /\{\{\s*selected_commits\s*\}\}/.test(chosen.prompt)
+				? renderPrompt(chosen.prompt, { ...strings, selected_commits: details })
+				: `${renderPrompt(chosen.prompt, strings)}\n\nSelected commits:\n${details}`;
+
+			pendingSummaryTask = chosen.name;
 			if (pendingSummaryTimer) clearTimeout(pendingSummaryTimer);
 			pendingSummaryTimer = setTimeout(() => {
 				pendingSummaryTimer = null;
@@ -1355,8 +1540,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				pendingSummaryTask = null;
 				lastCtx?.ui.notify(`do-always: "${name}" failed to start (check model/API key)`, "error");
 			}, 10_000);
-			pi.sendUserMessage(reviewPrompt);
-			ctx.ui.notify(`do-always: reviewing ${selected.length} commit${selected.length !== 1 ? "s" : ""} (Plan)`, "info");
+			pi.sendUserMessage(prompt);
+			ctx.ui.notify(
+				`do-always: ${selected.length} commit${selected.length !== 1 ? "s" : ""} → ${chosen.name}`,
+				"info",
+			);
 			return;
 		}
 		const blocked = evaluateGuards(task, context);
@@ -1491,12 +1679,21 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					return;
 				}
 				setChainStep(ctx, 0, "completed");
-				// Post-step summary for step 1 (fill-first)
-				const postContext = await getContext(ctx.cwd);
-				const fileCount = postContext.files.length;
+				// Post-step summary for step 1 (fill-first). When more steps
+				// follow, the fresh full build doubles as step 2's pre-context
+				// (the tree can only change via agent runs, which have settled);
+				// a single-task chain only needs the file count.
+				let nextContext: TaskContext | undefined;
+				let fileCount: number;
+				if (steps.length === 1) {
+					fileCount = await changedFileCount(ctx.cwd);
+				} else {
+					nextContext = await getContext(ctx.cwd);
+					fileCount = nextContext.files.length;
+				}
 				const summary = stepSummary(outcome, first.name, chainDurations[0], fileCount);
 				ctx.ui.notify(`do-always: step 1/${steps.length} — ${summary}`, "info");
-				await runChainSteps(steps, ctx, 1);
+				await runChainSteps(steps, ctx, 1, nextContext);
 			} finally {
 				chainActive = false;
 			}
@@ -1508,15 +1705,23 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * and renders prompts against fresh repository context, and each step is
 	 * awaited until its run has fully settled; an aborted/errored step (or a
 	 * send that failed to start) stops the chain.
+	 *
+	 * Context builds are shared across steps: after each completed step the
+	 * fresh full build (needed for the file-count summary) is reused as the
+	 * next step's pre-context — the tree can only change via agent runs, and
+	 * the step has fully settled before the build runs. `initialContext` lets
+	 * the fill-first path hand over its post-step-1 build. The last step's
+	 * summary uses a single-spawn file count instead of a full build.
 	 */
 	async function runChainSteps(
 		steps: DoAlwaysTask[],
 		ctx: ExtensionContext,
 		startAt: number,
+		initialContext?: TaskContext,
 	): Promise<void> {
+		let context = initialContext ?? (await getContext(ctx.cwd));
 		for (let i = startAt; i < steps.length; i++) {
 			const step = steps[i];
-			const context = await getContext(ctx.cwd);
 			const blocked = evaluateGuards(step, context);
 			if (blocked) {
 				markChainStopped(ctx, i, "skipped", blocked);
@@ -1534,9 +1739,16 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			chainDurations[i] = stepDuration;
 			if (outcome === "completed") {
 				setChainStep(ctx, i, "completed");
-				// Post-step summary: files changed + duration.
-				const postContext = await getContext(ctx.cwd);
-				const fileCount = postContext.files.length;
+				// Post-step summary: files changed + duration. All but the last
+				// step get a fresh full build that doubles as the next step's
+				// pre-context; the last step only needs the count (one spawn).
+				let fileCount: number;
+				if (i === steps.length - 1) {
+					fileCount = await changedFileCount(ctx.cwd);
+				} else {
+					context = await getContext(ctx.cwd);
+					fileCount = context.files.length;
+				}
 				const summary = stepSummary(outcome, step.name, stepDuration, fileCount);
 				ctx.ui.notify(`do-always: step ${i + 1}/${steps.length} — ${summary}`, "info");
 				continue;
@@ -1593,9 +1805,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		context: TaskContext,
 		cache: ReturnType<typeof createContextCache>,
 	): Promise<void> {
-		// Filter by the `when` condition once per session, so hidden tasks never
-		// appear, are never numbered, and can't be picked.
-		const visibleTasks = tasks.filter((t) => evaluateWhen(t, context));
+		// Filter by the `hidden` flag and the `when` condition once per session,
+		// so hidden tasks never appear, are never numbered, and can't be picked
+		// (same predicate as refreshVisible, which numbers `/do-always <n>`).
+		const visibleTasks = tasks.filter((t) => isTaskVisible(t, context));
 		// String view for prompt rendering (derived once, used by the preview).
 		const strings = toPromptContext(context);
 		const result = await ctx.ui.custom<SelectorResult>((tui, theme, _kb, done) => {
@@ -2092,6 +2305,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							return;
 						}
 						// ORDER column: toggle this task's chain membership.
+						// Browser tasks can't be chained: the chain runner sends
+						// prompts directly, so the browser (and
+						// {{selected_commits}}) never run — run them on their own.
+						if (row.task.browser) {
+							ctx.ui.notify(`do-always: "${row.task.name}" opens a browser — it can't be chained, run it on its own`, "info");
+							return;
+						}
 						if (chain.items.includes(row.task.name)) {
 							chain = chainRemove(chain, row.task.name);
 						} else {
@@ -2154,16 +2374,22 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					const { itemRows } = visible;
 					const idx = itemRows.findIndex((r) => r.task === task);
 					if (idx < 0) return undefined;
-					// ORDER cell: press toggles chain membership.
-					if (orderColX !== null && event.x >= orderColX) {
-						if (event.type === "press") {
-							chain = chain.items.includes(task.name) ? chainRemove(chain, task.name) : chainAdd(chain, task.name).state;
-							clampCursor(visible);
-							resetPreview();
-							return { handled: true, render: true };
+						// ORDER cell: press toggles chain membership.
+						if (orderColX !== null && event.x >= orderColX) {
+							if (event.type === "press") {
+								if (task.browser) {
+									// Same rule as the keyboard toggle: browser tasks
+									// can't be chained (see ORDER column).
+									ctx.ui.notify(`do-always: "${task.name}" opens a browser — it can't be chained, run it on its own`, "info");
+									return { handled: true };
+								}
+								chain = chain.items.includes(task.name) ? chainRemove(chain, task.name) : chainAdd(chain, task.name).state;
+								clampCursor(visible);
+								resetPreview();
+								return { handled: true, render: true };
+							}
+							return { handled: true }; // swallow the click after the press action
 						}
-						return { handled: true }; // swallow the click after the press action
-					}
 					// Task area: press selects, click runs (the classic fast path).
 					if (event.type === "press") {
 						mousePressedIndex = idx;

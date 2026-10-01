@@ -111,6 +111,31 @@ that view and in the report file on disk. A run that stops early (aborted, error
 skipped steps) does not show the inline report — only the status trace widget below
 the prompt.
 
+## Commit browser
+
+Two built-in tasks open the date-grouped commit browser (pages of 20, type to
+filter, Space/Enter to select, ←/→ to page):
+
+- **Browse commits** (category `Browse`, only shown inside a git repo) — the
+  generic entry: select commits, then confirm on the `do on the commits
+  (n commits)` row to pick which task runs on them — a picker lists your
+  visible `Plan` tasks, except those marked `notForCommits: true` (the
+  built-in Review changes, Review code, and Propose features — they operate
+  on the working tree or the whole project, not on a set of commits). The
+  chosen task's prompt is sent as a single turn (not a chain) with the
+  selection injected.
+- **Review commits** (category `Plan`, hidden from the selector) — offered in
+  the picker after a selection; the review runs directly on the selected
+  commits (its prompt consumes the selection). Still resolvable by name:
+  `/do-always review commits` opens the browser as before.
+
+The selection is injected into the chosen task's prompt: a prompt that
+references `{{selected_commits}}` gets the numbered commit detail block
+substituted in; any other prompt gets the block appended under
+`Selected commits:`. In non-interactive modes (no TUI) the browser is skipped:
+the latest commit is selected and the first eligible `Plan` task (not
+`notForCommits`) whose guards pass runs on it.
+
 ## Install
 
 Install it from npm as a Pi package, which loads the bundled `index.ts` (and its `tasks.ts`) without
@@ -140,7 +165,7 @@ Tasks are read from JSON files (an array of tasks, or the object form `{"tasks":
 |`~/.pi/agent/do-always.json`|Global (all projects)|
 |`<project>/.pi/do-always.json`|Project-local; overrides global tasks with the same `name`|
 
-If neither file exists, the built-in defaults (Review changes, Review code, Cleanup, Security, Performance, Propose features, Review commits, Build, Tests, Readme, Release, Commit) are used.
+If neither file exists, the built-in defaults (Review changes, Review code, Cleanup, Security, Performance, Propose features, Review commits, Browse commits, Build, Tests, Readme, Release, Commit) are used.
 This repo ships a sample in [`do-always.json`](./extensions/pi-do-always/do-always.json) — copy it to one of the
 locations above to make it your own:
 
@@ -158,10 +183,13 @@ locations above to make it your own:
 Fields:
 
 - `name` (required) — short unique id, used for `/do-always <name>`
-- `category` (optional) — group header the task is shown under in the selector (e.g. `"Plan"`, `"Do"`). Matching is case-insensitive and the header is title-cased, so `"plan"` and `"Plan"` land in the same `Plan` group. Tasks without a category fall under `Other`. The built-in defaults are grouped into `Plan`, `Do`, `Docs`, and `Ops`.
+- `category` (optional) — group header the task is shown under in the selector (e.g. `"Plan"`, `"Do"`). Matching is case-insensitive and the header is title-cased, so `"plan"` and `"Plan"` land in the same `Plan` group. Tasks without a category fall under `Other`. The built-in defaults are grouped into `Plan`, `Browse`, `Do`, `Docs`, and `Ops`.
 - `description` (optional) — one-line label shown in the selector
 - `prompt` (required) — the text filled into the editor (supports `{{placeholders}}` — see [Prompt placeholders](#prompt-placeholders))
 - `autoRun` (optional) — when `true`, selecting the task sends its prompt immediately instead of filling the editor; when `false`, it always fills the editor. When omitted, the default is derived from the category: `Plan` tasks auto-run, everything else fills the editor. Auto-run tasks are marked `⚡` in the selector.
+- `browser` (optional) — a browser to open on selection instead of injecting the prompt. Only `"commits"` is supported: it opens the date-grouped commit browser, and after the selection the task runs on the selected commits — directly when its prompt references `{{selected_commits}}`, otherwise via a picker of `Plan` tasks (see [Commit browser](#commit-browser)). An invalid value is ignored with a warning.
+- `hidden` (optional) — when `true`, the task is not shown in the selector or in `/do-always list` / `list-details`. Unlike a `when` condition, a hidden task can still be run by name (`/do-always <name>`), and it is offered as a candidate by the commit picker. The built-in `Review commits` uses this: it is a pick-after-browse option, not a standalone entry.
+- `notForCommits` (optional) — when `true`, the task is excluded from the commit picker (the “run on the selected commits” list) because it does not operate on a set of commits. The task is otherwise unaffected (selector, lists, CLI). The built-in `Review changes`, `Review code`, and `Propose features` use this.
 - `when` (optional) — a condition that hides the task from the selector and lists when it is not met (see [Conditionals](#conditionals)).
 - `guards` (optional) — an array of selection-time guards that block the task (with a message, not a hide) when a condition is unmet (see [Guards](#guards)). The legacy `requireDirty` (boolean) still works and is combined with any `guards`.
 
@@ -204,6 +232,7 @@ injects “Review the changes on branch `fix/login-null` (3 changed files:
 |`{{repo}}`|Basename of the git remote (or of the working directory when there is no remote) — disambiguates monorepo work|
 |`{{staged_files}}`|Files staged for commit, one per line (`none` when empty)|
 |`{{unstaged_files}}`|Modified-but-unstaged files, one per line (`none` when empty)|
+|`{{selected_commits}}`|Commits selected in the commit browser, as a numbered detail block (`none` outside a browser run)|
 
 Unknown placeholders are left as-is, and a prompt without placeholders is
 injected unchanged, so existing configs keep working. The selector preview and

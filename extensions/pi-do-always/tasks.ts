@@ -38,12 +38,35 @@ export interface DoAlwaysTask {
 	 */
 	when?: string | Record<string, unknown>;
 	/**
+	 * Hide the task from the selector and the `list` commands. Hidden tasks
+	 * are not standalone user-visible entries; they can still be resolved by
+	 * name on the command line and are offered as candidates by the commit
+	 * picker. The built-in "Review commits" uses this: it is a pick-after-
+	 * browse option, not an entry point ("Browse commits" is the entry).
+	 */
+	hidden?: boolean;
+	/**
+	 * Exclude the task from the commit picker (the "run on the selected
+	 * commits" list shown after a commit selection). For Plan tasks that
+	 * operate on the working tree or the whole project rather than on a set
+	 * of commits. The task is otherwise unaffected (selector, lists, CLI).
+	 */
+	notForCommits?: boolean;
+	/**
 	 * Extra selection-time guards, evaluated alongside the legacy `requireDirty`
 	 * (see `evaluateGuards`). Each guard blocks the task (with a message, not a
 	 * hide) when its condition is not met. `requireDirty` is kept for backward
 	 * compatibility; new guards use this array so the set is extensible.
 	 */
 	guards?: Guard[];
+	/**
+	 * A browser to open on selection instead of injecting the prompt directly.
+	 * Currently only "commits": opens the date-grouped commit browser, and the
+	 * selected commits drive the review prompt (see `fillPrompt` in index.ts).
+	 * The built-in "Review commits" task also triggers the browser by name, so
+	 * configs that predate this field keep working.
+	 */
+	browser?: BrowserType;
 }
 
 /** The set of known guard types (used for validation at parse time). */
@@ -65,6 +88,13 @@ export interface Guard {
 	type: GuardType;
 	value?: string;
 }
+
+/** The set of known browser types (used for validation at parse time). */
+export const BROWSER_TYPES = [
+	"commits",
+] as const;
+
+export type BrowserType = (typeof BROWSER_TYPES)[number];
 
 /**
  * A config file can be a bare array of tasks, or {"tasks": [...], "shortcut": ...}.
@@ -144,6 +174,12 @@ export interface TaskContext {
 	stagedFiles: string[];
 	/** Modified-but-unstaged files. */
 	unstagedFiles: string[];
+	/**
+	 * Commits selected in the commit browser, formatted for prompt injection
+	 * (see `formatSelectedCommits`), or "none" when no selection is active.
+	 * Context builds always set "none"; the browser flow overrides it at render.
+	 */
+	selectedCommits: string;
 	/** True when cwd is inside a git working tree (authoritative, not inferred from the branch name). */
 	isGitRepo: boolean;
 }
@@ -166,6 +202,7 @@ export const PROMPT_CONTEXT_KEYS = [
 	"repo",
 	"staged_files",
 	"unstaged_files",
+	"selected_commits",
 ] as const;
 
 /** A fully populated prompt context: one entry per PROMPT_CONTEXT_KEYS. */
@@ -193,6 +230,7 @@ export function toPromptContext(ctx: TaskContext): PromptContext {
 		repo: ctx.repo,
 		staged_files: formatFileLines(ctx.stagedFiles),
 		unstaged_files: formatFileLines(ctx.unstagedFiles),
+		selected_commits: ctx.selectedCommits,
 	};
 }
 
@@ -315,6 +353,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		category: "Plan",
 		description: "Review the current code changes (Plan)",
 		requireDirty: true,
+		notForCommits: true,
 		prompt:
 			"Review the changes on branch {{branch}} ({{files_changed_count}} changed files: {{files_changed}}). " +
 			"Change summary: {{diff_stat}}. Last commit: {{last_commit}}. " +
@@ -326,6 +365,7 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		name: "Review code",
 		category: "Plan",
 		description: "Review the whole project's code quality (Plan)",
+		notForCommits: true,
 		prompt:
 			"Review this project's code holistically: identify code smells, dead code, duplication, awkward architecture or patterns, maintainability issues, inconsistencies, and missing or unclear documentation. " +
 			"Prioritize by impact, propose a plan for the fixes, and summarize your findings. Do not make any changes yet.",
@@ -393,14 +433,28 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		name: "Propose features",
 		category: "Plan",
 		description: "Propose new features (Plan)",
+		notForCommits: true,
 		prompt:
 			"Review this project and propose new features that would add value. For each idea, describe the problem it solves, the user benefit, and a rough implementation approach. Prioritize by impact and effort. Do not make any changes yet. Try to evaluate how many lines this will be in terms of changes, whether this will break APIs, or introduce compatibility issues.",
 	},
 	{
 		name: "Review commits",
 		category: "Plan",
-		description: "Browse and select commits to review (Plan)",
-		prompt: "Browse recent commits, select some, and review their diffs.",
+		description: "Review the selected commits (Plan)",
+		browser: "commits",
+		hidden: true,
+		prompt:
+			"Review the selected commits: {{selected_commits}}. Inspect each with `git show <hash>`, " +
+			"double-check the changes for bugs, edge cases, security issues, and consistency with the rest of the codebase. " +
+			"Summarize your findings per commit and propose a plan for any fixes if needed. Do not make any changes yet.",
+	},
+	{
+		name: "Browse commits",
+		category: "Browse",
+		description: "Browse and select commits, then pick a task to run on them",
+		browser: "commits",
+		when: "git",
+		prompt: "Browse recent commits, select some, then pick a task to run on them.",
 	},
 ];
 
@@ -442,6 +496,15 @@ export function parseConfig(
 				if (typeof t.category === "string" && t.category.trim() !== "") task.category = t.category.trim();
 				if (typeof t.autoRun === "boolean") task.autoRun = t.autoRun;
 				if (typeof t.requireDirty === "boolean") task.requireDirty = t.requireDirty;
+				if (typeof t.hidden === "boolean") task.hidden = t.hidden;
+				if (typeof t.notForCommits === "boolean") task.notForCommits = t.notForCommits;
+				if (t.browser !== undefined) {
+					if (typeof t.browser === "string" && BROWSER_TYPES.includes(t.browser as BrowserType)) {
+						task.browser = t.browser as BrowserType;
+					} else {
+						onError(`do-always: ignoring invalid "browser" in ${path} (expected one of: ${BROWSER_TYPES.join(", ")})`);
+					}
+				}
 				if (t.guards !== undefined) {
 					if (Array.isArray(t.guards)) {
 						const guards: Guard[] = [];
@@ -671,8 +734,17 @@ export function evaluateWhen(task: DoAlwaysTask, ctx: TaskContext): boolean {
 	return true;
 }
 
+/**
+ * Whether a task is visible in the selector and the lists: not `hidden` and
+ * its `when` condition passes. Single source of truth so the TUI selector and
+ * the `/do-always <n>` numbering can never diverge.
+ */
+export function isTaskVisible(task: DoAlwaysTask, ctx: TaskContext): boolean {
+	return !task.hidden && evaluateWhen(task, ctx);
+}
+
 /** Default order for category headers in the selector. Exported for tests. */
-export const DEFAULT_CATEGORY_ORDER = ["Plan", "Do", "Docs", "Ops", "Other"];
+export const DEFAULT_CATEGORY_ORDER = ["Plan", "Browse", "Do", "Docs", "Ops", "Other"];
 
 /** A category group: a display name and the tasks that belong to it. */
 interface TaskGroup {
@@ -1379,11 +1451,14 @@ export function groupCommitsByDate(commits: CommitInfo[]): DateGroup[] {
 }
 
 /**
- * Build the review prompt for the selected commits to send to the agent.
+ * Format the selected commits as a numbered detail block (hash, subject,
+ * author, date, stats per commit). Injected into task prompts via the
+ * `{{selected_commits}}` placeholder; composed into the full review prompt by
+ * `formatCommitReviewPrompt`.
  */
-export function formatCommitReviewPrompt(commits: SelectedCommit[]): string {
+export function formatSelectedCommits(commits: SelectedCommit[]): string {
 	const count = commits.length;
-	const commitDetails = commits
+	return commits
 		.map((c, i) => {
 			const num = count > 1 ? `${i + 1}. ` : "";
 			return (
@@ -1394,6 +1469,14 @@ export function formatCommitReviewPrompt(commits: SelectedCommit[]): string {
 			);
 		})
 		.join("\n\n");
+}
+
+/**
+ * Build the review prompt for the selected commits to send to the agent.
+ */
+export function formatCommitReviewPrompt(commits: SelectedCommit[]): string {
+	const count = commits.length;
+	const commitDetails = formatSelectedCommits(commits);
 
 	const showCmd = count === 1 ? `git show ${commits[0].hash}` : "git show <hash>";
 
