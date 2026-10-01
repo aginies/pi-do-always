@@ -4,8 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [0.13.0] - 2026-10-01
 
+### Added
+
+- **Review commits**: new built-in task allowing users to browse recent git commits in pages of 20, select one or more commits to review, and trigger an automated code review with the agent.
+
 ### Fixed
 
+- Commit selector: fixed key handling so Space and Enter toggle commit selection properly instead of being intercepted by search filtering.
+- Commit selector: fixed pagination and cursor tracking, loading 20 commits per page on demand.
 - Commit selector: fixed bug where `rows[cursorRow]` used the wrong array index (line vs. row) and `runLine` was misaligned with the run label.
 - Commit selector: fixed bug where `cursorRow` was not clamped after filter changes, potentially causing out-of-bounds errors.
 - Commit selector: removed dead code (`commitLine` Map and `clearPreviewTimer` no-op).
