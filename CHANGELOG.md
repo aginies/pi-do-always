@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.0] - 2026-10-02
+
+### Added
+
+- **Commit browser**: tasks can now declare `browser: "commits"` to open a
+  date-grouped browser of recent commits on selection instead of injecting
+  the prompt directly. After a selection, a task whose prompt references
+  `{{selected_commits}}` runs on that selection directly; the new built-in
+  "Browse commits" entry (Browse category, git only) offers a picker of
+  eligible Plan tasks (hidden ones included) to run on the selection.
+- New task fields: `browser` (validated against `BROWSER_TYPES`, invalid
+  values ignored with a warning), `hidden` (hidden from the selector and
+  lists, still runnable by name and offered by the commit picker), and
+  `notForCommits` (excluded from the commit picker).
+- New `{{selected_commits}}` prompt placeholder; `formatSelectedCommits`
+  builds the numbered detail block and `formatCommitReviewPrompt` composes
+  the review prompt from it.
+
+### Changed
+
+- Non-TUI modes skip the browser: the latest commit is selected and the
+  first Plan task whose guards pass runs on it.
+- "Review commits" is now a hidden pick-after-browse option whose prompt
+  consumes the commit selection; Review changes, Review code, and Propose
+  features are marked `notForCommits`.
+- Chains share fresh context builds across steps, and the last step's
+  summary uses a single-spawn file count instead of a full build.
+
+### Fixed
+
+- A shared `isTaskVisible` predicate keeps the TUI selector and
+  `/do-always <n>` numbering in sync (hidden tasks no longer appear in the
+  selector).
+- Browser tasks can no longer be added to a chain (keyboard or mouse).
+- Guards are now enforced for the task run from the commit picker.
+
 ## [0.13.0] - 2026-10-01
 
 ### Added
