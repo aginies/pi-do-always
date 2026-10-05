@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0] - 2026-10-02
+
+### Fixed
+
+- `pi.sendUserMessage` calls now include `{ deliverAs: 'followUp' }` so
+  messages are queued when the agent is already processing, instead of
+  throwing "Agent is already processing" errors. Affected paths: chain
+  step execution, commit browser runs, auto-run Plan tasks, and non-TUI
+  fallback sends.
+
 ## [0.14.0] - 2026-10-02
 
 ### Added
