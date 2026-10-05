@@ -1353,11 +1353,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * Send a prompt and resolve when the run it starts has fully settled,
 	 * reporting the run's outcome (see armWaiter).
 	 */
-	function sendAndWait(prompt: string, graceMs = 10_000, stepIndex = 0): Promise<ChainStepOutcome> {
-		const done = armWaiter(graceMs, stepIndex);
-		pi.sendUserMessage(prompt);
-		return done;
-	}
+		function sendAndWait(prompt: string, graceMs = 10_000, stepIndex = 0): Promise<ChainStepOutcome> {
+				const done = armWaiter(graceMs, stepIndex);
+				pi.sendUserMessage(prompt, { deliverAs: 'followUp' });
+				return done;
+		}
 
 	/** Filter tasks by visibility (`hidden` flag + `when` condition) and refresh the completion cache. */
 	function refreshVisible(cwd: string, context: TaskContext): DoAlwaysTask[] {
@@ -1540,7 +1540,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				pendingSummaryTask = null;
 				lastCtx?.ui.notify(`do-always: "${name}" failed to start (check model/API key)`, "error");
 			}, 10_000);
-			pi.sendUserMessage(prompt);
+			pi.sendUserMessage(prompt, { deliverAs: 'followUp' });
 			ctx.ui.notify(
 				`do-always: ${selected.length} commit${selected.length !== 1 ? "s" : ""} → ${chosen.name}`,
 				"info",
@@ -1571,7 +1571,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				pendingSummaryTask = null;
 				lastCtx?.ui.notify(`do-always: "${name}" failed to start (check model/API key)`, "error");
 			}, 10_000);
-			pi.sendUserMessage(prompt);
+			pi.sendUserMessage(prompt, { deliverAs: 'followUp' });
 			ctx.ui.notify(`do-always: auto-ran "${task.name}"`, "info");
 			return;
 		}
@@ -1579,7 +1579,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			ctx.ui.setEditorText(prompt);
 			ctx.ui.notify(`do-always: prompt for "${task.name}" filled — press Enter to run`, "info");
 		} else {
-			pi.sendUserMessage(prompt);
+			pi.sendUserMessage(prompt, { deliverAs: 'followUp' });
 		}
 	}
 
