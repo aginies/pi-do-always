@@ -2,6 +2,60 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- The raw `plan` block is now hidden from the transcript after a completed
+  auto-run `Plan` task: as soon as the reply is finalized, the fenced block
+  is stripped from the message (the questionnaire still parses the captured
+  raw text, so the flow is unchanged). The stripped text is what the model
+  sees in later turns and what the session file persists. The strip is
+  TUI-only — in non-TUI modes the block stays in the transcript so the
+  model can resolve the item-number replies the notification offers. Scoped
+  to the auto-run `Plan` tasks whose prompt carries the plan-block
+  instruction — a `plan` block in a normal conversation, in a non-Plan
+  auto-run task's reply, or in a chain step is never touched.
+- New task field `hidePlan` (default `true`) and global config `hidePlan`
+  (project file wins) to keep the block visible per task or globally.
+- The plan execution prompt no longer refers to the proposal "above" — the
+  block is no longer in the transcript, so the prompt is self-contained.
+
+## [0.16.0] - 2026-10-08
+
+### Added
+
+- **Plan questionnaire**: auto-run `Plan` tasks now end their reply with a
+  machine-readable `plan` block (a summary plus the proposed action items
+  grouped into priority tiers). When the run settles, the reply is parsed
+  and — in the TUI — a questionnaire opens: select whole tiers or individual
+  items (Space/Enter toggles the row under the cursor, a/Ctrl+A selects all,
+  Ctrl+U clears), then confirm on the pinned `Confirm (n/N)` row to send the
+  selection as a single follow-up turn that executes exactly the selected
+  items, in tier order — or Esc to withdraw with no action. Mouse clicks
+  toggle rows and confirm. If the reply has no parseable plan block, the
+  questionnaire is disabled, or the mode is not the TUI, the plain summary
+  notification is kept (non-TUI modes list the proposed items instead, so
+  you can reply with the item numbers to execute). Offered only on the
+  single auto-run path — chain steps never get it.
+- New task field `questionnaire` (default `true`) and global config
+  `questionnaire` (project file wins) to disable the questionnaire per task
+  or globally.
+- **Questionnaire improvements** (same release, additive):
+  - The tier/item list now scrolls for long plans: a 12-row window follows
+    the cursor (↑/↓, Home/End, or the mouse wheel) with a `(n/N)` position
+    marker; the `Confirm` row stays pinned.
+  - **e** on an item row opens a note editor (Enter saves, Esc cancels);
+    the note is shown on the row (`✎ …`) and appended to that item in the
+    execution prompt, so you can steer an item without retyping it.
+  - `/do-always replan` re-opens the questionnaire for the last offered
+    proposal (e.g. after an accidental Esc); the Esc notification hints at
+    it. The proposal is cleared on confirm and on session start.
+  - When the questionnaire was expected but no proposal was offered, the
+    fallback notification now says why: no `plan` block in the reply, or
+    the block is not valid JSON (with the parse error). The parser itself
+    is unchanged — the diagnostics mirror its block precedence.
+
 ## [0.15.0] - 2026-10-02
 
 ### Fixed

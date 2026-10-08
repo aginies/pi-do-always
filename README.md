@@ -20,6 +20,7 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
 |`/do-always review changes`|Fill the prompt for the task named `review changes` (task names autocomplete after `/do-always`)|
 |`/do-always list`|Print the task list|
 |`/do-always list-details`|Show the full rendered prompt text each task will inject|
+|`/do-always replan`|Re-open the plan questionnaire for the last offered proposal (e.g. after an accidental Esc)|
 
 The selector supports direct number-pick (1-9), live type-to-filter, arrow/Enter navigation,
 mouse-wheel scrolling, and click-to-select. While a filter is active, typed digits refine the
@@ -136,6 +137,68 @@ substituted in; any other prompt gets the block appended under
 the latest commit is selected and the first eligible `Plan` task (not
 `notForCommits`) whose guards pass runs on it.
 
+## Plan questionnaire
+
+Auto-run `Plan` tasks (⚡) are asked to end their reply with a
+machine-readable `plan` block: a one-line summary plus the proposed action
+items grouped into priority tiers (`P0`, `P1`, …). When the run settles, the
+reply is parsed and — if a plan block is present — a **questionnaire** opens
+in the TUI. The block is the data channel, but by default it is hidden: as
+soon as the reply is finalized, the extension strips the block from the
+transcript in the TUI (the prose around it is the human-facing summary), so
+the conversation stays clean — the questionnaire still works, because the
+raw text is captured before the strip. In non-TUI modes the block stays in
+the transcript, so the model can resolve the item-number replies the
+notification offers. Set `hidePlan` to `false` (per task or
+globally) to keep the block visible. With the questionnaire disabled the
+block is not requested at all:
+
+```
+  Plan proposal — Review changes
+  2 critical bugs, 3 cleanups
+
+  [·] P0 — Critical (0/2)
+  ·  Fix null deref in parse()
+  ·  Validate input length
+  [◐] P1 — Important (1/3)
+  ✓  Remove unused imports
+  ·  Drop dead config flag
+  ·  Tighten error message
+
+  ─────────────────────────────
+  Confirm (1/5)
+  space/⏎ toggle  •  a all  •  ctrl+u clear  •  e note  •  ⏎ confirm  •  esc withdraw
+```
+
+- **↑/↓** (wrapping), **Home/End** move the cursor; **Space** or **Enter**
+  toggles the row under the cursor — a tier row toggles the whole tier
+  (`·` none → `◐` partial → `✓` all), an item row toggles just that item.
+- **a** (or **Ctrl+A**) selects everything; **Ctrl+U** clears the selection.
+- **e** on an item row opens a note editor for that item (Enter saves, Esc
+  cancels). The note is shown on the row (`✎ …`) and appended to that item
+  in the execution prompt — a way to steer an item without retyping it.
+- Long plans scroll: the list shows 12 rows at a time and the window follows
+  the cursor (**↑/↓**, **Home/End**, or the mouse wheel); a `(n/N)` marker
+  shows the position. The `Confirm` row stays pinned.
+- **Enter** (or a mouse click) on the pinned `Confirm (n/N)` row sends the
+  selection as a single follow-up turn: the agent executes exactly the
+  selected items, in tier order, and nothing else. **Esc** withdraws —
+  nothing is sent and the proposal is kept in memory; re-open it with
+  `/do-always replan` (an accidental Esc is cheap to undo).
+- Mouse: clicking a tier/item row toggles it; clicking the Confirm row
+  confirms.
+
+Nothing is preselected. A Plan run that finds nothing to do replies with an
+empty tier list, and you just get the usual one-line summary. If the reply
+has no parseable `plan` block, the questionnaire is disabled, or the mode is
+not the TUI, the extension falls back to the plain summary notification —
+and when a questionnaire was expected, the notification says why (no plan
+block in the reply, or the block is not valid JSON), so a fallback is never
+a silent mystery. In non-TUI modes a parseable proposal is listed as a
+notification instead, so you can reply with the item numbers to execute. The
+questionnaire is offered only on the single auto-run path (selector pick,
+`/do-always <n>`, commit picker) — chain steps never get it.
+
 ## Install
 
 Install it from npm as a Pi package, which loads the bundled `index.ts` (and its `tasks.ts`) without
@@ -190,6 +253,8 @@ Fields:
 - `browser` (optional) — a browser to open on selection instead of injecting the prompt. Only `"commits"` is supported: it opens the date-grouped commit browser, and after the selection the task runs on the selected commits — directly when its prompt references `{{selected_commits}}`, otherwise via a picker of `Plan` tasks (see [Commit browser](#commit-browser)). An invalid value is ignored with a warning.
 - `hidden` (optional) — when `true`, the task is not shown in the selector or in `/do-always list` / `list-details`. Unlike a `when` condition, a hidden task can still be run by name (`/do-always <name>`), and it is offered as a candidate by the commit picker. The built-in `Review commits` uses this: it is a pick-after-browse option, not a standalone entry.
 - `notForCommits` (optional) — when `true`, the task is excluded from the commit picker (the “run on the selected commits” list) because it does not operate on a set of commits. The task is otherwise unaffected (selector, lists, CLI). The built-in `Review changes`, `Review code`, and `Propose features` use this.
+- `questionnaire` (optional) — whether the plan questionnaire is offered after this task's completed run (see [Plan questionnaire](#plan-questionnaire)). Default `true`; set `false` to keep the plain summary notification.
+- `hidePlan` (optional) — whether the raw `plan` block is hidden from the transcript after this task's completed run: the fenced block is stripped from the finalized reply (TUI only — in non-TUI modes the block is always kept so the model can resolve item-number replies). Default `true`; set `false` to keep the block visible in the conversation.
 - `when` (optional) — a condition that hides the task from the selector and lists when it is not met (see [Conditionals](#conditionals)).
 - `guards` (optional) — an array of selection-time guards that block the task (with a message, not a hide) when a condition is unmet (see [Guards](#guards)). The legacy `requireDirty` (boolean) still works and is combined with any `guards`.
 
@@ -198,6 +263,8 @@ In the object form you can also configure the selector shortcut:
 - `shortcut` (optional) — key that opens the selector, e.g. `"f4"`. Set to `null` to disable the shortcut. Defaults to `F4`. The project file's value wins over the global one.
 - `merge` (optional) — how project tasks combine with the global tasks: `"override"` (default) replaces a global task with the same `name`; `"append"` keeps the global tasks and only adds new project task names (a cascade, like CSS). The project file's value wins over the global one; when neither sets it, the default is `override` (the historical behavior).
 - `report` (optional) — whether chain runs write a Markdown report file in the project root (one per run, appended as each step finishes). Default `true`; set `false` to disable. The project file's value wins over the global one. See [Chains](#chains).
+- `questionnaire` (optional) — whether completed auto-run tasks whose reply carries a plan block offer the selection questionnaire. Default `true`; set `false` to keep the plain summary notification. The project file's value wins over the global one. See [Plan questionnaire](#plan-questionnaire).
+- `hidePlan` (optional) — whether the raw `plan` block is stripped from the transcript after a completed auto-run task (TUI only — in non-TUI modes the block is always kept). Default `true`; set `false` to keep the block visible in the conversation. The project file's value wins over the global one.
 
 Example project file that only *adds* tasks without overriding the global set:
 

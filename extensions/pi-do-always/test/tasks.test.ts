@@ -24,11 +24,15 @@ import {
 	formatChainSequence,
 	formatCommitReviewPrompt,
 	formatList,
+	formatPlanExecutionPrompt,
+	planBlockDiagnostics,
 	formatSelectedCommits,
 	groupCommitsByDate,
 	parseGitLogOutput,
+	parsePlanProposal,
 	parseGuard,
 	groupTasksByCategory,
+	isPlanTask,
 	isTaskVisible,
 	isValidKeyId,
 	isValidWhen,
@@ -39,6 +43,13 @@ import {
 	parseStatusPorcelain,
 	parseStatusStagedUnstaged,
 	orderTasksByCategory,
+	planItemKey,
+	planSelectAll,
+	planSelectionClear,
+	planSelectedItems,
+	planTierState,
+	planToggleItem,
+	planToggleTier,
 	renderPrompt,
 	reportAbandonedFooter,
 	reportFileName,
@@ -52,6 +63,7 @@ import {
 	resolveTask,
 	shouldAutoRun,
 	stepSummary,
+	stripPlanBlocks,
 	chainSummary,
 	formatDuration,
 	MAX_FILE_LINES,
@@ -62,6 +74,7 @@ import {
 	type DateGroup,
 	type DoAlwaysTask,
 	type Guard,
+	type PlanProposal,
 	type PromptContext,
 	type SelectedCommit,
 	type TaskContext,
@@ -212,6 +225,35 @@ test("parseConfig reads a boolean notForCommits flag and omits it when absent", 
 	assert.equal(on.tasks[0].notForCommits, true);
 	const absent = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
 	assert.ok(!("notForCommits" in absent.tasks[0]), "notForCommits key omitted when not set");
+});
+
+test("parseConfig reads a boolean hidePlan flag and omits it when absent", () => {
+	const on = parseConfig(JSON.stringify([{ name: "x", prompt: "p", hidePlan: true }]), "test.json");
+	assert.equal(on.tasks[0].hidePlan, true);
+	const off = parseConfig(JSON.stringify([{ name: "x", prompt: "p", hidePlan: false }]), "test.json");
+	assert.equal(off.tasks[0].hidePlan, false);
+	const absent = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json");
+	assert.ok(!("hidePlan" in absent.tasks[0]), "hidePlan key omitted when not set");
+});
+
+test("parseConfig ignores a non-boolean hidePlan", () => {
+	const out = parseConfig(JSON.stringify([{ name: "x", prompt: "p", hidePlan: "no" }]), "test.json");
+	assert.equal(out.tasks[0].hidePlan, undefined);
+});
+
+test("parseConfig reads a global hidePlan from the object form", () => {
+	assert.equal(parseConfig(JSON.stringify({ tasks: [], hidePlan: false }), "test.json").hidePlan, false);
+	assert.equal(parseConfig(JSON.stringify({ tasks: [], hidePlan: true }), "test.json").hidePlan, true);
+	assert.equal(parseConfig(JSON.stringify({ tasks: [] }), "test.json").hidePlan, undefined);
+	assert.equal(parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json").hidePlan, undefined);
+});
+
+test("parseConfig ignores a non-boolean global hidePlan and reports it", () => {
+	const errors: string[] = [];
+	const out = parseConfig(JSON.stringify({ tasks: [], hidePlan: 1 }), "test.json", (m) => errors.push(m));
+	assert.equal(out.hidePlan, undefined);
+	assert.equal(errors.length, 1);
+	assert.match(errors[0], /invalid "hidePlan"/);
 });
 
 test("parseConfig reads a string shortcut from the object form", () => {
@@ -1748,4 +1790,411 @@ const sampleSelected: SelectedCommit = {
 test("SelectedCommit has correct shape", () => {
 	assert.equal(sampleSelected.selectionOrder, 1);
 	assert.equal(sampleSelected.hash.length, 40);
+});
+
+// ── Plan proposal ──────────────────────────────────────────────────────────
+
+/** A reply with a well-formed plan block (the happy path fixture). */
+const planReply =
+	"Here is my review of the changes.\n\n" +
+	"```plan\n" +
+	'{"summary":"2 critical bugs, 3 cleanups","tiers":[' +
+	'{"id":"P0","label":"Critical","items":[' +
+	'{"title":"Fix null deref in parse()","detail":"src/foo.ts:42 — throws on empty input"},' +
+	'{"title":"Validate input length"}' +
+	"]}," +
+	'{"id":"P1","label":"Important","items":[' +
+	'{"title":"Remove unused imports","detail":"src/bar.ts:7"}' +
+	"]}" +
+	"]}\n" +
+	"```\n";
+
+test("parsePlanProposal parses a well-formed plan block", () => {
+	const p = parsePlanProposal(planReply);
+	assert.ok(p);
+	assert.equal(p.summary, "2 critical bugs, 3 cleanups");
+	assert.equal(p.tiers.length, 2);
+	assert.equal(p.tiers[0].id, "P0");
+	assert.equal(p.tiers[0].label, "Critical");
+	assert.equal(p.tiers[0].items.length, 2);
+	assert.equal(p.tiers[0].items[0].title, "Fix null deref in parse()");
+	assert.equal(p.tiers[0].items[0].detail, "src/foo.ts:42 — throws on empty input");
+	assert.equal(p.tiers[0].items[1].detail, undefined);
+	assert.equal(p.tiers[1].id, "P1");
+	assert.equal(p.tiers[1].label, "Important");
+});
+
+test("parsePlanProposal returns null when there is no plan block", () => {
+	assert.equal(parsePlanProposal("Just a summary, no block."), null);
+	assert.equal(parsePlanProposal("```json\n{}\n```"), null);
+	assert.equal(parsePlanProposal(""), null);
+});
+
+test("parsePlanProposal returns null for malformed JSON", () => {
+	assert.equal(parsePlanProposal("```plan\n{not json}\n```"), null);
+	assert.equal(parsePlanProposal("```plan\n[1,2,3]\n```"), null);
+});
+
+test("parsePlanProposal takes the last valid block when several exist", () => {
+	const text =
+		"```plan\n{\"tiers\":[{\"items\":[{\"title\":\"first\"}]}]}\n```\n" +
+		"correction:\n" +
+		"```plan\n{\"tiers\":[{\"id\":\"P9\",\"items\":[{\"title\":\"second\"}]}]}\n```\n";
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers.length, 1);
+	assert.equal(p.tiers[0].items[0].title, "second");
+});
+
+test("parsePlanProposal falls back to an earlier valid block when the last is malformed", () => {
+	const text =
+		"```plan\n{\"tiers\":[{\"items\":[{\"title\":\"good\"}]}]}\n```\n" +
+		"```plan\n{broken\n```\n";
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers[0].items[0].title, "good");
+});
+
+test("parsePlanProposal accepts the flat items shape with a tier field", () => {
+	const text =
+		'```plan\n{"items":[{"tier":"P1","title":"b"},{"tier":"P0","title":"a"},{"title":"c"}]}\n```\n';
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers.length, 2);
+	// First-seen order of the tier field; items without a tier join "P0".
+	assert.equal(p.tiers[0].id, "P1");
+	assert.equal(p.tiers[0].items[0].title, "b");
+	assert.equal(p.tiers[1].id, "P0");
+	assert.equal(p.tiers[1].items.length, 2);
+	assert.equal(p.tiers[1].items[0].title, "a");
+	assert.equal(p.tiers[1].items[1].title, "c");
+});
+
+test("parsePlanProposal defaults missing ids and labels by position", () => {
+	const text = "```plan\n{\"tiers\":[{\"items\":[{\"title\":\"x\"}]},{\"items\":[{\"title\":\"y\"}]}]}\n```\n";
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers[0].id, "P0");
+	assert.equal(p.tiers[0].label, "P0");
+	assert.equal(p.tiers[1].id, "P1");
+	assert.equal(p.tiers[1].label, "P1");
+});
+
+test("parsePlanProposal drops invalid entries and returns null when nothing survives", () => {
+	assert.equal(parsePlanProposal("```plan\n{\"tiers\":[{\"items\":[42, \"\", {\"title\":\"\"}]}]}\n```\n"), null);
+	assert.equal(parsePlanProposal("```plan\n{\"tiers\":[]}\n```\n"), null);
+	assert.equal(parsePlanProposal("```plan\n{}\n```\n"), null);
+	const p = parsePlanProposal(
+		"```plan\n{\"tiers\":[{\"items\":[{\"title\":\"keep\"}, null, {\"detail\":\"no title\"}]},{\"items\":[]}]}\n```\n",
+	);
+	assert.ok(p);
+	assert.equal(p.tiers.length, 1);
+	assert.equal(p.tiers[0].items.length, 1);
+});
+
+test("parsePlanProposal trims the summary and drops it when blank", () => {
+	const p = parsePlanProposal(
+		"```plan\n{\"summary\":\"  padded  \",\"tiers\":[{\"items\":[{\"title\":\"x\"}]}]}\n```\n",
+	);
+	assert.ok(p);
+	assert.equal(p.summary, "padded");
+	const p2 = parsePlanProposal("```plan\n{\"summary\":\"   \",\"tiers\":[{\"items\":[{\"title\":\"x\"}]}]}\n```\n");
+	assert.ok(p2);
+	assert.equal(p2.summary, undefined);
+});
+
+test("parsePlanProposal accepts string items and a plan fence with trailing spaces", () => {
+	const p = parsePlanProposal("```plan   \n{\"tiers\":[{\"items\":[\"just a title\"]}]}\n```\n");
+	assert.ok(p);
+	assert.equal(p.tiers[0].items[0].title, "just a title");
+});
+
+// ── Plan block stripping ───────────────────────────────────────────────────
+
+test("stripPlanBlocks removes a trailing plan block", () => {
+	const { text, removed } = stripPlanBlocks(planReply);
+	assert.equal(removed, true);
+	assert.equal(text, "Here is my review of the changes.");
+});
+
+test("stripPlanBlocks leaves text without a plan fence unchanged", () => {
+	assert.deepEqual(stripPlanBlocks("Just prose."), { text: "Just prose.", removed: false });
+	assert.deepEqual(stripPlanBlocks("```json\n{}\n```"), { text: "```json\n{}\n```", removed: false });
+	assert.deepEqual(stripPlanBlocks(""), { text: "", removed: false });
+});
+
+test("stripPlanBlocks removes every plan block and keeps the prose", () => {
+	const input =
+		"first\n\n" +
+		"```plan\n{\"tiers\":[{\"items\":[{\"title\":\"old\"}]}]}\n```\n" +
+		"middle\n" +
+		"```plan\n{\"tiers\":[{\"items\":[{\"title\":\"new\"}]}]}\n```\n" +
+		"last";
+	const { text, removed } = stripPlanBlocks(input);
+	assert.equal(removed, true);
+	assert.equal(text, "first\n\nmiddle\n\nlast");
+});
+
+test("stripPlanBlocks handles a block at the start of the text", () => {
+	const { text, removed } = stripPlanBlocks(
+		"```plan\n{\"tiers\":[{\"items\":[{\"title\":\"x\"}]}]}\n```\n\nafter",
+	);
+	assert.equal(removed, true);
+	assert.equal(text, "after");
+});
+
+test("stripPlanBlocks yields empty text when the block is the whole reply", () => {
+	const { text, removed } = stripPlanBlocks("```plan\n{}\n```\n");
+	assert.equal(removed, true);
+	assert.equal(text, "");
+});
+
+test("stripPlanBlocks leaves an unclosed plan fence alone", () => {
+	const input = "```plan\n{\"tiers\":[{\"items\":[{\"title\":\"x\"}]}]}\n";
+	assert.deepEqual(stripPlanBlocks(input), { text: input, removed: false });
+});
+
+test("stripPlanBlocks strips the block but the parser still reads the raw capture", () => {
+	// The message_end flow: the questionnaire parses the raw capture, the
+	// transcript shows the stripped text (which carries no plan block).
+	const proposal = parsePlanProposal(planReply);
+	assert.ok(proposal);
+	assert.equal(proposal.summary, "2 critical bugs, 3 cleanups");
+	const { text } = stripPlanBlocks(planReply);
+	assert.equal(parsePlanProposal(text), null);
+});
+
+// ── Plan questionnaire selection ───────────────────────────────────────────
+
+const selProposal: PlanProposal = {
+	summary: "s",
+	tiers: [
+		{ id: "P0", label: "Critical", items: [{ title: "a" }, { title: "b" }] },
+		{ id: "P1", label: "Important", items: [{ title: "c" }, { title: "d" }, { title: "e" }] },
+	],
+};
+
+test("planSelectionClear returns an empty set", () => {
+	assert.equal(planSelectionClear().size, 0);
+});
+
+test("planItemKey encodes tier and item positions", () => {
+	assert.equal(planItemKey(0, 0), "0:0");
+	assert.equal(planItemKey(1, 2), "1:2");
+});
+
+test("planToggleItem adds then removes", () => {
+	let sel = planSelectionClear();
+	sel = planToggleItem(sel, "0:0");
+	assert.equal(sel.size, 1);
+	sel = planToggleItem(sel, "0:0");
+	assert.equal(sel.size, 0);
+	// The input set is never mutated.
+	const base = planSelectionClear();
+	planToggleItem(base, "0:0");
+	assert.equal(base.size, 0);
+});
+
+test("planToggleTier selects all when not fully selected", () => {
+	let sel = planSelectionClear();
+	// Partial: one item of tier 1 already selected.
+	sel = planToggleItem(sel, planItemKey(1, 0));
+	const { selection, selected } = planToggleTier(selProposal, 1, sel);
+	assert.equal(selected, true);
+	assert.equal(selection.size, 3); // all of tier 1
+	assert.equal(planTierState(selProposal, 1, selection), "all");
+});
+
+test("planToggleTier clears a fully selected tier", () => {
+	const sel = planSelectAll(selProposal, planSelectionClear());
+	const { selection, selected } = planToggleTier(selProposal, 0, sel);
+	assert.equal(selected, false);
+	assert.equal(selection.size, 3); // only tier 1 remains
+	assert.equal(planTierState(selProposal, 0, selection), "none");
+});
+
+test("planToggleTier leaves other tiers untouched and ignores unknown tiers", () => {
+	const sel = planToggleItem(planSelectionClear(), planItemKey(0, 0));
+	const { selection } = planToggleTier(selProposal, 1, sel);
+	assert.equal(selection.has(planItemKey(0, 0)), true);
+	const unknown = planToggleTier(selProposal, 9, selection);
+	assert.equal(unknown.selection, selection);
+	assert.equal(unknown.selected, false);
+});
+
+test("planSelectAll selects every item", () => {
+	const sel = planSelectAll(selProposal, planSelectionClear());
+	assert.equal(sel.size, 5);
+	assert.equal(planTierState(selProposal, 0, sel), "all");
+	assert.equal(planTierState(selProposal, 1, sel), "all");
+});
+
+test("planTierState reports none, partial, and all", () => {
+	const empty = planSelectionClear();
+	assert.equal(planTierState(selProposal, 0, empty), "none");
+	const partial = planToggleItem(empty, planItemKey(0, 0));
+	assert.equal(planTierState(selProposal, 0, partial), "partial");
+	const full = planSelectAll(selProposal, empty);
+	assert.equal(planTierState(selProposal, 0, full), "all");
+	assert.equal(planTierState(selProposal, 5, full), "none"); // unknown tier
+});
+
+test("planSelectedItems returns selected items in tier then item order", () => {
+	const sel = planSelectionClear();
+	// Select out of order: tier 1 item 0, then tier 0 item 1.
+	let s = planToggleItem(sel, planItemKey(1, 0));
+	s = planToggleItem(s, planItemKey(0, 1));
+	const items = planSelectedItems(selProposal, s);
+	assert.equal(items.length, 2);
+	assert.equal(items[0].item.title, "b"); // tier 0 first
+	assert.equal(items[0].tier.id, "P0");
+	assert.equal(items[1].item.title, "c");
+	assert.equal(items[1].tier.id, "P1");
+	assert.equal(planSelectedItems(selProposal, sel).length, 0);
+});
+
+// ── Plan execution prompt ──────────────────────────────────────────────────
+
+test("formatPlanExecutionPrompt lists the selected items in order with tier tags", () => {
+	const sel = planSelectAll(selProposal, planSelectionClear());
+	const prompt = formatPlanExecutionPrompt(planSelectedItems(selProposal, sel), "Review changes");
+	// No "above": the plan block is stripped from the transcript, so the
+	// prompt must not point the model at a proposal that isn't there.
+	assert.ok(prompt.includes('"Review changes" plan proposal, in exactly this order'));
+	assert.ok(!prompt.includes("above"));
+	assert.ok(prompt.includes("1. [P0] a"));
+	assert.ok(prompt.includes("2. [P0] b"));
+	assert.ok(prompt.includes("3. [P1] c"));
+	assert.ok(prompt.includes("4. [P1] d"));
+	assert.ok(prompt.includes("5. [P1] e"));
+});
+
+test("formatPlanExecutionPrompt appends the detail when present", () => {
+	const entry = [{ tier: selProposal.tiers[0], item: { title: "Fix bug", detail: "src/foo.ts:42" } }];
+	const prompt = formatPlanExecutionPrompt(entry, "Security");
+	assert.ok(prompt.includes("1. [P0] Fix bug — src/foo.ts:42"));
+});
+
+test("formatPlanExecutionPrompt excludes unselected items", () => {
+	const sel = planToggleItem(planSelectionClear(), planItemKey(1, 2));
+	const prompt = formatPlanExecutionPrompt(planSelectedItems(selProposal, sel), "Cleanup");
+	assert.ok(prompt.includes("1. [P1] e"));
+	assert.ok(!prompt.includes("[P0] a"));
+	assert.ok(!prompt.includes("[P1] d"));
+});
+
+// ── Plan block diagnostics ─────────────────────────────────────────────────
+
+test("planBlockDiagnostics reports none when there is no plan fence", () => {
+	assert.deepEqual(planBlockDiagnostics("no block here"), { kind: "none" });
+	assert.deepEqual(planBlockDiagnostics(""), { kind: "none" });
+});
+
+test("planBlockDiagnostics reports malformed JSON with the parse error", () => {
+	const diag = planBlockDiagnostics("text\n```plan\n{not json}\n```\n");
+	assert.equal(diag.kind, "malformed");
+	if (diag.kind === "malformed") assert.ok(diag.detail.length > 0);
+});
+
+test("planBlockDiagnostics strips position info from JSON.parse errors", () => {
+	// JSON.parse in Node.js reports "at position N (line L column C)" —
+	// this is meaningless in a large plan block, so it is stripped.
+	const diag = planBlockDiagnostics(
+		'```plan\n{"tiers":[{"items":[{"title":"a"},{"title":"b"} "missing comma"]}]}\n```',
+	);
+	assert.equal(diag.kind, "malformed");
+	if (diag.kind === "malformed") {
+		assert.ok(!diag.detail.includes("at position"));
+		assert.ok(!diag.detail.includes("column"));
+		assert.ok(diag.detail.length > 0);
+	}
+});
+
+test("planBlockDiagnostics reports empty when the JSON parses but has no items", () => {
+	assert.deepEqual(planBlockDiagnostics("```plan\n{}\n```"), { kind: "empty" });
+	assert.deepEqual(planBlockDiagnostics('```plan\n{"tiers":[]}\n```'), { kind: "empty" });
+	assert.deepEqual(planBlockDiagnostics('```plan\n{"tiers":[{"id":"P0","items":[]}]}\n```'), { kind: "empty" });
+	assert.deepEqual(planBlockDiagnostics('```plan\n[1,2]\n```'), { kind: "empty" });
+});
+
+test("planBlockDiagnostics reports ok with the item count", () => {
+	const diag = planBlockDiagnostics(
+		'```plan\n{"tiers":[{"id":"P0","items":[{"title":"a"},{"title":"b"}]},{"id":"P1","items":[{"title":"c"}]}]}\n```',
+	);
+	assert.deepEqual(diag, { kind: "ok", itemCount: 3 });
+});
+
+test("planBlockDiagnostics tries blocks from last to first, like the parser", () => {
+	// Last block malformed, earlier one valid → ok: the parser takes the
+	// earlier block, so the diagnostics must agree.
+	const mixed =
+		'```plan\n{"tiers":[{"items":[{"title":"old"}]}]}\n```\n' +
+		"```plan\n{broken}\n```";
+	assert.deepEqual(planBlockDiagnostics(mixed), { kind: "ok", itemCount: 1 });
+	// Last block valid, earlier one malformed → ok (the last block wins).
+	const fixed =
+		"```plan\n{broken}\n```\n" +
+		'```plan\n{"tiers":[{"items":[{"title":"new"}]}]}\n```';
+	assert.deepEqual(planBlockDiagnostics(fixed), { kind: "ok", itemCount: 1 });
+	// Only malformed blocks → malformed, reporting the LAST block's error.
+	const allBad = "```plan\n{broken1}\n```\n```plan\n{broken2}\n```";
+	const diag = planBlockDiagnostics(allBad);
+	assert.equal(diag.kind, "malformed");
+	if (diag.kind === "malformed") {
+		assert.ok(diag.detail.length > 0);
+		assert.ok(!diag.detail.includes("broken1")); // the first block's error is not the one reported
+	}
+});
+
+test("planBlockDiagnostics agrees with parsePlanProposal", () => {
+	const samples: Array<[string, boolean]> = [
+		["no block", false],
+		["```plan\n{bad}\n```", false],
+		["```plan\n{}\n```", false],
+		['```plan\n{"tiers":[{"id":"P0","items":[{"title":"a"}]}]}\n```', true],
+	];
+	for (const [text, expectOk] of samples) {
+		const diag = planBlockDiagnostics(text);
+		assert.equal(diag.kind === "ok", expectOk, text);
+	}
+});
+
+// ── Plan item notes ────────────────────────────────────────────────────────
+
+test("planSelectedItems carries notes for selected items only", () => {
+	const sel = planSelectAll(selProposal, planSelectionClear());
+	const notes = new Map<string, string>([
+		[planItemKey(0, 0), "keep the API"],
+		[planItemKey(1, 0), "  "], // whitespace-only: dropped
+		[planItemKey(1, 3), "note for unselected item"], // not selected: ignored
+	]);
+	const items = planSelectedItems(selProposal, sel, notes);
+	const withNotes = items.filter((e) => e.note !== undefined);
+	assert.equal(withNotes.length, 1);
+	assert.equal(withNotes[0].item.title, "a");
+	assert.equal(withNotes[0].note, "keep the API");
+	// Without the notes argument the output is unchanged.
+	const plain = planSelectedItems(selProposal, sel);
+	assert.ok(plain.every((e) => e.note === undefined));
+});
+
+test("formatPlanExecutionPrompt appends the note in brackets", () => {
+	const entry = [
+		{ tier: selProposal.tiers[0], item: { title: "Fix bug", detail: "src/foo.ts:42" }, note: "keep the API" },
+		{ tier: selProposal.tiers[1], item: { title: "No note" } },
+	];
+	const prompt = formatPlanExecutionPrompt(entry, "Security");
+	assert.ok(prompt.includes("1. [P0] Fix bug — src/foo.ts:42 [note: keep the API]"));
+	assert.ok(prompt.includes("2. [P1] No note"));
+	assert.ok(!prompt.includes("2. [P1] No note ["));
+});
+
+// ── isPlanTask ─────────────────────────────────────────────────────────────
+
+test("isPlanTask matches the Plan category case-insensitively", () => {
+	assert.equal(isPlanTask({ name: "x", prompt: "p", category: "Plan" }), true);
+	assert.equal(isPlanTask({ name: "x", prompt: "p", category: "plan" }), true);
+	assert.equal(isPlanTask({ name: "x", prompt: "p", category: " plan " }), true);
+	assert.equal(isPlanTask({ name: "x", prompt: "p", category: "Do" }), false);
+	assert.equal(isPlanTask({ name: "x", prompt: "p" }), false);
 });

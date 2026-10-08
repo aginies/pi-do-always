@@ -36,7 +36,7 @@
 import { execFile } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import type { AgentEndEvent, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI, ExtensionContext, MessageEndEvent, Theme } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	type KeyId,
@@ -55,6 +55,7 @@ import {
 	COMMIT_SELECT_MAX,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
+	PLAN_OUTPUT_INSTRUCTION,
 	assistantText,
 	buildTableRows,
 	chainAdd,
@@ -67,9 +68,11 @@ import {
 	evaluateWhen,
 	formatChainSequence,
 	formatList,
+	formatPlanExecutionPrompt,
 	formatSelectedCommits,
 	groupCommitsByDate,
 	groupTasksByCategory,
+	isPlanTask,
 	isTaskVisible,
 	isValidKeyId,
 	mergeTasks,
@@ -77,9 +80,18 @@ import {
 	parseConfigRegexpValueForKey,
 	parseCommitSubject,
 	parseGitLogOutput,
+	parsePlanProposal,
 	parseStatusPorcelain,
 	parseStatusStagedUnstaged,
 	orderTasksByCategory,
+	planBlockDiagnostics,
+	planItemKey,
+	planSelectAll,
+	planSelectionClear,
+	planSelectedItems,
+	planTierState,
+	planToggleItem,
+	planToggleTier,
 	reportAbandonedFooter,
 	reportFooter,
 	reportHeader,
@@ -91,12 +103,16 @@ import {
 	resolveTask,
 	shouldAutoRun,
 	stepSummary,
+	stripPlanBlocks,
 	toPromptContext,
 	validateChain,
 	type ChainStepOutcome,
 	type CommitInfo,
 	type DateGroup,
 	type DoAlwaysTask,
+	type PlanProposal,
+	type PlanSelection,
+	type PlanSelectionEntry,
 	type SelectedCommit,
 	type TaskContext,
 	type TableRow,
@@ -149,6 +165,10 @@ function loadConfig(
 	shortcut: string | null;
 	/** Whether chain runs write a Markdown report file (default true). */
 	report: boolean;
+	/** Whether plan questionnaires are offered (default true). */
+	questionnaire: boolean;
+	/** Whether the raw plan block is hidden from the transcript (default true). */
+	hidePlan: boolean;
 } {
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
@@ -158,10 +178,10 @@ function loadConfig(
 
 	const global = globalRaw !== null
 		? parseConfig(globalRaw, globalPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined };
 	const project = projectRaw !== null
 		? parseConfig(projectRaw, projectPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined };
 
 	// The project file's merge mode wins; otherwise the global value; otherwise
 	// override (the historical behavior), so existing configs are unaffected.
@@ -175,6 +195,10 @@ function loadConfig(
 		// The project file's value wins; otherwise the global value; otherwise
 		// reports are on.
 		report: project.report ?? global.report ?? true,
+		// Same precedence: project, then global, then on.
+		questionnaire: project.questionnaire ?? global.questionnaire ?? true,
+		// Same precedence: project, then global, then on (the block is hidden).
+		hidePlan: project.hidePlan ?? global.hidePlan ?? true,
 	};
 }
 
@@ -950,10 +974,30 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// flag would post a spurious summary for the next unrelated turn.
 	let pendingSummaryTask: string | null = null;
 	let pendingSummaryTimer: NodeJS.Timeout | null = null;
+	// The completed auto-run task's reply, captured at agent_end and offered
+	// at agent_settled (the session is fully idle then, so the confirm
+	// follow-up cannot race queued continuations). Discarded on agent_start
+	// — a new run started, so the proposal is stale — and on session start.
+	let pendingProposal: { taskName: string; text: string } | null = null;
+	// The last offered plan proposal (parseable, questionnaire enabled), kept
+	// so `/do-always replan` can re-open the questionnaire after a
+	// withdrawal. Cleared on confirm (executed) and on session start.
+	let lastProposal: { taskName: string; text: string } | null = null;
+	// The raw (unstripped) reply text of the pending auto-run task, captured
+	// at message_end before its plan block is stripped from the transcript
+	// (by the time agent_end fires, the message there is already stripped).
+	// Cleared on agent_start (a new run makes it stale), agent_end (consumed
+	// or discarded), and session start.
+	let pendingPlanRaw: string | null = null;
 
 	/** Clear the auto-run summary flag and its grace timer (session start). */
 	function resetPendingSummary(): void {
 		pendingSummaryTask = null;
+		// A completed auto-run's captured reply is only offered at the
+		// settle that follows its own agent_end — a new run invalidates it.
+		pendingProposal = null;
+		lastProposal = null;
+		pendingPlanRaw = null;
 		if (pendingSummaryTimer) {
 			clearTimeout(pendingSummaryTimer);
 			pendingSummaryTimer = null;
@@ -962,6 +1006,410 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// Whether chain runs write a Markdown report file (config `report`,
 	// default true). Refreshed whenever the config is (re)loaded.
 	let reportEnabled = true;
+	// Whether completed auto-run tasks whose reply carries a "plan" block
+	// offer the selection questionnaire (config `questionnaire`, default
+	// true). Refreshed whenever the config is (re)loaded.
+	let questionnaireEnabled = true;
+	// Whether the raw "plan" block is stripped from the transcript after a
+	// completed auto-run task (config `hidePlan`, default true). Refreshed
+	// whenever the config is (re)loaded.
+	let hidePlanEnabled = true;
+
+	/** The result of the plan questionnaire: the confirmed selection, or a withdrawal. */
+	type PlanQuestionnaireResult =
+		| { kind: "confirm"; items: PlanSelectionEntry[] }
+		| { kind: "withdraw" };
+
+	/**
+	 * Render a task's prompt for injection or preview. Plan-category tasks get
+	 * PLAN_OUTPUT_INSTRUCTION appended (once) so the reply carries the
+	 * machine-readable "plan" block the questionnaire parses — but only when
+	 * the questionnaire is actually offered for this task, otherwise the agent
+	 * would emit a block nobody reads. A prompt that already mentions the plan
+	 * fence keeps its own contract; chain-step prompts are rendered with the
+	 * plain renderPrompt and never get it.
+	 */
+	function renderTaskPrompt(task: DoAlwaysTask, ctx: Record<string, string>): string {
+		const base = renderPrompt(task.prompt, ctx);
+		const enabled = task.questionnaire ?? questionnaireEnabled;
+		if (isPlanTask(task) && enabled && !base.includes("```plan")) {
+			return `${base}\n\n${PLAN_OUTPUT_INSTRUCTION}`;
+		}
+		return base;
+	}
+
+	/**
+	 * Offer a completed auto-run task's reply. When it carries a parseable
+	 * "plan" block and the questionnaire is enabled, the TUI shows the tier/
+	 * item questionnaire: confirming sends the selection as an execution
+	 * follow-up, Esc withdraws (nothing happens). Everything else — disabled,
+	 * non-TUI, or no plan block — falls back to the plain summary
+	 * notification.
+	 */
+	async function offerPlanProposal(
+		captured: { taskName: string; text: string },
+		ctx: ExtensionContext | null,
+	): Promise<void> {
+		const proposal = parsePlanProposal(captured.text);
+		if (!ctx) return;
+		const task = tasks.find((t) => t.name === captured.taskName);
+		const enabled = task?.questionnaire ?? questionnaireEnabled;
+		// The prompt asked for a plan block only for Plan tasks with the
+		// questionnaire enabled (renderTaskPrompt's gate) — only then is a
+		// missing or invalid block a contract violation worth explaining; for
+		// a non-Plan auto-run task its absence is the expected outcome.
+		const blockExpected = task !== undefined && isPlanTask(task) && enabled;
+		if (!proposal || !enabled) {
+			const base = `do-always: ${stepSummary("completed", captured.taskName, 0, 0)}`;
+			if (!blockExpected) {
+				// Questionnaire disabled, or a non-Plan auto-run task: the
+				// prompt never asked for a plan block, so its absence is not a
+				// contract violation — plain summary.
+				ctx.ui.notify(base, "info");
+				return;
+			}
+			// The prompt asked for a plan block but none was usable — say why,
+			// so the fallback to a plain summary is not a mystery.
+			const diag = planBlockDiagnostics(captured.text);
+			if (diag.kind === "none") {
+				ctx.ui.notify(`${base} — reply had no plan block, so no questionnaire was offered`, "warning");
+			} else if (diag.kind === "malformed") {
+				ctx.ui.notify(`${base} — plan block was not valid JSON (${diag.detail}); no questionnaire offered`, "warning");
+			} else {
+				// "empty": the agent proposed no action items — a legitimate
+				// outcome, not a contract violation.
+				ctx.ui.notify(`${base} — no action items proposed`, "info");
+			}
+			return;
+		}
+		// Remember the last offered proposal so /do-always replan can re-open
+		// it after a withdrawal.
+		lastProposal = captured;
+		if (ctx.mode !== "tui") {
+			// Non-TUI: list the proposed items so the user can reply with a
+			// selection; nothing is sent automatically.
+			const all = planSelectedItems(proposal, planSelectAll(proposal, planSelectionClear()));
+			const list = all.map(({ tier, item }, i) => `  ${i + 1}. [${tier.id}] ${item.title}`).join("\n");
+			ctx.ui.notify(
+				`do-always: "${captured.taskName}" proposed ${all.length} action item(s):\n${list}\nReply with the item numbers to execute (or do nothing to withdraw).`,
+				"info",
+			);
+			return;
+		}
+		const result = await showPlanQuestionnaire(ctx, proposal, captured.taskName);
+		if (result.kind === "confirm") {
+			lastProposal = null; // executed — nothing left to re-offer
+			const prompt = formatPlanExecutionPrompt(result.items, captured.taskName);
+			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+			ctx.ui.notify(
+				`do-always: executing ${result.items.length} selected item(s) from the "${captured.taskName}" plan`,
+				"info",
+			);
+		} else {
+			ctx.ui.notify(`do-always: plan withdrawn — no action taken (re-open with /do-always replan)`, "info");
+		}
+	}
+
+	/**
+	 * Plan questionnaire: shown after a completed auto-run task whose reply
+	 * carries a parseable "plan" block. The summary line up top, then the tiers
+	 * with their action items. Selecting a tier row toggles the whole tier (all
+	 * its items); selecting an item row toggles just that item. The pinned
+	 * Confirm row sends the selection as an execution follow-up; Esc withdraws
+	 * (nothing happens).
+	 */
+	function showPlanQuestionnaire(
+		ctx: ExtensionContext,
+		proposal: PlanProposal,
+		taskName: string,
+	): Promise<PlanQuestionnaireResult> {
+		return new Promise<PlanQuestionnaireResult>((resolve) => {
+			ctx.ui.custom<PlanQuestionnaireResult>((tui, theme, _kb, done) => {
+				const kb = getKeybindings();
+				let settled = false;
+				let selection: PlanSelection = planSelectionClear();
+
+				// Flat cursor rows: a tier header row, its item rows, and the
+				// pinned Confirm row last.
+				type Row =
+					| { kind: "tier"; index: number }
+					| { kind: "item"; tier: number; index: number }
+					| { kind: "confirm" };
+				const rows: Row[] = [];
+				proposal.tiers.forEach((tier, ti) => {
+					rows.push({ kind: "tier", index: ti });
+					tier.items.forEach((_, ii) => rows.push({ kind: "item", tier: ti, index: ii }));
+				});
+				rows.push({ kind: "confirm" });
+				// The scrollable part: everything but the pinned Confirm row.
+				// (Cast — slice() does not narrow the row union; the last row
+				// is always the confirm row pushed above.)
+				type ListRow = Exclude<Row, { kind: "confirm" }>;
+				const listRows = rows.slice(0, -1) as ListRow[];
+				let cursor = 0;
+				const MAX_VISIBLE = 12; // tier/item rows visible in the scroll window
+				// Per-item notes (item key → note), added with `e` on an item
+				// row and carried into the execution prompt on confirm.
+				const notes = new Map<string, string>();
+				let noteKey: string | null = null; // the item being annotated
+				let noteDraft = "";
+
+				function finish(result: PlanQuestionnaireResult) {
+					if (settled) return;
+					settled = true;
+					done(result);
+					resolve(result);
+				}
+
+				function tierCount(ti: number): string {
+					const tier = proposal.tiers[ti];
+					let n = 0;
+					tier.items.forEach((_, ii) => {
+						if (selection.has(planItemKey(ti, ii))) n++;
+					});
+					return `${n}/${tier.items.length}`;
+				}
+
+				// Line map for mouse hit-testing (rebuilt on every render).
+				let rowLine = new Map<number, Row>();
+
+				function render(width: number): string[] {
+					rowLine = new Map();
+					const lines: string[] = [];
+					lines.push(
+						theme.fg("accent", theme.bold(truncateToWidth(`  Plan proposal — ${taskName}`, width - 2, ""))),
+					);
+					if (proposal.summary) {
+						lines.push(theme.fg("muted", truncateToWidth(`  ${proposal.summary}`, width - 2, "…")));
+					}
+					lines.push("");
+					// Scroll window over the tier/item rows (the Confirm row is
+					// pinned below it). The window follows the cursor, clamped at
+					// both edges — the same pattern as the task selector.
+					const anchor = cursor < listRows.length ? cursor : listRows.length - 1;
+					const winStart =
+						listRows.length > MAX_VISIBLE
+							? Math.max(0, Math.min(anchor + 1 - MAX_VISIBLE, listRows.length - MAX_VISIBLE))
+							: 0;
+					const winEnd = Math.min(winStart + MAX_VISIBLE, listRows.length);
+					for (let i = winStart; i < winEnd; i++) {
+						const row = listRows[i];
+						if (row.kind === "tier") {
+							const ti = row.index;
+							const tier = proposal.tiers[ti];
+							const state = planTierState(proposal, ti, selection);
+							const glyph = state === "all" ? "✓" : state === "partial" ? "◐" : "·";
+							const color = state === "all" ? "success" : state === "partial" ? "warning" : "dim";
+							const headerText = `  [${glyph}] ${tier.id} — ${tier.label} (${tierCount(ti)})`;
+							if (cursor === i) {
+								lines.push(theme.bg("selectedBg", theme.bold(headerText)));
+							} else {
+								lines.push(`  ${theme.fg(color, `[${glyph}]`)} ${tier.id} — ${tier.label} (${tierCount(ti)})`);
+							}
+							rowLine.set(lines.length - 1, row);
+						} else {
+							const ti = row.tier;
+							const ii = row.index;
+							const key = planItemKey(ti, ii);
+							const item = proposal.tiers[ti].items[ii];
+							const mark = selection.has(key) ? theme.fg("success", "✓") : theme.fg("dim", "·");
+							const note = notes.get(key);
+							const title = truncateToWidth(
+								note ? `${item.title}  ✎ ${note}` : item.title,
+								Math.max(10, width - 8),
+								"…",
+							);
+							const rowText = `  ${mark}  ${title}`;
+							if (cursor === i) {
+								lines.push(theme.bg("selectedBg", theme.bold(rowText)));
+							} else {
+								lines.push(rowText);
+							}
+							rowLine.set(lines.length - 1, row);
+						}
+					}
+					// Scroll position marker (only when the list overflows the window).
+					if (listRows.length > MAX_VISIBLE) {
+						lines.push(theme.fg("dim", `  (${anchor + 1}/${listRows.length})`));
+					}
+				// Pinned Confirm row (always visible, outside the scroll window).
+				lines.push("");
+				lines.push(theme.fg("dim", `  ${"─".repeat(Math.max(1, width - 4))}`));
+				const totalItems = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
+				const confirmLabel = `Confirm (${selection.size}/${totalItems})`;
+				if (cursor === rows.length - 1) {
+					lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", "►")} ${confirmLabel}`)));
+				} else if (selection.size > 0) {
+					lines.push(theme.fg("accent", `  ${confirmLabel}`));
+				} else {
+					lines.push(theme.fg("dim", `  ${confirmLabel}`));
+				}
+				rowLine.set(lines.length - 1, { kind: "confirm" });
+				if (noteKey !== null) {
+					// Note editor: replaces the key hint while active.
+					lines.push(theme.fg("accent", truncateToWidth(`  note> ${noteDraft}`, width - 2, "")));
+					lines.push(theme.fg("dim", "  enter save note  •  esc cancel"));
+				} else {
+					lines.push(
+						theme.fg(
+							"dim",
+							truncateToWidth(
+								`  space/⏎ toggle  •  a all  •  ctrl+u clear  •  e note  •  ⏎ confirm  •  esc withdraw`,
+								width - 2,
+								"",
+							),
+						),
+					);
+				}
+				return lines;
+			}
+
+				function toggleAt(row: Row) {
+					if (row.kind === "tier") {
+						selection = planToggleTier(proposal, row.index, selection).selection;
+					} else if (row.kind === "item") {
+						selection = planToggleItem(selection, planItemKey(row.tier, row.index));
+					}
+				}
+
+				function confirmIfPossible(): boolean {
+					const items = planSelectedItems(proposal, selection, notes);
+					if (items.length === 0) {
+						ctx.ui.notify("do-always: nothing selected — pick a tier or item first (or esc to withdraw)", "info");
+						return false;
+					}
+					finish({ kind: "confirm", items });
+					return true;
+				}
+
+				function handleInput(data: string) {
+					if (settled) return;
+					// Note mode: capture the note for the item under the cursor.
+					// Enter saves (an empty note clears it), Esc cancels (the
+					// previous note, if any, is kept).
+					if (noteKey !== null) {
+						if (matchesKey(data, "enter") || kb.matches(data, "tui.select.confirm")) {
+							const trimmed = noteDraft.trim();
+							if (trimmed) notes.set(noteKey, trimmed);
+							else notes.delete(noteKey);
+							noteKey = null;
+							noteDraft = "";
+							tui.requestRender();
+							return;
+						}
+						if (kb.matches(data, "tui.select.cancel") || matchesKey(data, "escape")) {
+							noteKey = null;
+							noteDraft = "";
+							tui.requestRender();
+							return;
+						}
+						if (kb.matches(data, "tui.editor.deleteCharBackward")) {
+							noteDraft = noteDraft.slice(0, -1);
+							tui.requestRender();
+							return;
+						}
+						if (isPrintable(data)) {
+							if (noteDraft.length < 200) noteDraft += data;
+							tui.requestRender();
+							return;
+						}
+						return; // swallow other keys while editing
+					}
+					const row = rows[cursor];
+					// Withdraw (Esc / Ctrl+C).
+					if (kb.matches(data, "tui.select.cancel") || matchesKey(data, "escape")) {
+						finish({ kind: "withdraw" });
+						return;
+					}
+					// Space or Enter: toggle at the cursor (tier or item), or
+					// confirm on the Confirm row.
+					if (matchesKey(data, "space") || kb.matches(data, "tui.select.confirm") || matchesKey(data, "enter")) {
+						if (row.kind === "confirm") {
+							confirmIfPossible();
+						} else {
+							toggleAt(row);
+							tui.requestRender();
+						}
+						return;
+					}
+					// a / Ctrl+A: select all.
+					if (data === "a" || matchesKey(data, "ctrl+a")) {
+						selection = planSelectAll(proposal, selection);
+						tui.requestRender();
+						return;
+					}
+					// e: edit the note for the item under the cursor.
+					if (data === "e") {
+						if (row.kind === "item") {
+							const key = planItemKey(row.tier, row.index);
+							noteKey = key;
+							noteDraft = notes.get(key) ?? "";
+							tui.requestRender();
+						} else {
+							ctx.ui.notify("do-always: notes attach to item rows — put the cursor on an item, then press e", "info");
+						}
+						return;
+					}
+					// Ctrl+U: clear the selection.
+					if (matchesKey(data, "ctrl+u")) {
+						selection = planSelectionClear();
+						tui.requestRender();
+						return;
+					}
+					// Navigation (wraps at the edges).
+					if (kb.matches(data, "tui.select.up") || matchesKey(data, "up")) {
+						cursor = cursor === 0 ? rows.length - 1 : cursor - 1;
+						tui.requestRender();
+						return;
+					}
+					if (kb.matches(data, "tui.select.down") || matchesKey(data, "down")) {
+						cursor = cursor === rows.length - 1 ? 0 : cursor + 1;
+						tui.requestRender();
+						return;
+					}
+					if (matchesKey(data, "home")) {
+						cursor = 0;
+						tui.requestRender();
+						return;
+					}
+					if (matchesKey(data, "end")) {
+						cursor = rows.length - 1;
+						tui.requestRender();
+						return;
+					}
+				}
+
+				function handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+					// Wheel: move the cursor one row (the scroll window follows) —
+					// the same behavior as the task selector.
+					if (event.type === "wheel" && event.wheelDelta) {
+						if (noteKey !== null) return { handled: true };
+						const delta = event.wheelDelta < 0 ? -1 : 1;
+						const next = Math.max(0, Math.min(rows.length - 1, cursor + delta));
+						if (next === cursor) return { handled: true };
+						cursor = next;
+						return { handled: true, render: true };
+					}
+					if (event.button !== "left" || (event.type !== "press" && event.type !== "click")) return undefined;
+					if (noteKey !== null) return { handled: true }; // clicks are swallowed while editing
+					const row = rowLine.get(event.y);
+					if (!row) return undefined;
+					if (row.kind === "confirm") {
+						if (event.type === "press") confirmIfPossible();
+						return { handled: true };
+					}
+					if (event.type === "press") {
+						toggleAt(row);
+						return { handled: true, render: true };
+					}
+					return { handled: true };
+				}
+
+				return { render, handleInput, handleMouse, invalidate: () => {} };
+			});
+		});
+	}
+
 	// The in-flight chain's report file: its path (absolute + relative for
 	// display), the precomputed header (deferred — written together with the
 	// first step section, so a chain that dies before that leaves no
@@ -1232,6 +1680,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			clearTimeout(pendingSummaryTimer);
 			pendingSummaryTimer = null;
 		}
+		// A new run began before the captured plan proposal was offered (the
+		// user typed a prompt right after the Plan run ended) — it is stale.
+		pendingProposal = null;
+		pendingPlanRaw = null;
 		// The run actually began — time the step for the report.
 		if (chainReport) chainReport.stepStartedAt = new Date();
 		// Fill-first: step 1 left the editor and is running — update the
@@ -1261,6 +1713,69 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		return "completed";
 	}
 
+	/**
+	 * The message with every fenced plan block removed from its text parts,
+	 * or null when nothing changed. Strips per part: a fence spanning two
+	 * parts is left in place (the questionnaire parser works on the joined
+	 * text, so its behavior is unaffected by that edge case).
+	 */
+	function stripPlanFromMessage(message: MessageEndEvent["message"]): MessageEndEvent["message"] | null {
+		if (message.role !== "assistant") return null;
+		// Assistant content is a parts array (text / thinking / toolCall);
+		// only text parts can carry the plan fence.
+		const content = message.content;
+		if (!Array.isArray(content)) return null;
+		let removed = false;
+		const parts = content.map((part) => {
+			if (part.type === "text" && typeof part.text === "string") {
+				const { text, removed: partRemoved } = stripPlanBlocks(part.text);
+				if (partRemoved) {
+					removed = true;
+					return { ...part, text };
+				}
+			}
+			return part;
+		});
+		return removed ? { ...message, content: parts } : null;
+	}
+
+	/**
+	 * Hide the plan block: while a single auto-run Plan task is in flight
+	 * (its prompt carried PLAN_OUTPUT_INSTRUCTION), capture the reply's raw
+	 * text for the questionnaire, then — in the TUI — replace the finalized
+	 * message with the plan block(s) stripped out. The runtime applies the
+	 * replacement in place, so the stripped text is what the model sees in
+	 * later turns and what the session file persists. In non-TUI modes the
+	 * block stays in the transcript: it is the model's only record of the
+	 * proposal, and the user may reply with item numbers to execute. Scoped
+	 * to the pending auto-run Plan task (renderTaskPrompt's gate), so a
+	 * plan-tagged JSON block in a normal conversation or in a non-Plan
+	 * auto-run's reply is never touched; `hidePlan` (per task, then global)
+	 * opts out of the strip.
+	 */
+	pi.on("message_end", (event) => {
+		if (event.message.role !== "assistant" || !pendingSummaryTask) return;
+		const task = tasks.find((t) => t.name === pendingSummaryTask);
+		// Only the runs whose prompt carried PLAN_OUTPUT_INSTRUCTION (Plan
+		// tasks with the questionnaire enabled — renderTaskPrompt's gate)
+		// may have the block captured and stripped; a plan fence in any other
+		// reply is the user's content and stays in the transcript.
+		if (!task || !isPlanTask(task) || !(task.questionnaire ?? questionnaireEnabled)) return;
+		const text = assistantText(event.message.content);
+		if (!text.includes("```plan")) return;
+		// Capture the raw (unstripped) text for the questionnaire — after the
+		// strip below the message text no longer carries the block.
+		pendingPlanRaw = text;
+		// TUI-only strip: in non-TUI modes the block stays in the transcript
+		// so the model can resolve the item-number replies the notification
+		// offers (and the session file keeps the proposal on record).
+		if (lastCtx?.mode !== "tui") return;
+		// `hidePlan` (per task, then global) opts out of the strip.
+		if (!(task.hidePlan ?? hidePlanEnabled)) return;
+		const stripped = stripPlanFromMessage(event.message);
+		if (stripped) return { message: stripped };
+	});
+
 	pi.on("agent_end", (event) => {
 		// The agent may have changed the repo — drop the TTL context cache so
 		// the next action sees the new tree (a running chain keeps its own
@@ -1276,10 +1791,26 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const lastAssistant = lastAssistantMessage(event.messages);
 			if (lastAssistant) {
 				const outcome = outcomeFromStopReason(lastAssistant.stopReason);
-				const summary = stepSummary(outcome, pendingSummaryTask, 0, 0);
-				lastCtx?.ui.notify(`do-always: ${summary}`, "info");
+				if (outcome === "completed") {
+					// Completed auto-run: capture the reply; the plan
+					// questionnaire (or the plain summary when there is no
+					// parseable plan block / the mode is not TUI) is offered at
+					// agent_settled, when the session is fully idle. The
+					// message_end handler stripped the plan block from the
+					// transcript, so the message here no longer carries it — the
+					// raw capture is the parse source (the message text is the
+					// fallback when no capture exists).
+					pendingProposal = {
+						taskName: pendingSummaryTask,
+						text: pendingPlanRaw ?? assistantText(lastAssistant.content),
+					};
+				} else {
+					const summary = stepSummary(outcome, pendingSummaryTask, 0, 0);
+					lastCtx?.ui.notify(`do-always: ${summary}`, "info");
+				}
 			}
 			pendingSummaryTask = null;
+			pendingPlanRaw = null;
 			return;
 		}
 		if (!chainWaiter) return;
@@ -1325,9 +1856,25 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			}
 		}
 	});
+	// The settle that follows a chain run's agent_end (or the
+	// failed-to-start grace timer): settle the waiter there, not in
+	// agent_end, because agent_end can fire while a queued follow-up is
+	// still pending — the settle is the point where the session is
+	// truly idle. A settle with no waiter is a plain user turn (or the
+	// settle of a completed auto-run, which offers its captured reply).
 	pi.on("agent_settled", () => {
-		if (!chainWaiter) return;
-		settleChainWaiter(chainWaiter.started ? (chainWaiter.outcome ?? "completed") : "failed-to-start");
+		if (chainWaiter) {
+			settleChainWaiter(chainWaiter.started ? (chainWaiter.outcome ?? "completed") : "failed-to-start");
+			return;
+		}
+		// A completed auto-run task may have a captured reply to offer (the
+		// plan questionnaire in TUI, the summary elsewhere). Skip when a chain
+		// is active — the questionnaire is only for single auto-runs.
+		if (pendingProposal && !chainActive) {
+			const captured = pendingProposal;
+			pendingProposal = null;
+			void offerPlanProposal(captured, lastCtx);
+		}
 	});
 
 	/**
@@ -1403,6 +1950,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		const config = loadConfig(ctx.cwd, onError);
 		tasks = config.tasks;
 		reportEnabled = config.report;
+		questionnaireEnabled = config.questionnaire;
+		hidePlanEnabled = config.hidePlan;
 		refreshVisible(ctx.cwd, await getContext(ctx.cwd));
 		registerShortcut(config.shortcut, onError);
 	});
@@ -1528,8 +2077,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const details = formatSelectedCommits(selected);
 			const strings = toPromptContext(context);
 			const prompt = /\{\{\s*selected_commits\s*\}\}/.test(chosen.prompt)
-				? renderPrompt(chosen.prompt, { ...strings, selected_commits: details })
-				: `${renderPrompt(chosen.prompt, strings)}\n\nSelected commits:\n${details}`;
+				? renderTaskPrompt(chosen, { ...strings, selected_commits: details })
+				: `${renderTaskPrompt(chosen, strings)}\n\nSelected commits:\n${details}`;
 
 			pendingSummaryTask = chosen.name;
 			if (pendingSummaryTimer) clearTimeout(pendingSummaryTimer);
@@ -1554,7 +2103,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		}
 		// Render with the same context the selector/preview used, so what the
 		// user saw is exactly what gets injected.
-		const prompt = renderPrompt(task.prompt, toPromptContext(context));
+		const prompt = renderTaskPrompt(task, toPromptContext(context));
 		if (shouldAutoRun(task)) {
 			// Fire-and-forget: sendUserMessage returns void; the run proceeds
 			// independently (see the chain control notes for why).
@@ -2081,7 +2630,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					const sel = itemRows[cursor.row];
 					if (sel) {
 						const wrapWidth = Math.max(10, width - 4);
-						const wrapped = wrapTextWithAnsi(renderPrompt(sel.task.prompt, strings), wrapWidth);
+						const wrapped = wrapTextWithAnsi(renderTaskPrompt(sel.task, strings), wrapWidth);
 						const shown = wrapped.slice(0, PREVIEW_MAX_LINES);
 						const truncated = wrapped.length > PREVIEW_MAX_LINES;
 						lines.push("");
@@ -2429,6 +2978,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const matches = [
 				{ value: "list", label: "list" },
 				{ value: "list-details", label: "list-details" },
+				{ value: "replan", label: "replan" },
 				...visible.map((t, i) => ({ value: t.name, label: `${i + 1}. ${t.name}` })),
 			].filter((c) => c.value.toLowerCase().includes(p));
 			return matches.length > 0 ? matches : null;
@@ -2451,6 +3001,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			const config = loadConfig(ctx.cwd, onError);
 			tasks = config.tasks;
 			reportEnabled = config.report;
+			questionnaireEnabled = config.questionnaire;
+			hidePlanEnabled = config.hidePlan;
 		}
 
 		// One context per command run: shared by visibility filtering, rendering,
@@ -2475,6 +3027,18 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return;
 		}
 
+		// Re-open the questionnaire for the last offered plan proposal (e.g.
+		// after an accidental esc). Re-offers the same captured reply, so the
+		// confirm/withdraw behavior is exactly as before.
+		if (arg.toLowerCase() === "replan") {
+			if (!lastProposal) {
+				ctx.ui.notify("do-always: no plan proposal to re-open — run a Plan task (⚡) first", "info");
+				return;
+			}
+			void offerPlanProposal(lastProposal, ctx);
+			return;
+		}
+
 		if (arg.toLowerCase() === "list-details") {
 			// Display only — the description is metadata; selecting a task injects just its prompt.
 			// Render with the current context so what is shown is what gets injected.
@@ -2484,7 +3048,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					const lines = [`${i + 1}. ${t.name}`];
 					if (t.description) lines.push(`   description: ${t.description}`);
 					lines.push("   prompt (this is what gets injected on select):");
-					for (const line of renderPrompt(t.prompt, strings).split("\n")) lines.push(`   ${line}`);
+					for (const line of renderTaskPrompt(t, strings).split("\n")) lines.push(`   ${line}`);
 					return lines.join("\n");
 				})
 				.join("\n\n");

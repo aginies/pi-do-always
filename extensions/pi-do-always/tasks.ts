@@ -67,6 +67,25 @@ export interface DoAlwaysTask {
 	 * configs that predate this field keep working.
 	 */
 	browser?: BrowserType;
+	/**
+	 * Whether the plan questionnaire is offered after this task's run: the
+	 * reply's "plan" block (tiers + action items) becomes a selectable list
+	 * the user confirms or withdraws. Default true (the global config
+	 * "questionnaire" sets the fallback); set false to keep the plain summary
+	 * notification. Only meaningful for auto-run tasks (Plan category by
+	 * default).
+	 */
+	questionnaire?: boolean;
+	/**
+	 * Whether the raw "plan" block is hidden from the transcript after this
+	 * task's run: the fenced block is stripped from the finalized reply in
+	 * the TUI (the questionnaire still parses the captured raw text; in
+	 * non-TUI modes the block is always kept). Default true (the global
+	 * config "hidePlan" sets the fallback); set false to keep the block
+	 * visible in the transcript. Only meaningful for auto-run tasks (Plan
+	 * category by default).
+	 */
+	hidePlan?: boolean;
 }
 
 /** The set of known guard types (used for validation at parse time). */
@@ -115,6 +134,19 @@ type DoAlwaysConfig =
 			 * the project root). Default true; set false to disable.
 			 */
 			report?: boolean;
+			/**
+			 * Whether completed auto-run tasks whose reply carries a "plan"
+			 * block offer the selection questionnaire. Default true; set false
+			 * to keep the plain summary notification.
+			 */
+			questionnaire?: boolean;
+			/**
+			 * Whether the raw "plan" block is stripped from the transcript
+			 * after a completed auto-run task (TUI only — in non-TUI modes
+			 * the block is always kept). Default true; set false to keep the
+			 * block visible in the transcript.
+			 */
+			hidePlan?: boolean;
 		};
 
 /** Shortcut used when neither config file specifies one. */
@@ -138,6 +170,18 @@ interface ParsedDoAlwaysConfig {
 	 * report file. undefined when the file does not set one (default: on).
 	 */
 	report: boolean | undefined;
+	/**
+	 * The `questionnaire` field, if present: whether completed auto-run
+	 * tasks whose reply carries a plan block offer the selection
+	 * questionnaire. undefined when the file does not set one (default: on).
+	 */
+	questionnaire: boolean | undefined;
+	/**
+	 * The `hidePlan` field, if present: whether the raw plan block is
+	 * stripped from the transcript after a completed auto-run task.
+	 * undefined when the file does not set one (default: on).
+	 */
+	hidePlan: boolean | undefined;
 }
 
 import { existsSync } from "node:fs";
@@ -474,14 +518,14 @@ export function parseConfig(
 		data = JSON.parse(raw);
 	} catch (err) {
 		onError(`do-always: invalid JSON in ${path}: ${err}`);
-		return { tasks: [], shortcut: undefined, report: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined };
 	}
 
 	const list = Array.isArray(data) ? data : data?.tasks;
 
 	if (!Array.isArray(list)) {
 		onError(`do-always: ${path} must be a JSON array of tasks or {"tasks": [...]}`);
-		return { tasks: [], shortcut: undefined, report: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined };
 	}
 
 	const tasks: DoAlwaysTask[] = [];
@@ -498,6 +542,8 @@ export function parseConfig(
 				if (typeof t.requireDirty === "boolean") task.requireDirty = t.requireDirty;
 				if (typeof t.hidden === "boolean") task.hidden = t.hidden;
 				if (typeof t.notForCommits === "boolean") task.notForCommits = t.notForCommits;
+				if (typeof t.questionnaire === "boolean") task.questionnaire = t.questionnaire;
+				if (typeof t.hidePlan === "boolean") task.hidePlan = t.hidePlan;
 				if (t.browser !== undefined) {
 					if (typeof t.browser === "string" && BROWSER_TYPES.includes(t.browser as BrowserType)) {
 						task.browser = t.browser as BrowserType;
@@ -546,8 +592,18 @@ export function parseConfig(
 		if (typeof data.report === "boolean") report = data.report;
 		else onError(`do-always: ignoring invalid "report" in ${path} (expected true or false)`);
 	}
+	let questionnaire: boolean | undefined;
+	if (!Array.isArray(data) && "questionnaire" in data) {
+		if (typeof data.questionnaire === "boolean") questionnaire = data.questionnaire;
+		else onError(`do-always: ignoring invalid "questionnaire" in ${path} (expected true or false)`);
+	}
+	let hidePlan: boolean | undefined;
+	if (!Array.isArray(data) && "hidePlan" in data) {
+		if (typeof data.hidePlan === "boolean") hidePlan = data.hidePlan;
+		else onError(`do-always: ignoring invalid "hidePlan" in ${path} (expected true or false)`);
+	}
 
-	return { tasks, shortcut, merge, report };
+	return { tasks, shortcut, merge, report, questionnaire, hidePlan };
 }
 
 const KEY_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -807,7 +863,7 @@ export function orderTasksByCategory(
  */
 export function shouldAutoRun(task: DoAlwaysTask): boolean {
 	if (typeof task.autoRun === "boolean") return task.autoRun;
-	return (task.category ?? "").trim().toLowerCase() === "plan";
+	return isPlanTask(task);
 }
 
 /**
@@ -1490,4 +1546,353 @@ export function formatCommitReviewPrompt(commits: SelectedCommit[]): string {
 		`3. Consistency with surrounding project patterns and tests.\n\n` +
 		`Summarize your findings for each commit and propose a plan for any fixes if needed. Do not make changes yet.`
 	);
+}
+
+// ── Plan proposal ────────────────────────────────────────────────────────────
+//
+// Auto-run Plan tasks end their reply with a machine-readable plan block:
+// a fenced code block tagged "plan" carrying the proposed action items as
+// JSON (summary + tiers of items). PLAN_OUTPUT_INSTRUCTION is appended to
+// Plan task prompts at render time so the agent emits the block; 
+// parsePlanProposal extracts and normalizes it; the selection state machine
+// and the execution prompt builder are pure so they can be unit-tested
+// without the Pi runtime.
+
+/**
+ * Instruction appended to Plan-category task prompts at render time: it
+ * requires the reply to end with a fenced "plan" code block containing the
+ * proposed action items as JSON (summary + tiers of items). Kept in one
+ * place so every Plan prompt shares the same contract.
+ */
+export const PLAN_OUTPUT_INSTRUCTION =
+	"End your reply with a machine-readable plan block: a fenced code block tagged plan (```plan) containing JSON of exactly this shape: " +
+	'{"summary":"one-line summary","tiers":[{"id":"P0","label":"Critical","items":[{"title":"short action","detail":"where and why (file:line if known)"}]}]}. ' +
+	"One tier per priority level, most urgent first (P0, P1, P2, ...). " +
+	"Each item must be one concrete, independently doable action. " +
+	'Use an empty "tiers" array when no action is needed.';
+
+/** One concrete action item proposed by a Plan run. */
+export interface PlanItem {
+	/** Short action description. */
+	title: string;
+	/** Where and why — file:line, rationale (optional). */
+	detail?: string;
+}
+
+/** A priority tier grouping action items (most urgent tier first). */
+export interface PlanTier {
+	/** Tier id as emitted by the agent (e.g. "P0"); defaulted by position when absent. */
+	id: string;
+	/** Human label (e.g. "Critical"); defaults to the id when absent. */
+	label: string;
+	/** The tier's action items, in the order the agent emitted them. */
+	items: PlanItem[];
+}
+
+/** A parsed plan proposal: the agent's reply, normalized for selection. */
+export interface PlanProposal {
+	/** One-line summary from the block (undefined when absent or blank). */
+	summary?: string;
+	/** Tiers in the order the agent emitted them (most urgent first). */
+	tiers: PlanTier[];
+}
+
+/** True when the task belongs to the Plan category (case-insensitive). */
+export function isPlanTask(task: DoAlwaysTask): boolean {
+	return (task.category ?? "").trim().toLowerCase() === "plan";
+}
+
+/**
+ * Matches a fenced code block whose info string is "plan" (trailing
+ * whitespace allowed). The lazy body stops at the first closing fence.
+ */
+const PLAN_FENCE_RE = /```plan[^\S\n]*\r?\n([\s\S]*?)```/gi;
+
+/**
+ * Remove every fenced plan block from `text`, collapsing the blank lines
+ * they leave behind and trimming the ends. The stripped text is what the
+ * transcript shows (the message_end handler in index.ts replaces the
+ * finalized message with it); the raw text is captured separately for the
+ * questionnaire parser. `removed` is false when no plan fence was present
+ * (the text is returned unchanged).
+ */
+export function stripPlanBlocks(text: string): { text: string; removed: boolean } {
+	if (typeof text !== "string" || text === "") return { text, removed: false };
+	if (!text.includes("```plan")) return { text, removed: false };
+	// An unclosed fence (no closing ```) matches nothing: leave the text
+	// alone instead of claiming a removal that didn't happen.
+	if ([...text.matchAll(PLAN_FENCE_RE)].length === 0) return { text, removed: false };
+	const stripped = text
+		.replace(PLAN_FENCE_RE, "")
+		.replace(/\n{3,}/g, "\n\n")
+		.replace(/^\s+/, "")
+		.replace(/\s+$/, "");
+	return { text: stripped, removed: true };
+}
+
+/**
+ * Parse a plan proposal from a Plan run's reply text. Finds the fenced
+ * "plan" code blocks, tries them from last to first (the agent may emit an
+ * early malformed one and correct it), and returns the first that yields at
+ * least one valid item. Returns null when there is no plan block, the JSON
+ * is malformed, or nothing valid survives normalization — callers then fall
+ * back to the plain summary notification.
+ */
+export function parsePlanProposal(text: string): PlanProposal | null {
+	if (typeof text !== "string" || text === "") return null;
+	const fences = [...text.matchAll(PLAN_FENCE_RE)];
+	for (let i = fences.length - 1; i >= 0; i--) {
+		const proposal = normalizePlanJson(fences[i][1]);
+		if (proposal) return proposal;
+	}
+	return null;
+}
+
+/**
+ * Why (or why not) a reply's plan block is usable for the questionnaire.
+ * Mirrors parsePlanProposal's block precedence (last to first), so the
+ * reported reason matches what the parser decided: "ok" is exactly the case
+ * where parsePlanProposal returns a proposal.
+ */
+export type PlanBlockDiagnostic =
+	| { kind: "none" } // no fenced plan block at all
+	| { kind: "malformed"; detail: string } // the last block's JSON does not parse (detail: the parse error)
+	| { kind: "empty" } // JSON parsed, but no valid items survived normalization
+	| { kind: "ok"; itemCount: number };
+
+export function planBlockDiagnostics(text: string): PlanBlockDiagnostic {
+	if (typeof text !== "string" || text === "") return { kind: "none" };
+	const fences = [...text.matchAll(PLAN_FENCE_RE)];
+	if (fences.length === 0) return { kind: "none" };
+	let lastError: string | null = null;
+	let parsedButEmpty = false;
+	for (let i = fences.length - 1; i >= 0; i--) {
+		try {
+			JSON.parse(fences[i][1].trim());
+		} catch (err) {
+			// The loop runs last-to-first, so the first error seen is the
+			// last block's — the agent's final answer, which is the one to
+			// report. Strip the position suffix from JSON.parse errors
+			// ("at position N (line L column C)") so the message is readable
+			// in a large plan block where the position number is meaningless.
+			if (lastError === null) {
+				const raw = err instanceof Error ? err.message : String(err);
+				lastError = raw.replace(/\s+at\s+position\s+\d+(?:\s*\(line\s+\d+\s+column\s+\d+\))?/, "");
+			}
+			continue;
+		}
+		const proposal = normalizePlanJson(fences[i][1]);
+		if (proposal) {
+			const count = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
+			if (count > 0) return { kind: "ok", itemCount: count };
+		}
+		parsedButEmpty = true;
+	}
+	if (lastError !== null) return { kind: "malformed", detail: lastError };
+	if (parsedButEmpty) return { kind: "empty" };
+	return { kind: "malformed", detail: "invalid JSON" };
+}
+
+/**
+ * Normalize one plan block's JSON body. Accepts the tiered shape
+ * ({tiers: [{id, label, items: [...]}]}) and a lenient flat shape
+ * ({items: [{tier, title, ...}]}, grouped preserving first-seen tier
+ * order). Invalid entries are dropped; a result with no valid items is
+ * null.
+ */
+function normalizePlanJson(raw: string): PlanProposal | null {
+	let data: unknown;
+	try {
+		data = JSON.parse(raw.trim());
+	} catch {
+		return null;
+	}
+	if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+	const obj = data as Record<string, unknown>;
+	const summary =
+		typeof obj.summary === "string" && obj.summary.trim() !== "" ? obj.summary.trim() : undefined;
+	const tiers: PlanTier[] = [];
+	if (Array.isArray(obj.tiers)) {
+		obj.tiers.forEach((t, i) => {
+			const tier = normalizePlanTier(t, i);
+			if (tier) tiers.push(tier);
+		});
+	} else if (Array.isArray(obj.items)) {
+		const byTier = new Map<string, PlanTier>();
+		for (const entry of obj.items) {
+			const item = normalizePlanItem(entry);
+			if (!item) continue;
+			const tierField =
+				typeof entry === "object" && entry !== null
+					? (entry as Record<string, unknown>).tier
+					: undefined;
+			const id = typeof tierField === "string" && tierField.trim() !== "" ? tierField.trim() : "P0";
+			if (!byTier.has(id)) byTier.set(id, { id, label: id, items: [] });
+			byTier.get(id)!.items.push(item);
+		}
+		for (const tier of byTier.values()) tiers.push(tier);
+	}
+	if (tiers.length === 0) return null;
+	return { summary, tiers };
+}
+
+/** Normalize one tier entry; null when it carries no valid items. */
+function normalizePlanTier(raw: unknown, index: number): PlanTier | null {
+	if (typeof raw !== "object" || raw === null) return null;
+	const obj = raw as Record<string, unknown>;
+	const items: PlanItem[] = [];
+	if (Array.isArray(obj.items)) {
+		for (const entry of obj.items) {
+			const item = normalizePlanItem(entry);
+			if (item) items.push(item);
+		}
+	}
+	if (items.length === 0) return null;
+	const id = typeof obj.id === "string" && obj.id.trim() !== "" ? obj.id.trim() : `P${index}`;
+	const label = typeof obj.label === "string" && obj.label.trim() !== "" ? obj.label.trim() : id;
+	return { id, label, items };
+}
+
+/**
+ * Normalize one item entry: a plain string is a title-only item; an object
+ * needs a non-blank string "title" ("detail" is optional). Null otherwise.
+ */
+function normalizePlanItem(raw: unknown): PlanItem | null {
+	if (typeof raw === "string") {
+		const title = raw.trim();
+		return title === "" ? null : { title };
+	}
+	if (typeof raw !== "object" || raw === null) return null;
+	const obj = raw as Record<string, unknown>;
+	const title = typeof obj.title === "string" ? obj.title.trim() : "";
+	if (title === "") return null;
+	const item: PlanItem = { title };
+	const detail = typeof obj.detail === "string" ? obj.detail.trim() : "";
+	if (detail !== "") item.detail = detail;
+	return item;
+}
+
+// ── Plan questionnaire selection ─────────────────────────────────────────────
+//
+// The user's selection in the plan questionnaire: which item keys are
+// checked. A key is "tierIndex:itemIndex" (0-based positions in the
+// normalized proposal). Pure state — every operation returns a new Set,
+// never mutating the input (same style as the chain state).
+
+/** The checked item keys of one questionnaire. */
+export type PlanSelection = Set<string>;
+
+/** An empty selection. */
+export function planSelectionClear(): PlanSelection {
+	return new Set();
+}
+
+/** The selection key of one item (0-based tier and item positions). */
+export function planItemKey(tierIndex: number, itemIndex: number): string {
+	return `${tierIndex}:${itemIndex}`;
+}
+
+/** Toggle one item's membership. */
+export function planToggleItem(selection: PlanSelection, key: string): PlanSelection {
+	const next = new Set(selection);
+	if (next.has(key)) next.delete(key);
+	else next.add(key);
+	return next;
+}
+
+/**
+ * Toggle a whole tier: fully selected → clear all its items; none or
+ * partial → select all of them. Returns the new selection and whether the
+ * tier ended up selected. Unknown tier index: the selection is unchanged.
+ */
+export function planToggleTier(
+	proposal: PlanProposal,
+	tierIndex: number,
+	selection: PlanSelection,
+): { selection: PlanSelection; selected: boolean } {
+	const tier = proposal.tiers[tierIndex];
+	if (!tier) return { selection, selected: false };
+	const keys = tier.items.map((_, i) => planItemKey(tierIndex, i));
+	const allSelected = keys.every((k) => selection.has(k));
+	const next = new Set(selection);
+	if (allSelected) for (const k of keys) next.delete(k);
+	else for (const k of keys) next.add(k);
+	return { selection: next, selected: !allSelected };
+}
+
+/** Select every item in the proposal. */
+export function planSelectAll(proposal: PlanProposal, selection: PlanSelection): PlanSelection {
+	const next = new Set(selection);
+	proposal.tiers.forEach((tier, ti) => {
+		tier.items.forEach((_, ii) => next.add(planItemKey(ti, ii)));
+	});
+	return next;
+}
+
+/** One tier's aggregate state: no items, some, or all items selected. */
+export function planTierState(
+	proposal: PlanProposal,
+	tierIndex: number,
+	selection: PlanSelection,
+): "none" | "partial" | "all" {
+	const tier = proposal.tiers[tierIndex];
+	if (!tier) return "none";
+	let count = 0;
+	tier.items.forEach((_, ii) => {
+		if (selection.has(planItemKey(tierIndex, ii))) count++;
+	});
+	if (count === 0) return "none";
+	if (count === tier.items.length) return "all";
+	return "partial";
+}
+
+/** A selected item with its tier, for display and the execution prompt. */
+export interface PlanSelectionEntry {
+	tier: PlanTier;
+	item: PlanItem;
+	/** A user note added in the questionnaire for this item, if any. */
+	note?: string;
+}
+
+/**
+ * The selected items in execution order: tier order, item order within a
+ * tier. Empty when nothing is selected. When `notes` is given, a non-empty
+ * note for a selected item (keyed by planItemKey) is carried on the entry.
+ */
+export function planSelectedItems(
+	proposal: PlanProposal,
+	selection: PlanSelection,
+	notes?: ReadonlyMap<string, string>,
+): PlanSelectionEntry[] {
+	const out: PlanSelectionEntry[] = [];
+	proposal.tiers.forEach((tier, ti) => {
+		tier.items.forEach((item, ii) => {
+			const key = planItemKey(ti, ii);
+			if (!selection.has(key)) return;
+			const note = notes?.get(key)?.trim();
+			out.push(note ? { tier, item, note } : { tier, item });
+		});
+	});
+	return out;
+}
+
+/**
+ * Build the follow-up prompt sent when the user confirms a questionnaire
+ * selection. The proposal itself is already in the conversation (the Plan
+ * run's reply), so the prompt references it and lists only the selected
+ * items, in execution order.
+ */
+export function formatPlanExecutionPrompt(selected: PlanSelectionEntry[], taskName: string): string {
+	const lines: string[] = [
+		`Execute the following action items from the "${taskName}" plan proposal, in exactly this order. ` +
+			"Do ONLY these items — skip every other item from the proposal, and do not start anything else. " +
+			"When done, summarize what you changed.",
+		"",
+	];
+	selected.forEach(({ tier, item, note }, i) => {
+		lines.push(
+			`${i + 1}. [${tier.id}] ${item.title}${item.detail ? ` — ${item.detail}` : ""}${note ? ` [note: ${note}]` : ""}`,
+		);
+	});
+	return lines.join("\n");
 }

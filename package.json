@@ -1,6 +1,6 @@
 {
 	"name": "pi-do-always",
-	"version": "0.15.0",
+	"version": "0.16.0",
 	"type": "module",
 	"description": "Pi extension: /do-always — pick a common task by number, it fills your prompt",
 	"author": {
