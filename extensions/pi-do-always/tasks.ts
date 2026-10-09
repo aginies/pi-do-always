@@ -86,6 +86,14 @@ export interface DoAlwaysTask {
 	 * category by default).
 	 */
 	hidePlan?: boolean;
+	/**
+	 * Short names that resolve to this task on the command line. Each alias
+	 * is case-insensitive and is tried before the task's own name. Aliases
+	 * must be single words (no spaces) and must not collide with other
+	 * tasks' aliases or names (a collision is silently resolved to the
+	 * first-encountered task).
+	 */
+	aliases?: string[];
 }
 
 /** The set of known guard types (used for validation at parse time). */
@@ -147,6 +155,13 @@ type DoAlwaysConfig =
 			 * block visible in the transcript.
 			 */
 			hidePlan?: boolean;
+			/**
+			 * A global alias map: `{ "rc": "Review changes" }` maps a short
+			 * alias string to a task name. Aliases are case-insensitive and
+			 * are tried before the task's own name. Invalid entries (non-string
+			 * values, empty keys) are silently ignored.
+			 */
+			aliases?: Record<string, string>;
 		};
 
 /** Shortcut used when neither config file specifies one. */
@@ -182,6 +197,11 @@ interface ParsedDoAlwaysConfig {
 	 * undefined when the file does not set one (default: on).
 	 */
 	hidePlan: boolean | undefined;
+	/**
+	 * A global alias map parsed from the config object: `{ "rc": "Review changes" }`.
+	 * undefined when the file does not set one.
+	 */
+	aliases: Record<string, string> | undefined;
 }
 
 import { existsSync } from "node:fs";
@@ -518,14 +538,14 @@ export function parseConfig(
 		data = JSON.parse(raw);
 	} catch (err) {
 		onError(`do-always: invalid JSON in ${path}: ${err}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, aliases: undefined };
 	}
 
 	const list = Array.isArray(data) ? data : data?.tasks;
 
 	if (!Array.isArray(list)) {
 		onError(`do-always: ${path} must be a JSON array of tasks or {"tasks": [...]}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, aliases: undefined };
 	}
 
 	const tasks: DoAlwaysTask[] = [];
@@ -544,6 +564,13 @@ export function parseConfig(
 				if (typeof t.notForCommits === "boolean") task.notForCommits = t.notForCommits;
 				if (typeof t.questionnaire === "boolean") task.questionnaire = t.questionnaire;
 				if (typeof t.hidePlan === "boolean") task.hidePlan = t.hidePlan;
+				if (t.aliases !== undefined) {
+					if (Array.isArray(t.aliases) && t.aliases.every((a) => typeof a === "string")) {
+						task.aliases = t.aliases.filter((a) => a.trim() !== "");
+					} else {
+						onError(`do-always: ignoring invalid "aliases" in ${path} (expected an array of strings)`);
+					}
+				}
 				if (t.browser !== undefined) {
 					if (typeof t.browser === "string" && BROWSER_TYPES.includes(t.browser as BrowserType)) {
 						task.browser = t.browser as BrowserType;
@@ -602,8 +629,20 @@ export function parseConfig(
 		if (typeof data.hidePlan === "boolean") hidePlan = data.hidePlan;
 		else onError(`do-always: ignoring invalid "hidePlan" in ${path} (expected true or false)`);
 	}
+	let aliases: Record<string, string> | undefined;
+	if (!Array.isArray(data) && "aliases" in data) {
+		if (typeof data.aliases === "object" && data.aliases !== null && !Array.isArray(data.aliases)) {
+			const map: Record<string, string> = {};
+			for (const [k, v] of Object.entries(data.aliases)) {
+				if (typeof k === "string" && k.trim() !== "" && typeof v === "string") {
+					map[k.trim()] = v.trim();
+				}
+			}
+			if (Object.keys(map).length > 0) aliases = map;
+		}
+	}
 
-	return { tasks, shortcut, merge, report, questionnaire, hidePlan };
+	return { tasks, shortcut, merge, report, questionnaire, hidePlan, aliases };
 }
 
 const KEY_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -996,7 +1035,11 @@ export function resolveTask(tasks: DoAlwaysTask[], arg: string): DoAlwaysTask | 
 		const n = Number(a);
 		return n >= 1 && n <= tasks.length ? tasks[n - 1] : undefined;
 	}
-	return tasks.find((t) => t.name.toLowerCase() === a.toLowerCase());
+	// Try aliases first (case-insensitive), then the task's own name.
+	const lower = a.toLowerCase();
+	const aliasMatch = tasks.find((t) => t.aliases?.some((alias) => alias.toLowerCase() === lower));
+	if (aliasMatch) return aliasMatch;
+	return tasks.find((t) => t.name.toLowerCase() === lower);
 }
 
 /** Matches a `{{key}}` placeholder: key is [A-Za-z0-9_]+, optional inner whitespace. */

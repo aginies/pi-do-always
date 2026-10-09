@@ -11,6 +11,26 @@ type to filter, scroll or click, or navigate with arrows + Enter → the task's 
 
 ![do-always — the numbered task selector](pi.image.png)
 
+## Install
+
+Install it from npm as a Pi package, which loads the bundled `index.ts` (and its `tasks.ts`) without
+managing symlinks:
+
+```bash
+pi install npm:pi-do-always
+```
+
+Manage it with `pi list` (to see installed sources) and `pi remove <source>` using the same
+source you installed with (e.g. `pi remove npm:pi-do-always`).
+
+Alternatively, you can install from the git repo or symlink a local checkout for development:
+
+```bash
+ln -s "$PWD" ~/.pi/agent/extensions/do-always   # uninstall with: rm that symlink
+```
+
+For development you can also load it explicitly: `npm run dev` (runs `pi --extension ./extensions/pi-do-always/index.ts`).
+
 ## Usage
 
 |Command|What it does|
@@ -199,26 +219,6 @@ notification instead, so you can reply with the item numbers to execute. The
 questionnaire is offered only on the single auto-run path (selector pick,
 `/do-always <n>`, commit picker) — chain steps never get it.
 
-## Install
-
-Install it from npm as a Pi package, which loads the bundled `index.ts` (and its `tasks.ts`) without
-managing symlinks:
-
-```bash
-pi install npm:pi-do-always
-```
-
-Manage it with `pi list` (to see installed sources) and `pi remove <source>` using the same
-source you installed with (e.g. `pi remove npm:pi-do-always`).
-
-Alternatively, you can install from the git repo or symlink a local checkout for development:
-
-```bash
-ln -s "$PWD" ~/.pi/agent/extensions/do-always   # uninstall with: rm that symlink
-```
-
-For development you can also load it explicitly: `npm run dev` (runs `pi --extension ./extensions/pi-do-always/index.ts`).
-
 ## Tasks configuration
 
 Tasks are read from JSON files (an array of tasks, or the object form `{"tasks": [...], "shortcut": "f4"}`):
@@ -246,6 +246,7 @@ locations above to make it your own:
 Fields:
 
 - `name` (required) — short unique id, used for `/do-always <name>`
+- `aliases` (optional) — an array of short names that also resolve to this task on the command line. Each alias is case-insensitive and is tried before the task's own name, so `/do-always r` can stand in for `/do-always review`. An invalid value (not an array of strings) is ignored with a warning.
 - `category` (optional) — group header the task is shown under in the selector (e.g. `"Plan"`, `"Do"`). Matching is case-insensitive and the header is title-cased, so `"plan"` and `"Plan"` land in the same `Plan` group. Tasks without a category fall under `Other`. The built-in defaults are grouped into `Plan`, `Browse`, `Do`, `Docs`, and `Ops`.
 - `description` (optional) — one-line label shown in the selector
 - `prompt` (required) — the text filled into the editor (supports `{{placeholders}}` — see [Prompt placeholders](#prompt-placeholders))
@@ -265,6 +266,14 @@ In the object form you can also configure the selector shortcut:
 - `report` (optional) — whether chain runs write a Markdown report file in the project root (one per run, appended as each step finishes). Default `true`; set `false` to disable. The project file's value wins over the global one. See [Chains](#chains).
 - `questionnaire` (optional) — whether completed auto-run tasks whose reply carries a plan block offer the selection questionnaire. Default `true`; set `false` to keep the plain summary notification. The project file's value wins over the global one. See [Plan questionnaire](#plan-questionnaire).
 - `hidePlan` (optional) — whether the raw `plan` block is stripped from the transcript after a completed auto-run task (TUI only — in non-TUI modes the block is always kept). Default `true`; set `false` to keep the block visible in the conversation. The project file's value wins over the global one.
+- `aliases` (optional) — a global alias map: an object that maps short alias strings to task names, e.g. `{ "rc": "Review changes", "bl": "Build" }`. Each alias is case-insensitive and is tried before the task's own name, so `/do-always rc` resolves to the task named `Review changes`. Keys and values are trimmed; entries with empty keys or non-string values are silently dropped. The project file's value wins over the global one.
+
+```json
+{
+  "tasks": [ { "name": "review", "prompt": "…" } ],
+  "aliases": { "r": "review", "rc": "review changes" }
+}
+```
 
 Example project file that only *adds* tasks without overriding the global set:
 

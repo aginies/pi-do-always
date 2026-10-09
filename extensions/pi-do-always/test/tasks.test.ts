@@ -547,9 +547,40 @@ test("resolveTask returns undefined for empty or unknown input", () => {
 	assert.equal(resolveTask(sample, "nope"), undefined);
 });
 
-// ---------------------------------------------------------------------------
-// formatList
-// ---------------------------------------------------------------------------
+// ── resolveTask with aliases ────────────────────────────────────────────────
+
+const aliasedSample: DoAlwaysTask[] = [
+	{ name: "review", prompt: "p", aliases: ["r", "rev"] },
+	{ name: "build", prompt: "p", aliases: ["b", "bl"] },
+	{ name: "readme", prompt: "p" },
+];
+
+test("resolveTask resolves by alias (case-insensitive)", () => {
+	assert.equal(resolveTask(aliasedSample, "r")?.name, "review");
+	assert.equal(resolveTask(aliasedSample, "R")?.name, "review");
+	assert.equal(resolveTask(aliasedSample, "rev")?.name, "review");
+	assert.equal(resolveTask(aliasedSample, "b")?.name, "build");
+	assert.equal(resolveTask(aliasedSample, "BL")?.name, "build");
+});
+
+test("resolveTask prefers alias over name when both match", () => {
+	// "review" matches the name; "r" only matches the alias.
+	assert.equal(resolveTask(aliasedSample, "r")?.name, "review");
+	// "readme" does not match any alias; falls through to name.
+	assert.equal(resolveTask(aliasedSample, "readme")?.name, "readme");
+});
+
+test("resolveTask falls back to name when no alias matches", () => {
+	assert.equal(resolveTask(aliasedSample, "readme")?.name, "readme");
+	assert.equal(resolveTask(aliasedSample, "README")?.name, "readme");
+});
+
+test("resolveTask returns undefined when neither alias nor name matches", () => {
+	assert.equal(resolveTask(aliasedSample, "deploy"), undefined);
+	assert.equal(resolveTask(aliasedSample, "D"), undefined);
+});
+
+// ── formatList ───────────────────────────────────────────────────────────────
 
 test("formatList renders a numbered one-line-per-task list", () => {
 	assert.equal(
@@ -1455,6 +1486,79 @@ test("parseConfig reads the report flag (default on, explicit off honored)", () 
 	const invalid = parseConfig(JSON.stringify({ tasks: [], report: "yes" }), "t.json", (m) => (warned = m));
 	assert.equal(invalid.report, undefined);
 	assert.match(warned, /report/);
+});
+
+test("parseConfig reads per-task aliases as an array of strings", () => {
+	const out = parseConfig(
+		JSON.stringify([{ name: "x", prompt: "p", aliases: ["r", "x-alias"] }]),
+		"t.json",
+	);
+	assert.equal(out.tasks.length, 1);
+	assert.deepEqual(out.tasks[0].aliases, ["r", "x-alias"]);
+});
+
+test("parseConfig drops empty alias strings", () => {
+	const out = parseConfig(
+		JSON.stringify([{ name: "x", prompt: "p", aliases: ["r", "", " bl "] }]),
+		"t.json",
+	);
+	assert.deepEqual(out.tasks[0].aliases, ["r", " bl "]);
+});
+
+test("parseConfig ignores invalid aliases (not an array)", () => {
+	let warned = "";
+	const out = parseConfig(
+		JSON.stringify([{ name: "x", prompt: "p", aliases: "not-array" }]),
+		"t.json",
+		(m) => (warned = m),
+	);
+	assert.equal(out.tasks[0].aliases, undefined);
+	assert.match(warned, /aliases/);
+});
+
+test("parseConfig ignores aliases containing non-strings", () => {
+	let warned = "";
+	const out = parseConfig(
+		JSON.stringify([{ name: "x", prompt: "p", aliases: ["r", 42] }]),
+		"t.json",
+		(m) => (warned = m),
+	);
+	assert.equal(out.tasks[0].aliases, undefined);
+	assert.match(warned, /aliases/);
+});
+
+test("parseConfig reads the global alias map", () => {
+	const out = parseConfig(
+		JSON.stringify({ tasks: [], aliases: { r: "review", b: "build" } }),
+		"t.json",
+	);
+	assert.deepEqual(out.aliases, { r: "review", b: "build" });
+});
+
+test("parseConfig trims alias keys and values", () => {
+	const out = parseConfig(
+		JSON.stringify({ tasks: [], aliases: { " r ": " review " } }),
+		"t.json",
+	);
+	assert.deepEqual(out.aliases, { r: "review" });
+});
+
+test("parseConfig drops invalid alias entries (empty key or non-string value)", () => {
+	const out = parseConfig(
+		JSON.stringify({ tasks: [], aliases: { "": "x", "r": 123, "b": "build" } }),
+		"t.json",
+	);
+	assert.deepEqual(out.aliases, { b: "build" });
+});
+
+test("parseConfig returns undefined aliases when absent", () => {
+	const out = parseConfig(JSON.stringify({ tasks: [] }), "t.json");
+	assert.equal(out.aliases, undefined);
+});
+
+test("parseConfig returns undefined aliases for a bare array (no object key)", () => {
+	const out = parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "t.json");
+	assert.equal(out.aliases, undefined);
 });
 
 // ── Chain step summary ───────────────────────────────────────────────────
