@@ -446,14 +446,14 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
 		category: "Docs",
 		description: "Update the README.md",
 		prompt:
-			"Update the README.md to match the current state of the project. Check the code, scripts, and configuration, then update the README.md sections that are now out of date (description, installation, usage, configuration). Keep it concise and accurate.",
+			"Update the project's README (e.g. README.md) to match the current state of the project. Check the code, scripts, and configuration, then update the README sections that are now out of date (description, installation, usage, configuration). Keep it concise and accurate.",
 	},
 	{
 		name: "Build",
 		category: "Do",
 		description: "Test build is ok and fix issues",
 		prompt:
-			"Build the project (run the build script, e.g. `npm run build`, plus type check if available). If the build fails, diagnose the errors and fix them, then re-build until it succeeds. Summarize what was broken and what you changed.",
+			"Build the project (run the project's build command — e.g. `npm run build`, `cargo build`, `go build`, `make`, `mvn package`; find the build entry point — plus type check if available). If the build fails, diagnose the errors and fix them, then re-build until it succeeds. Summarize what was broken and what you changed.",
 	},
 	{
 		name: "Security",
