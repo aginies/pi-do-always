@@ -24,6 +24,18 @@ All notable changes to this project will be documented in this file.
   removed the `PROPOSAL-hide-plan-block.md` proposal document (the feature
   shipped in v0.17.0).
 
+### Fixed
+
+- The built-in `Release` task prompt no longer refers to `package.json`
+  specifically: it now says "the project's version manifest" (with examples:
+  package.json, Cargo.toml, pyproject.toml, go.mod, pom.xml) and "the
+  project's changelog file" (e.g. CHANGELOG.md), so it works for projects
+  in any ecosystem.
+- The built-in `Build` task prompt no longer assumes npm: it now says
+  "the project's build command" (with examples: npm, cargo, go, make, mvn).
+  The `Readme` task prompt now says "the project's README (e.g.
+  README.md)" instead of assuming `README.md`.
+
 ## [0.18.0] - 2026-10-09
 
 ### Changed
