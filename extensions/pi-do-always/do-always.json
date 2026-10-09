@@ -80,7 +80,7 @@
 			"category": "Ops",
 			"description": "Prepare a release (version, changelog, tag)",
 			"when": "git",
-			"prompt": "Prepare a release for this project (branch {{branch}}): check `git log` since the last tag, then bump the version in package.json (or the equivalent location) to the next version, and add a changelog entry under that exact version summarizing the changes. The changelog entry must use the same version number now set in package.json — never add a changelog section for a version that package.json does not yet contain, and never leave an 'Unreleased' or placeholder version heading. Create a git tag if git present. Do not push."
+			"prompt": "Prepare a release for this project (branch {{branch}}): check `git log` since the last tag, then bump the project's version to the next version in its version manifest (e.g. package.json, Cargo.toml, pyproject.toml, go.mod, pom.xml — find where the current version is declared), and add a changelog entry under that exact version summarizing the changes (in the project's changelog file, e.g. CHANGELOG.md). The changelog entry must use the same version number now set in the version manifest — never add a changelog section for a version the manifest does not yet contain, and never leave an 'Unreleased' or placeholder version heading. Create a git tag if git present. Do not push."
 		},
 		{
 			"name": "Commit",
