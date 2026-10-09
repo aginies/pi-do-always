@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`/do-always testplan [ok|malformed|last]`**: test mode that dry-runs the
+  post-plan questionnaire flow (parse → diagnostics → questionnaire →
+  execution prompt) without a real Plan run. `ok` (default) uses a
+  well-formed sample reply with a closed `plan` block; `malformed` uses the
+  failure mode observed in the wild (unclosed fence, JSON cut off before the
+  root brace, trailing tool-call XML tags); `last` uses the last assistant
+  reply of the session — the way to check why the questionnaire was or
+  wasn't offered after a real Plan run. The parser's verdict is always
+  reported, and confirming in test mode prints the execution prompt instead
+  of sending it (nothing is executed, and the real `/do-always replan`
+  state is left untouched).
+
 ## [0.19.0] - 2026-10-09
 
 ### Added

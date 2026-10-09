@@ -13,6 +13,8 @@ import {
 	DEFAULT_TASKS,
 	MAX_FILES_LISTED,
 	PROMPT_CONTEXT_KEYS,
+	TEST_PLAN_SAMPLE_MALFORMED,
+	TEST_PLAN_SAMPLE_OK,
 	buildTableRows,
 	chainAdd,
 	chainClear,
@@ -2301,6 +2303,32 @@ test("isPlanTask matches the Plan category case-insensitively", () => {
 	assert.equal(isPlanTask({ name: "x", prompt: "p", category: " plan " }), true);
 	assert.equal(isPlanTask({ name: "x", prompt: "p", category: "Do" }), false);
 	assert.equal(isPlanTask({ name: "x", prompt: "p" }), false);
+});
+
+// ── Test-mode samples (/do-always testplan) ────────────────────────────────
+
+test("TEST_PLAN_SAMPLE_OK parses through the strict path and strips cleanly", () => {
+	const p = parsePlanProposal(TEST_PLAN_SAMPLE_OK);
+	assert.ok(p);
+	assert.equal(p.tiers.length, 2);
+	assert.equal(p.tiers.reduce((n, t) => n + t.items.length, 0), 2);
+	assert.deepEqual(planBlockDiagnostics(TEST_PLAN_SAMPLE_OK), { kind: "ok", itemCount: 2 });
+	// The closed fence is stripped from the transcript.
+	const { text, removed } = stripPlanBlocks(TEST_PLAN_SAMPLE_OK);
+	assert.ok(removed);
+	assert.ok(!text.includes("```plan"));
+});
+
+test("TEST_PLAN_SAMPLE_MALFORMED parses through the lenient path (unclosed fence, truncated JSON, trailing tags)", () => {
+	const p = parsePlanProposal(TEST_PLAN_SAMPLE_MALFORMED);
+	assert.ok(p);
+	assert.equal(p.tiers.length, 2);
+	assert.equal(p.tiers.reduce((n, t) => n + t.items.length, 0), 3);
+	assert.deepEqual(planBlockDiagnostics(TEST_PLAN_SAMPLE_MALFORMED), { kind: "ok", itemCount: 3 });
+	// The unclosed fence is NOT stripped from the transcript (strip only
+	// removes closed blocks) — the block stays visible while the
+	// questionnaire still parses the raw capture.
+	assert.equal(stripPlanBlocks(TEST_PLAN_SAMPLE_MALFORMED).removed, false);
 });
 
 // ── Robust plan block extraction & lenient parsing ─────────────────────────

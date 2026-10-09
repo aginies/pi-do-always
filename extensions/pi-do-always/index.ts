@@ -29,6 +29,10 @@
  *   /do-always review  → fill prompt for task named "review"
  *   /do-always list    → print the task list
  *   /do-always list-details → show the full prompt text each task injects
+ *   /do-always testplan [ok|malformed|last] → dry-run the plan questionnaire
+ *       on a sample reply (or the last assistant reply): shows what the
+ *       parser concluded and offers the questionnaire; confirming prints
+ *       the execution prompt instead of sending it
  *
  * If no config file exists, built-in default tasks are used.
  */
@@ -56,6 +60,8 @@ import {
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
 	PLAN_OUTPUT_INSTRUCTION,
+	TEST_PLAN_SAMPLE_MALFORMED,
+	TEST_PLAN_SAMPLE_OK,
 	assistantText,
 	buildTableRows,
 	chainAdd,
@@ -989,6 +995,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// Cleared on agent_start (a new run makes it stale), agent_end (consumed
 	// or discarded), and session start.
 	let pendingPlanRaw: string | null = null;
+	// The last completed assistant reply's text, remembered at agent_end for
+	// `/do-always testplan last` (dry-run the questionnaire on the real reply
+	// to see why the questionnaire was or wasn't offered). Cleared on
+	// session start.
+	let lastAssistantText: string | null = null;
 
 	/** Clear the auto-run summary flag and its grace timer (session start). */
 	function resetPendingSummary(): void {
@@ -998,6 +1009,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		pendingProposal = null;
 		lastProposal = null;
 		pendingPlanRaw = null;
+		lastAssistantText = null;
 		if (pendingSummaryTimer) {
 			clearTimeout(pendingSummaryTimer);
 			pendingSummaryTimer = null;
@@ -1050,6 +1062,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	async function offerPlanProposal(
 		captured: { taskName: string; text: string },
 		ctx: ExtensionContext | null,
+		opts: { dryRun?: boolean } = {},
 	): Promise<void> {
 		const proposal = parsePlanProposal(captured.text);
 		if (!ctx) return;
@@ -1084,8 +1097,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return;
 		}
 		// Remember the last offered proposal so /do-always replan can re-open
-		// it after a withdrawal.
-		lastProposal = captured;
+		// it after a withdrawal. Dry-run (testplan) must not pollute the real
+		// replan state.
+		if (!opts.dryRun) lastProposal = captured;
 		if (ctx.mode !== "tui") {
 			// Non-TUI: list the proposed items so the user can reply with a
 			// selection; nothing is sent automatically.
@@ -1099,13 +1113,22 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		}
 		const result = await showPlanQuestionnaire(ctx, proposal, captured.taskName);
 		if (result.kind === "confirm") {
-			lastProposal = null; // executed — nothing left to re-offer
+			if (!opts.dryRun) lastProposal = null; // executed — nothing left to re-offer
 			const prompt = formatPlanExecutionPrompt(result.items, captured.taskName);
-			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-			ctx.ui.notify(
-				`do-always: executing ${result.items.length} selected item(s) from the "${captured.taskName}" plan`,
-				"info",
-			);
+			if (opts.dryRun) {
+				// Test mode: show exactly what would be sent, without starting
+				// a run on sample items.
+				ctx.ui.notify(
+					`do-always: test mode — confirm dry-run, execution prompt NOT sent:\n${prompt}`,
+					"info",
+				);
+			} else {
+				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+				ctx.ui.notify(
+					`do-always: executing ${result.items.length} selected item(s) from the "${captured.taskName}" plan`,
+					"info",
+				);
+			}
 		} else {
 			ctx.ui.notify(`do-always: plan withdrawn — no action taken (re-open with /do-always replan)`, "info");
 		}
@@ -1789,6 +1812,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// the next action sees the new tree (a running chain keeps its own
 		// per-action snapshot and is unaffected).
 		contextCache = null;
+		// Remember the last completed reply for /do-always testplan last.
+		const lastAssistantForTest = lastAssistantMessage(event.messages);
+		if (lastAssistantForTest) lastAssistantText = assistantText(lastAssistantForTest.content);
 		// Single auto-run task summary (no chainWaiter: pi.sendUserMessage is
 		// fire-and-forget, so no armWaiter is called).
 		if (!chainWaiter && pendingSummaryTask) {
@@ -2988,6 +3014,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				{ value: "list-details", label: "list-details" },
 				{ value: "replan", label: "replan" },
 				{ value: "questionnaire", label: "questionnaire (toggle)" },
+				{ value: "testplan", label: "testplan (dry-run the plan questionnaire)" },
 				...visible.map((t, i) => ({ value: t.name, label: `${i + 1}. ${t.name}` })),
 			].filter((c) => c.value.toLowerCase().includes(p));
 			return matches.length > 0 ? matches : null;
@@ -3057,6 +3084,59 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					: "do-always: questionnaire disabled (plan proposals will not be offered)",
 				"info",
 			);
+			return;
+		}
+
+		// Test mode: dry-run the post-plan questionnaire flow (parse →
+		// diagnostics → questionnaire → execution prompt) without a real Plan
+		// run. Samples: "ok" (default) is a well-formed reply with a closed
+		// plan block; "malformed" is the failure mode observed in the wild
+		// (unclosed fence, JSON cut off before the root brace, trailing
+		// tool-call XML tags); "last" uses the last assistant reply of this
+		// session — the way to check why the questionnaire was or wasn't
+		// offered after a real Plan run. Confirming never sends anything:
+		// the execution prompt is printed instead.
+		if (arg.toLowerCase().startsWith("testplan")) {
+			const [, sub = "ok"] = arg.toLowerCase().split(/\s+/);
+			let text: string;
+			let label: string;
+			if (sub === "last") {
+				if (!lastAssistantText) {
+					ctx.ui.notify("do-always: testplan — no assistant reply captured yet in this session — run something first", "info");
+					return;
+				}
+				text = lastAssistantText;
+				label = "the last assistant reply";
+			} else if (sub === "malformed") {
+				text = TEST_PLAN_SAMPLE_MALFORMED;
+				label = "the malformed sample (unclosed fence, truncated JSON, trailing tool tags)";
+			} else if (sub === "ok") {
+				text = TEST_PLAN_SAMPLE_OK;
+				label = "the well-formed sample";
+			} else {
+				ctx.ui.notify("do-always: testplan [ok|malformed|last] — unknown sample (use ok, malformed, or last)", "info");
+				return;
+			}
+			// Always say what the parser concluded — that is the point of the
+			// test mode (it mirrors offerPlanProposal's decision exactly).
+			const diag = planBlockDiagnostics(text);
+			if (diag.kind === "none") {
+				ctx.ui.notify(`do-always: testplan — no plan block found in ${label}`, "warning");
+				return;
+			}
+			if (diag.kind === "malformed") {
+				ctx.ui.notify(`do-always: testplan — the plan block in ${label} is not valid JSON (${diag.detail})`, "warning");
+				return;
+			}
+			if (diag.kind === "empty") {
+				ctx.ui.notify(`do-always: testplan — the plan block in ${label} parsed but has no action items`, "warning");
+				return;
+			}
+			ctx.ui.notify(
+				`do-always: testplan — ${diag.itemCount} item(s) parsed from ${label}; the questionnaire follows (dry-run: confirming prints the execution prompt instead of sending it)`,
+				"info",
+			);
+			void offerPlanProposal({ taskName: "Test plan", text }, ctx, { dryRun: true });
 			return;
 		}
 

@@ -1618,6 +1618,33 @@ export const PLAN_OUTPUT_INSTRUCTION =
 	"- The fenced block must contain ONLY the JSON — no explanation, no comments, no text after the closing }\n" +
 	"- The plan block must be the very last thing in your reply\n";
 
+/**
+ * Sample reply for `/do-always testplan`: a well-formed reply whose closed
+ * "plan" block parses through the strict path. Lets the user dry-run the
+ * plan questionnaire (parse → selection → execution prompt) without a real
+ * Plan run or a model in the loop.
+ */
+export const TEST_PLAN_SAMPLE_OK =
+	"Reviewed the changes. Two issues found: a race in the cache invalidation and a missing null check.\n\n" +
+	"```plan\n" +
+	'{"summary":"Fix cache race and null check in src/cache.ts","tiers":[{"id":"P0","label":"Critical","items":[{"title":"Fix cache invalidation race","detail":"src/cache.ts:42 — invalidate() can run between get() and set()"}]},{"id":"P1","label":"Important","items":[{"title":"Add null check for missing key","detail":"src/cache.ts:87 — throws when the key is absent"}]}]}\n' +
+	"```\n";
+
+/**
+ * Sample reply for `/do-always testplan malformed`: the failure mode observed
+ * in the wild — the fence is never closed, the JSON is cut off before the
+ * root closing brace, and the reply ends with leaked tool-call XML tags.
+ * Parses only through the lenient path (unclosed fence + auto-closed braces);
+ * its unclosed fence is not stripped from the transcript.
+ */
+export const TEST_PLAN_SAMPLE_MALFORMED =
+	"Review finished. The plan:\n\n" +
+	"```plan\n" +
+	'{"summary":"Fix 2 test failures and remove dead code","tiers":[{"id":"P0","label":"Critical","items":[{"title":"Fix stale timestamp test","detail":"test_mocap.py:619 — pass with_cap=False to restore the old phase boundaries"},{"title":"Align the 5 divergent version strings","detail":"mocap_core.py:55 says 1.2.0, fake_mocap_stream.py:41 says 1.4.0"}]},{"id":"P1","label":"High","items":[{"title":"Remove unused CaptorPlacement class","detail":"mocap_core.py:290-300 — built at import but never consumed"}]}]\n' +
+	"</parameter>\n" +
+	"</function>\n" +
+	"</tool_call>";
+
 /** One concrete action item proposed by a Plan run. */
 export interface PlanItem {
 	/** Short action description. */
