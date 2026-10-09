@@ -1565,11 +1565,15 @@ export function formatCommitReviewPrompt(commits: SelectedCommit[]): string {
  * place so every Plan prompt shares the same contract.
  */
 export const PLAN_OUTPUT_INSTRUCTION =
-	"End your reply with a machine-readable plan block: a fenced code block tagged plan (```plan) containing JSON of exactly this shape: " +
-	'{"summary":"one-line summary","tiers":[{"id":"P0","label":"Critical","items":[{"title":"short action","detail":"where and why (file:line if known)"}]}]}. ' +
-	"One tier per priority level, most urgent first (P0, P1, P2, ...). " +
-	"Each item must be one concrete, independently doable action. " +
-	'Use an empty "tiers" array when no action is needed.';
+	"Plan block (required):\n" +
+	"End your reply with a fenced code block tagged plan (\`\`\`plan) containing ONLY the JSON object — nothing else:\n" +
+	'{"summary":"one-line summary","tiers":[{"id":"P0","label":"Critical","items":[{"title":"short action","detail":"where and why (file:line if known)"}]}]}\n' +
+	"Rules:\n" +
+	"- One tier per priority level, most urgent first (P0, P1, P2, …)\n" +
+	"- Each item must be one concrete, independently doable action\n" +
+	"- Use an empty \"tiers\" array when no action is needed\n" +
+	"- The fenced block must contain ONLY the JSON — no explanation, no comments, no text after the closing }\n" +
+	"- The plan block must be the very last thing in your reply\n";
 
 /** One concrete action item proposed by a Plan run. */
 export interface PlanItem {

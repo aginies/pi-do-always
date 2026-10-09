@@ -1033,7 +1033,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		const base = renderPrompt(task.prompt, ctx);
 		const enabled = task.questionnaire ?? questionnaireEnabled;
 		if (isPlanTask(task) && enabled && !base.includes("```plan")) {
-			return `${base}\n\n${PLAN_OUTPUT_INSTRUCTION}`;
+			// Prepend so the LLM sees the instruction first (more reliable in long sessions)
+			return `${PLAN_OUTPUT_INSTRUCTION}\n\n${base}`;
 		}
 		return base;
 	}

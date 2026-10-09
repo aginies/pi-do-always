@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.0] - 2026-10-09
+
+### Changed
+
+- The plan-block instruction is now **prepended** to the task prompt instead of
+  appended, making it more prominent and reliable — especially in long sessions
+  where tail-end instructions are easily ignored.
+- The instruction text was restructured: added a clear "Plan block (required):"
+  header, the JSON shape is shown on its own line, rules use bullet points,
+  and an explicit rule states the fenced block must contain ONLY the JSON with
+  no explanation or comments after the closing `}`.
+
 ## [0.17.0] - 2026-10-08
 
 ### Changed
