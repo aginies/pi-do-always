@@ -1032,7 +1032,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	function renderTaskPrompt(task: DoAlwaysTask, ctx: Record<string, string>): string {
 		const base = renderPrompt(task.prompt, ctx);
 		const enabled = task.questionnaire ?? questionnaireEnabled;
-		if (isPlanTask(task) && enabled && !base.includes("```plan")) {
+		if (isPlanTask(task) && enabled && !/(?:```+|~~~+)[^\S\n]*plan\b/i.test(base)) {
 			// Prepend so the LLM sees the instruction first (more reliable in long sessions)
 			return `${PLAN_OUTPUT_INSTRUCTION}\n\n${base}`;
 		}
@@ -1763,10 +1763,17 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// reply is the user's content and stays in the transcript.
 		if (!task || !isPlanTask(task) || !(task.questionnaire ?? questionnaireEnabled)) return;
 		const text = assistantText(event.message.content);
-		if (!text.includes("```plan")) return;
+		const hasFence = /(?:```+|~~~+)[^\S\n]*plan\b/i.test(text);
+		if (!hasFence && !pendingPlanRaw) return;
 		// Capture the raw (unstripped) text for the questionnaire — after the
-		// strip below the message text no longer carries the block.
-		pendingPlanRaw = text;
+		// strip below the message text no longer carries the block. If an earlier
+		// message began the block, append this turn's text so split fences / trailing
+		// tags are included in the capture.
+		if (pendingPlanRaw) {
+			pendingPlanRaw += "\n" + text;
+		} else {
+			pendingPlanRaw = text;
+		}
 		// TUI-only strip: in non-TUI modes the block stays in the transcript
 		// so the model can resolve the item-number replies the notification
 		// offers (and the session file keeps the proposal on record).

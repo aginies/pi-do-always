@@ -1650,10 +1650,33 @@ export function isPlanTask(task: DoAlwaysTask): boolean {
 }
 
 /**
- * Matches a fenced code block whose info string is "plan" (trailing
- * whitespace allowed). The lazy body stops at the first closing fence.
+ * Matches a closed fenced code block whose info string starts with "plan"
+ * (case-insensitive, optional whitespace before "plan", e.g. ```plan, ```plan json, ```plan:json).
  */
-const PLAN_FENCE_RE = /```plan[^\S\n]*\r?\n([\s\S]*?)```/gi;
+const PLAN_CLOSED_FENCE_RE = /(?:```+|~~~+)[^\S\n]*plan\b[^\n]*\r?\n([\s\S]*?)[^\S\n]*(?:```+|~~~+)/gi;
+
+/**
+ * Extract all plan code block bodies from text. Handles closed fences as well as
+ * unclosed fences at the end of the text (e.g. when an LLM truncates or emits tool tags).
+ */
+export function extractPlanFences(text: string): { body: string; closed: boolean }[] {
+	if (typeof text !== "string" || text === "") return [];
+	const results: { body: string; closed: boolean }[] = [];
+	const closedRe = new RegExp(PLAN_CLOSED_FENCE_RE.source, "gi");
+	let lastEnd = 0;
+	let match: RegExpExecArray | null;
+	while ((match = closedRe.exec(text)) !== null) {
+		results.push({ body: match[1], closed: true });
+		lastEnd = match.index + match[0].length;
+	}
+	// Check for an unclosed fence after the last closed fence (or anywhere if no closed fences).
+	const remainder = text.slice(lastEnd);
+	const unclosedMatch = remainder.match(/(?:```+|~~~+)[^\S\n]*plan\b[^\n]*\r?\n([\s\S]*)$/i);
+	if (unclosedMatch) {
+		results.push({ body: unclosedMatch[1], closed: false });
+	}
+	return results;
+}
 
 /**
  * Remove every fenced plan block from `text`, collapsing the blank lines
@@ -1665,16 +1688,157 @@ const PLAN_FENCE_RE = /```plan[^\S\n]*\r?\n([\s\S]*?)```/gi;
  */
 export function stripPlanBlocks(text: string): { text: string; removed: boolean } {
 	if (typeof text !== "string" || text === "") return { text, removed: false };
-	if (!text.includes("```plan")) return { text, removed: false };
-	// An unclosed fence (no closing ```) matches nothing: leave the text
-	// alone instead of claiming a removal that didn't happen.
-	if ([...text.matchAll(PLAN_FENCE_RE)].length === 0) return { text, removed: false };
+	if (!/(?:```+|~~~+)[^\S\n]*plan\b/i.test(text)) return { text, removed: false };
+	const closedRe = new RegExp(PLAN_CLOSED_FENCE_RE.source, "gi");
+	const matches = [...text.matchAll(closedRe)];
+	if (matches.length === 0) return { text, removed: false };
 	const stripped = text
-		.replace(PLAN_FENCE_RE, "")
+		.replace(closedRe, "")
 		.replace(/\n{3,}/g, "\n\n")
 		.replace(/^\s+/, "")
 		.replace(/\s+$/, "");
 	return { text: stripped, removed: true };
+}
+
+/**
+ * Escape literal newlines, carriage returns, and tabs that appear inside JSON
+ * string literals (common when LLMs word-wrap long strings in output).
+ */
+function sanitizeJsonStrings(str: string): string {
+	let inString = false;
+	let escaped = false;
+	let out = "";
+	for (let i = 0; i < str.length; i++) {
+		const ch = str[i];
+		if (inString) {
+			if (escaped) {
+				out += ch;
+				escaped = false;
+			} else if (ch === "\\") {
+				out += ch;
+				escaped = true;
+			} else if (ch === '"') {
+				out += ch;
+				inString = false;
+			} else if (ch === "\n") {
+				out += "\\n";
+			} else if (ch === "\r") {
+				out += "\\r";
+			} else if (ch === "\t") {
+				out += "\\t";
+			} else {
+				out += ch;
+			}
+		} else {
+			if (ch === '"') {
+				inString = true;
+			}
+			out += ch;
+		}
+	}
+	return out;
+}
+
+/**
+ * Extract a balanced JSON object from `str`, stripping leading/trailing non-JSON
+ * text (such as XML tags `</parameter>` or explanatory notes). Auto-closes
+ * missing root brackets/braces if the JSON was cut off at the end.
+ */
+function extractJsonObject(str: string): string | null {
+	const start = str.indexOf("{");
+	if (start === -1) return null;
+	let inString = false;
+	let escaped = false;
+	const stack: string[] = [];
+	let end = -1;
+
+	for (let i = start; i < str.length; i++) {
+		const ch = str[i];
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+			} else if (ch === "\\") {
+				escaped = true;
+			} else if (ch === '"') {
+				inString = false;
+			}
+		} else {
+			if (ch === '"') {
+				inString = true;
+			} else if (ch === "{" || ch === "[") {
+				stack.push(ch === "{" ? "}" : "]");
+			} else if (ch === "}" || ch === "]") {
+				if (stack.length > 0 && stack[stack.length - 1] === ch) {
+					stack.pop();
+				}
+				if (stack.length === 0) {
+					end = i;
+					break;
+				}
+			}
+		}
+	}
+
+	if (end !== -1) {
+		return str.slice(start, end + 1);
+	}
+	if (stack.length > 0) {
+		let candidate = str.slice(start);
+		const tagMatch = candidate.search(/<\/?[a-zA-Z_-]+/);
+		if (tagMatch !== -1) {
+			candidate = candidate.slice(0, tagMatch);
+		}
+		candidate = candidate.trim();
+		const subStack: string[] = [];
+		inString = false;
+		escaped = false;
+		for (let i = 0; i < candidate.length; i++) {
+			const ch = candidate[i];
+			if (inString) {
+				if (escaped) escaped = false;
+				else if (ch === "\\") escaped = true;
+				else if (ch === '"') inString = false;
+			} else {
+				if (ch === '"') inString = true;
+				else if (ch === "{" || ch === "[") subStack.push(ch === "{" ? "}" : "]");
+				else if (ch === "}" || ch === "]") {
+					if (subStack.length > 0 && subStack[subStack.length - 1] === ch) subStack.pop();
+				}
+			}
+		}
+		if (inString) candidate += '"';
+		return candidate + subStack.reverse().join("");
+	}
+	return null;
+}
+
+/**
+ * Parse JSON with fallbacks for common LLM quirks:
+ * 1. Direct JSON.parse
+ * 2. Extracting { ... } ignoring trailing tags/prose and auto-closing missing braces
+ * 3. Sanitizing literal newlines inside string literals
+ */
+function parseLenientJson(raw: string): { data: unknown; error: string | null } {
+	try {
+		return { data: JSON.parse(raw.trim()), error: null };
+	} catch (err1) {
+		const extracted = extractJsonObject(raw);
+		if (extracted) {
+			try {
+				return { data: JSON.parse(extracted), error: null };
+			} catch (err2) {
+				try {
+					const sanitized = sanitizeJsonStrings(extracted);
+					return { data: JSON.parse(sanitized), error: null };
+				} catch (err3) {
+					const rawErr = err3 instanceof Error ? err3.message : String(err3);
+					return { data: null, error: rawErr };
+				}
+			}
+		}
+		const rawErr = err1 instanceof Error ? err1.message : String(err1);
+		return { data: null, error: rawErr };
+	}
 }
 
 /**
@@ -1687,9 +1851,9 @@ export function stripPlanBlocks(text: string): { text: string; removed: boolean 
  */
 export function parsePlanProposal(text: string): PlanProposal | null {
 	if (typeof text !== "string" || text === "") return null;
-	const fences = [...text.matchAll(PLAN_FENCE_RE)];
+	const fences = extractPlanFences(text);
 	for (let i = fences.length - 1; i >= 0; i--) {
-		const proposal = normalizePlanJson(fences[i][1]);
+		const proposal = normalizePlanJson(fences[i].body);
 		if (proposal) return proposal;
 	}
 	return null;
@@ -1709,26 +1873,24 @@ export type PlanBlockDiagnostic =
 
 export function planBlockDiagnostics(text: string): PlanBlockDiagnostic {
 	if (typeof text !== "string" || text === "") return { kind: "none" };
-	const fences = [...text.matchAll(PLAN_FENCE_RE)];
+	const fences = extractPlanFences(text);
 	if (fences.length === 0) return { kind: "none" };
 	let lastError: string | null = null;
 	let parsedButEmpty = false;
 	for (let i = fences.length - 1; i >= 0; i--) {
-		try {
-			JSON.parse(fences[i][1].trim());
-		} catch (err) {
+		const parsed = parseLenientJson(fences[i].body);
+		if (parsed.error !== null) {
 			// The loop runs last-to-first, so the first error seen is the
 			// last block's — the agent's final answer, which is the one to
 			// report. Strip the position suffix from JSON.parse errors
 			// ("at position N (line L column C)") so the message is readable
 			// in a large plan block where the position number is meaningless.
 			if (lastError === null) {
-				const raw = err instanceof Error ? err.message : String(err);
-				lastError = raw.replace(/\s+at\s+position\s+\d+(?:\s*\(line\s+\d+\s+column\s+\d+\))?/, "");
+				lastError = parsed.error.replace(/\s+at\s+position\s+\d+(?:\s*\(line\s+\d+\s+column\s+\d+\))?/, "");
 			}
 			continue;
 		}
-		const proposal = normalizePlanJson(fences[i][1]);
+		const proposal = normalizePlanData(parsed.data);
 		if (proposal) {
 			const count = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
 			if (count > 0) return { kind: "ok", itemCount: count };
@@ -1748,12 +1910,11 @@ export function planBlockDiagnostics(text: string): PlanBlockDiagnostic {
  * null.
  */
 function normalizePlanJson(raw: string): PlanProposal | null {
-	let data: unknown;
-	try {
-		data = JSON.parse(raw.trim());
-	} catch {
-		return null;
-	}
+	const { data } = parseLenientJson(raw);
+	return normalizePlanData(data);
+}
+
+function normalizePlanData(data: unknown): PlanProposal | null {
 	if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
 	const obj = data as Record<string, unknown>;
 	const summary =

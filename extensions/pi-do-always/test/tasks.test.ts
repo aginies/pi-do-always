@@ -2302,3 +2302,114 @@ test("isPlanTask matches the Plan category case-insensitively", () => {
 	assert.equal(isPlanTask({ name: "x", prompt: "p", category: "Do" }), false);
 	assert.equal(isPlanTask({ name: "x", prompt: "p" }), false);
 });
+
+// ── Robust plan block extraction & lenient parsing ─────────────────────────
+
+test("parsePlanProposal parses an unclosed plan fence at end of text", () => {
+	const text = "Review finished:\n```plan\n{\"tiers\":[{\"items\":[{\"title\":\"unclosed item\"}]}]}\n";
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers.length, 1);
+	assert.equal(p.tiers[0].items[0].title, "unclosed item");
+});
+
+test("parsePlanProposal accepts fence variations (plan json, plan:json, indented, tildes)", () => {
+	const variations = [
+		'```plan json\n{"tiers":[{"items":[{"title":"var1"}]}]}\n```',
+		'```plan:json\n{"tiers":[{"items":[{"title":"var2"}]}]}\n```',
+		'``` plan\n{"tiers":[{"items":[{"title":"var3"}]}]}\n```',
+		'````plan\n{"tiers":[{"items":[{"title":"var4"}]}]}\n````',
+		'~~~plan\n{"tiers":[{"items":[{"title":"var5"}]}]}\n~~~',
+		'```plan\n{"tiers":[{"items":[{"title":"var6"}]}]}\n   ```',
+	];
+	for (const v of variations) {
+		const p = parsePlanProposal(v);
+		assert.ok(p, `failed to parse variation: ${v}`);
+		assert.equal(p.tiers[0].items.length, 1);
+	}
+});
+
+test("parsePlanProposal parses blocks with trailing tool XML tags", () => {
+	const text =
+		"Review finished.\n```plan\n" +
+		'{"tiers":[{"items":[{"title":"clean dead code"}]}]}\n' +
+		"  </parameter>\n" +
+		"  </function>\n" +
+		"  </tool_call>\n";
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers[0].items[0].title, "clean dead code");
+	const diag = planBlockDiagnostics(text);
+	assert.deepEqual(diag, { kind: "ok", itemCount: 1 });
+});
+
+test("parsePlanProposal handles unescaped newlines in JSON strings from word wrapping", () => {
+	const text =
+		"```plan\n" +
+		'{"summary":"First line of summary\nsecond line of summary","tiers":[{"items":[{"title":"Long title with\nwrapped line","detail":"Long detail with\nwrapped line"}]}]}\n' +
+		"```";
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.ok(p.summary?.includes("First line of summary"));
+	assert.ok(p.tiers[0].items[0].title.includes("Long title with"));
+	assert.ok(p.tiers[0].items[0].detail?.includes("Long detail with"));
+});
+
+test("parsePlanProposal auto-balances missing root closing braces", () => {
+	// Cut off before the root closing brace
+	const text = '```plan\n{"tiers":[{"items":[{"title":"item"}]}]';
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers[0].items[0].title, "item");
+});
+
+test("parsePlanProposal successfully parses the full MoCap report sample", () => {
+	const text =
+		"```plan                                                                                                                       \n" +
+		'  {"summary":"Fix 2 pre-existing test failures, remove 5 dead code items, consolidate 5 duplicated-logic sites across the     \n' +
+		'Python MoCap stack, behavior unchanged","tiers":[{"id":"P0","label":"Critical","items":[{"title":"Align the 5 divergent       \n' +
+		'version strings to one value (1.4.0)","detail":"test_version_number fails: mocap_core.py:55, mocap_server.py:30,              \n' +
+		'mocap_web_server.py:63 say 1.2.0, fake_mocap_stream.py:41 says 1.4.0, firmware/src/esp32_mocap.ino:71 FIRMWARE_VERSION says   \n' +
+		'1.3.0. Bump core/server/web and firmware to 1.4.0 (metadata only)."},{"title":"Fix stale test_fake_mocap_stream_generation    \n' +
+		'timestamps","detail":"test_mocap.py:619-627: generate_motion(2.0/7.0/12.0) now lands in the new Phase 0 (capacities demo).    \n' +
+		'Pass with_cap=False to the three generate_motion calls to restore the pre-Phase-0 phase boundaries the assertions were written\n' +
+		'against; no generator change."}]},{"id":"P1","label":"High","items":[{"title":"Remove                                         \n' +
+		'MocapReceiver.compute_frame","detail":"mocap_core.py:972-974 — never called anywhere; record_frame() is a strict superset     \n' +
+		'(same compute_pose + frame bookkeeping)."},{"title":"Remove dead quat helpers in                                              \n' +
+		'mocap_biomechanics","detail":"mocap_biomechanics.py:276-290 quat_to_euler_rad and :292-305 euler_rad_to_quat — zero references\n' +
+		'in all modules and tests (confirmed by AST sweep)."},{"title":"Remove unused KALI_TRACKER_TO_JOINT                            \n' +
+		'alias","detail":"mocap_core.py:335 — alias of TRACKER_TO_JOINT, no consumer in code, tests, or docs."},{"title":"Remove unused\n' +
+		'CaptorPlacement class and CAPTOR_PLACEMENTS dict","detail":"mocap_core.py:290-300 and :338-362 — built at import but never    \n' +
+		'consumed. Keep the fail-fast check by replacing with a direct assert that every TRACKER_TO_JOINT joint exists in SEGMENT_MAP  \n' +
+		'and REST_POSITIONS (preserves import-time validation behavior)."}]},{"id":"P2","label":"Medium","items":[{"title":"Consolidate\n' +
+		'quat primitives into mocap_biomechanics","detail":"Delete mocap_core.py:406-430 (quat_multiply, quat_conjugate,               \n' +
+		'quat_normalize) and import them from mocap_biomechanics (identical, :191-212) so mocap_core.* names keep working for          \n' +
+		'mocap_web_server imports. Note: zero-quaternion edge case changes NaN -> identity (strictly safer, only on corrupted          \n' +
+		'packets)."},{"title":"Move SENSOR_MAPPING to mocap_core, import in both servers","detail":"Identical 23-entry dicts at        \n' +
+		'mocap_server.py:38 and mocap_web_server.py:79 (comments differ only). Define once in mocap_core.py next to TRACKER_TO_JOINT;  \n' +
+		'both files import it."},{"title":"Extract shared UDP frame parser in mocap_core","detail":"Three drifted copies of the        \n' +
+		'NODE#seq#txmicros;sid,q0..q3[,ax,ay,az] text parser: mocap_core.py:883 _process_packet, mocap_web_server.py:776               \n' +
+		'process_packet, mocap_server.py:65 parse_packet. Add parse_udp_frame(message) -> (node_id, seq, tx_timestamp, sensors) in     \n' +
+		"mocap_core and use it in all three; keep each caller's post-parse policy (enabled-sensor filtering, state updates) intact.    \n" +
+		'Medium risk — verify with the full test suite."},{"title":"Unify _to_float / _safe_float","detail":"Identical bodies at       \n' +
+		'mocap_core.py:474 and mocap_analysis.py:184. Keep one in mocap_core (public name) and import it in                            \n' +
+		'mocap_analysis.py."},{"title":"Build remaining quat->Euler copies on the shared core                                          \n' +
+		'function","detail":"mocap_web_server.py:198 quat_to_euler_deg and mocap_analysis.py:92 euler_from_quat duplicate              \n' +
+		'mocap_core.py:438 quat_to_euler (same ZYX formula). Reimplement the web version as rounded-degrees dict over core (keeps API  \n' +
+		'contract) and the analysis version as a zero-guard wrapper (keeps its zero-quat -> zeros                                      \n' +
+		'behavior)."}]},{"id":"P3","label":"Low","items":[{"title":"Decide fate of test-only                                           \n' +
+		'mocap_core.quat_inverse","detail":"mocap_core.py:421-426 is referenced only by test_mocap.py:154. Public API — keep by        \n' +
+		'default; only remove together with its test assertion if a slimmer API is desired."},{"title":"Optional: derive fake_stream   \n' +
+		'Phase-3 sequence from JOINT_CAPABILITIES","detail":"fake_mocap_stream.py:165-189 sequence table is nearly derivable from      \n' +
+		'JOINT_CAPABILITIES (:78-101) via _primary_axis, but the head entry (sid 22) intentionally uses pitch instead of its primary   \n' +
+		'yaw axis — consolidating would change the visible demo. Do only if that behavior change is accepted."}]}]                     \n' +
+		"  </parameter>                                                                                                                \n" +
+		"  </function>                                                                                                                 \n" +
+		"  </tool_call>";
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers.length, 4);
+	const totalItems = p.tiers.reduce((n, t) => n + t.items.length, 0);
+	assert.equal(totalItems, 13);
+	assert.deepEqual(planBlockDiagnostics(text), { kind: "ok", itemCount: 13 });
+});
