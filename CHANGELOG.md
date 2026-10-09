@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.19.0] - 2026-10-09
+
+### Added
+
+- **Task aliases**: tasks can declare an `aliases` array of short names that
+  resolve to the task on the command line (e.g. `"aliases": ["r", "rev"]`
+  lets `/do-always r` stand in for `/do-always review`). The object-form
+  config also accepts a global `aliases` map (e.g.
+  `{ "aliases": { "rc": "Review changes" } }`); keys and values are trimmed
+  and invalid entries are dropped. Aliases are case-insensitive, are tried
+  before the task's own name, and the project file's map wins over the
+  global one. Invalid per-task values (not an array of strings) are ignored
+  with a warning.
+
+### Changed
+
+- README: the Install section moved to the top (right after the intro),
+  and the new `aliases` fields are documented in Tasks configuration.
+- Docs: added a `plan_proposal.png` screenshot of the plan questionnaire;
+  removed the `PROPOSAL-hide-plan-block.md` proposal document (the feature
+  shipped in v0.17.0).
+
 ## [0.18.0] - 2026-10-09
 
 ### Changed
