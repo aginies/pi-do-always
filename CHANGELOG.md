@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.20.0] - 2026-10-09
 
 ### Added
 
@@ -17,6 +17,20 @@ All notable changes to this project will be documented in this file.
   reported, and confirming in test mode prints the execution prompt instead
   of sending it (nothing is executed, and the real `/do-always replan`
   state is left untouched).
+
+### Fixed
+
+- **Plan questionnaire silently skipped for malformed plan blocks**: plan
+  block parsing is now lenient — an unclosed `plan` fence at the end of a
+  reply is still captured, reply text is accumulated across messages when
+  the fence is split by trailing tool-call tags, and the JSON is recovered
+  even when it is cut off before the root closing brace, contains
+  unescaped newlines in strings, or is followed by leaked tool-call XML
+  tags (the failure mode observed in the wild). When a plan block still
+  cannot be parsed, the completion summary now reports why (malformed JSON
+  with the parse error) instead of silently skipping the questionnaire.
+  The plan-block instruction is also appended to Plan task prompts that
+  don't already mention a plan fence.
 
 ## [0.19.0] - 2026-10-09
 
