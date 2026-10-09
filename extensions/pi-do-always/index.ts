@@ -2979,6 +2979,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				{ value: "list", label: "list" },
 				{ value: "list-details", label: "list-details" },
 				{ value: "replan", label: "replan" },
+				{ value: "questionnaire", label: "questionnaire (toggle)" },
 				...visible.map((t, i) => ({ value: t.name, label: `${i + 1}. ${t.name}` })),
 			].filter((c) => c.value.toLowerCase().includes(p));
 			return matches.length > 0 ? matches : null;
@@ -3036,6 +3037,18 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				return;
 			}
 			void offerPlanProposal(lastProposal, ctx);
+			return;
+		}
+
+		// Toggle the questionnaire on/off for the rest of this session.
+		if (arg.toLowerCase() === "questionnaire") {
+			questionnaireEnabled = !questionnaireEnabled;
+			ctx.ui.notify(
+				questionnaireEnabled
+					? "do-always: questionnaire enabled (plan proposals will be offered)"
+					: "do-always: questionnaire disabled (plan proposals will not be offered)",
+				"info",
+			);
 			return;
 		}
 

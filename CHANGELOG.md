@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.17.0] - 2026-10-08
 
 ### Changed
 
@@ -20,6 +20,13 @@ All notable changes to this project will be documented in this file.
   (project file wins) to keep the block visible per task or globally.
 - The plan execution prompt no longer refers to the proposal "above" — the
   block is no longer in the transcript, so the prompt is self-contained.
+
+### Added
+
+- **`/do-always questionnaire`**: toggle the plan questionnaire on/off for
+  the rest of this session, without editing a config file or reloading Pi.
+  First call disables, second call re-enables. Per-task `questionnaire`
+  config still takes precedence over the global toggle.
 
 ## [0.16.0] - 2026-10-08
 
