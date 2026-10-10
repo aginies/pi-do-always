@@ -47,7 +47,8 @@ mouse-wheel scrolling, and click-to-select. While a filter is active, typed digi
 filter instead of picking by number; clear the filter (backspace) to use number-pick again.
 Pause on a task for two seconds and its full prompt is previewed below the list, so you can
 see exactly what will be injected before running it; moving the selection or typing hides it
-and restarts the delay. A task marked `⚡` runs immediately on selection (its prompt is sent,
+and restarts the delay. For Plan tasks the plan-block instruction that is prepended to the
+injected prompt is named in a one-line note instead of shown in full. A task marked `⚡` runs immediately on selection (its prompt is sent,
 not filled): the `Plan` category does this by default, and any task can opt in or out via the
 `autoRun` field.
 

@@ -1675,7 +1675,7 @@ export const TEST_PLAN_SAMPLE_OK =
  * in the wild — the fence is never closed, the JSON is cut off before the
  * root closing brace, and the reply ends with leaked tool-call XML tags.
  * Parses only through the lenient path (unclosed fence + auto-closed braces);
- * its unclosed fence is not stripped from the transcript.
+ * its unclosed fence is stripped from the transcript like a closed one.
  */
 export const TEST_PLAN_SAMPLE_MALFORMED =
 	"Review finished. The plan:\n\n" +
@@ -1746,25 +1746,48 @@ export function extractPlanFences(text: string): { body: string; closed: boolean
 }
 
 /**
+ * Matches a plan fence the reply never closed: the opening fence line plus
+ * everything to the end of the text (the body is captured). After the closed
+ * fences are removed, at most one such opening can remain, and its body runs
+ * to the end of the text by construction.
+ */
+const PLAN_UNCLOSED_FENCE_RE = /(?:```+|~~~+)[^\S\n]*plan\b[^\n]*\r?\n([\s\S]*)$/i;
+
+/**
  * Remove every fenced plan block from `text`, collapsing the blank lines
  * they leave behind and trimming the ends. The stripped text is what the
  * transcript shows (the message_end handler in index.ts replaces the
  * finalized message with it); the raw text is captured separately for the
- * questionnaire parser. `removed` is false when no plan fence was present
- * (the text is returned unchanged).
+ * questionnaire parser. A plan fence the reply never closed (the model
+ * truncated the block or leaked tool-call XML into it) is removed through
+ * the end of the text as well — the lenient parser reads it as the plan
+ * block, so the transcript must not keep it — but only when its region
+ * carries a parseable JSON object, so a prose mention of "```plan" mid-reply
+ * cannot delete the rest of the text. `removed` is false when no plan fence
+ * was present (the text is returned unchanged).
  */
 export function stripPlanBlocks(text: string): { text: string; removed: boolean } {
 	if (typeof text !== "string" || text === "") return { text, removed: false };
 	if (!/(?:```+|~~~+)[^\S\n]*plan\b/i.test(text)) return { text, removed: false };
 	const closedRe = new RegExp(PLAN_CLOSED_FENCE_RE.source, "gi");
 	const matches = [...text.matchAll(closedRe)];
-	if (matches.length === 0) return { text, removed: false };
-	const stripped = text
-		.replace(closedRe, "")
+	let stripped = text;
+	let removed = false;
+	if (matches.length > 0) {
+		stripped = stripped.replace(closedRe, "");
+		removed = true;
+	}
+	const unclosed = stripped.match(PLAN_UNCLOSED_FENCE_RE);
+	if (unclosed && parseLenientJson(unclosed[1]).error === null) {
+		stripped = stripped.slice(0, unclosed.index);
+		removed = true;
+	}
+	if (!removed) return { text, removed: false };
+	const collapsed = stripped
 		.replace(/\n{3,}/g, "\n\n")
 		.replace(/^\s+/, "")
 		.replace(/\s+$/, "");
-	return { text: stripped, removed: true };
+	return { text: collapsed, removed: true };
 }
 
 /**

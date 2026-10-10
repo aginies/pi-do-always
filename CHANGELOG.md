@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Plan block leaked into the transcript when the reply's fence was never
+  closed**: the transcript strip only removed closed `plan` fences, so the
+  failure mode the lenient parser already recovers (truncated block, leaked
+  tool-call XML tags, no closing fence) stayed visible at the end of the
+  reply. `stripPlanBlocks` now removes an unclosed plan fence through the
+  end of the text as well — guarded so a prose mention of "```plan" without
+  a parseable JSON object in its region cannot delete the rest of the reply.
+- **Selector preview showed the plan-block instruction instead of the task
+  prompt**: for Plan tasks the ten-line plan-block instruction is prepended
+  to the injected prompt, and the three-line preview window showed only it.
+  The preview now shows the task's own prompt and names the prepended plan
+  instruction in a one-line note; the injected prompt is unchanged.
+
 ## [0.21.0] - 2026-10-10
 
 ### Added

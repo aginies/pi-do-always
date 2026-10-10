@@ -1069,18 +1069,26 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		| { kind: "withdraw" };
 
 	/**
-	 * Render a task's prompt for injection or preview. Plan-category tasks get
-	 * PLAN_OUTPUT_INSTRUCTION appended (once) so the reply carries the
-	 * machine-readable "plan" block the questionnaire parses — but only when
-	 * the questionnaire is actually offered for this task, otherwise the agent
-	 * would emit a block nobody reads. A prompt that already mentions the plan
-	 * fence keeps its own contract; chain-step prompts are rendered with the
-	 * plain renderPrompt and never get it.
+	 * Split a task's prompt into its user-facing base and whether the plan
+	 * block instruction will be injected with it. Plan-category tasks get
+	 * PLAN_OUTPUT_INSTRUCTION (once) so the reply carries the machine-readable
+	 * "plan" block the questionnaire parses — but only when the questionnaire
+	 * is actually offered for this task, otherwise the agent would emit a block
+	 * nobody reads. A prompt that already mentions the plan fence keeps its own
+	 * contract; chain-step prompts are rendered with the plain renderPrompt and
+	 * never get it.
 	 */
-	function renderTaskPrompt(task: DoAlwaysTask, ctx: Record<string, string>): string {
+	function taskPromptParts(task: DoAlwaysTask, ctx: Record<string, string>): { base: string; plan: boolean } {
 		const base = renderPrompt(task.prompt, ctx);
 		const enabled = task.questionnaire ?? questionnaireEnabled;
-		if (isPlanTask(task) && enabled && !/(?:```+|~~~+)[^\S\n]*plan\b/i.test(base)) {
+		const plan = isPlanTask(task) && enabled && !/(?:```+|~~~+)[^\S\n]*plan\b/i.test(base);
+		return { base, plan };
+	}
+
+	/** Render a task's prompt for injection (see taskPromptParts for the gate). */
+	function renderTaskPrompt(task: DoAlwaysTask, ctx: Record<string, string>): string {
+		const { base, plan } = taskPromptParts(task, ctx);
+		if (plan) {
 			// Prepend so the LLM sees the instruction first (more reliable in long sessions)
 			return `${PLAN_OUTPUT_INSTRUCTION}\n\n${base}`;
 		}
@@ -2705,13 +2713,16 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				}
 
 				// Prompt preview: revealed after the cursor has been stable on a
-				// task row for PREVIEW_DELAY_MS, showing exactly what will be
-				// injected.
+				// task row for PREVIEW_DELAY_MS. Shows the task's own prompt; when
+				// the plan block instruction is part of the injected prompt it is
+				// named in one dim line instead of rendered in full (its ten lines
+				// would crowd the prompt out of the PREVIEW_MAX_LINES window).
 				if (previewVisible && cursor.kind === "cell" && cursor.col === "task") {
 					const sel = itemRows[cursor.row];
 					if (sel) {
 						const wrapWidth = Math.max(10, width - 4);
-						const wrapped = wrapTextWithAnsi(renderTaskPrompt(sel.task, strings), wrapWidth);
+						const { base, plan } = taskPromptParts(sel.task, strings);
+						const wrapped = wrapTextWithAnsi(base, wrapWidth);
 						const shown = wrapped.slice(0, PREVIEW_MAX_LINES);
 						const truncated = wrapped.length > PREVIEW_MAX_LINES;
 						lines.push("");
@@ -2721,6 +2732,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							const text = isLast && truncated ? truncateToWidth(`${ln} …`, wrapWidth, "") : ln;
 							lines.push(theme.fg("muted", `  ${text}`));
 						});
+						if (plan) {
+							lines.push(
+								theme.fg(
+									"dim",
+									truncateToWidth("  (+ plan block instruction prepended to the injected prompt)", width - 2, "…"),
+								),
+							);
+						}
 					}
 				}
 

@@ -2081,9 +2081,39 @@ test("stripPlanBlocks yields empty text when the block is the whole reply", () =
 	assert.equal(text, "");
 });
 
-test("stripPlanBlocks leaves an unclosed plan fence alone", () => {
-	const input = "```plan\n{\"tiers\":[{\"items\":[{\"title\":\"x\"}]}]}\n";
+test("stripPlanBlocks removes an unclosed plan fence with JSON at the end", () => {
+	const input = "Review done.\n\n```plan\n{\"tiers\":[{\"items\":[{\"title\":\"x\"}]}]}\n";
+	const { text, removed } = stripPlanBlocks(input);
+	assert.equal(removed, true);
+	assert.equal(text, "Review done.");
+});
+
+test("stripPlanBlocks removes an unclosed fence with split JSON objects and leaked tags", () => {
+	// The failure mode reported in the wild: two JSON objects (summary, then
+	// empty tiers), leaked tool-call XML, and a truncated closing tag — the
+	// fence is never closed, but the region carries parseable JSON.
+	const input =
+		"Here are five feature ideas.\n\n" +
+		"```plan\n" +
+		'  {"summary":"Propose 5 low-risk feature upgrades"}\n' +
+		'  {"tiers":[]}\n' +
+		"  </parameter>\n" +
+		"  </invoke>\n" +
+		"  </function>\n" +
+		"   _";
+	const { text, removed } = stripPlanBlocks(input);
+	assert.equal(removed, true);
+	assert.equal(text, "Here are five feature ideas.");
+});
+
+test("stripPlanBlocks leaves an unclosed plan fence without JSON alone", () => {
+	// A prose mention of a plan fence (or a truncated prose-only block) must
+	// not delete the rest of the reply: the strip guard requires a parseable
+	// JSON object in the unclosed region.
+	const input = "Review done.\n\n```plan\nI would fix the auth module first, then the tests.";
 	assert.deepEqual(stripPlanBlocks(input), { text: input, removed: false });
+	const mention = 'The reply must end with a ```plan block.\nKeep this paragraph.';
+	assert.deepEqual(stripPlanBlocks(mention), { text: mention, removed: false });
 });
 
 test("stripPlanBlocks strips the block but the parser still reads the raw capture", () => {
@@ -2351,10 +2381,12 @@ test("TEST_PLAN_SAMPLE_MALFORMED parses through the lenient path (unclosed fence
 	assert.equal(p.tiers.length, 2);
 	assert.equal(p.tiers.reduce((n, t) => n + t.items.length, 0), 3);
 	assert.deepEqual(planBlockDiagnostics(TEST_PLAN_SAMPLE_MALFORMED), { kind: "ok", itemCount: 3 });
-	// The unclosed fence is NOT stripped from the transcript (strip only
-	// removes closed blocks) — the block stays visible while the
-	// questionnaire still parses the raw capture.
-	assert.equal(stripPlanBlocks(TEST_PLAN_SAMPLE_MALFORMED).removed, false);
+	// The unclosed fence is stripped from the transcript like a closed one —
+	// its region carries parseable JSON (the lenient path auto-closes the
+	// truncated root brace), so the raw block no longer leaks into the reply.
+	const { text, removed } = stripPlanBlocks(TEST_PLAN_SAMPLE_MALFORMED);
+	assert.equal(removed, true);
+	assert.equal(text, "Review finished. The plan:");
 });
 
 // ── Robust plan block extraction & lenient parsing ─────────────────────────
