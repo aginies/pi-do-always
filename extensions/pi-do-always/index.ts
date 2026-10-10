@@ -59,6 +59,7 @@ import {
 	COMMIT_SELECT_MAX,
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
+	PLAN_NUDGE_PROMPT,
 	PLAN_OUTPUT_INSTRUCTION,
 	TEST_PLAN_SAMPLE_MALFORMED,
 	TEST_PLAN_SAMPLE_OK,
@@ -175,6 +176,8 @@ function loadConfig(
 	questionnaire: boolean;
 	/** Whether the raw plan block is hidden from the transcript (default true). */
 	hidePlan: boolean;
+	/** Whether a missing plan block triggers one nudge follow-up (default true). */
+	planNudge: boolean;
 } {
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
@@ -184,10 +187,10 @@ function loadConfig(
 
 	const global = globalRaw !== null
 		? parseConfig(globalRaw, globalPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined };
 	const project = projectRaw !== null
 		? parseConfig(projectRaw, projectPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined };
 
 	// The project file's merge mode wins; otherwise the global value; otherwise
 	// override (the historical behavior), so existing configs are unaffected.
@@ -205,6 +208,8 @@ function loadConfig(
 		questionnaire: project.questionnaire ?? global.questionnaire ?? true,
 		// Same precedence: project, then global, then on (the block is hidden).
 		hidePlan: project.hidePlan ?? global.hidePlan ?? true,
+		// Same precedence: project, then global, then on (the nudge is sent).
+		planNudge: project.planNudge ?? global.planNudge ?? true,
 	};
 }
 
@@ -1000,6 +1005,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// to see why the questionnaire was or wasn't offered). Cleared on
 	// session start.
 	let lastAssistantText: string | null = null;
+	// Whether the plan-block nudge follow-up has already been sent for the
+	// current auto-run (at most one nudge per run — a second miss falls back
+	// to the plain summary). Reset when a new auto-run is armed and on
+	// session start.
+	let planNudgeSent = false;
 
 	/** Clear the auto-run summary flag and its grace timer (session start). */
 	function resetPendingSummary(): void {
@@ -1010,10 +1020,31 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		lastProposal = null;
 		pendingPlanRaw = null;
 		lastAssistantText = null;
+		planNudgeSent = false;
 		if (pendingSummaryTimer) {
 			clearTimeout(pendingSummaryTimer);
 			pendingSummaryTimer = null;
 		}
+	}
+
+	/**
+	 * Arm the single auto-run task's summary flag and its failed-to-start
+	 * grace timer: a send that fails before the run starts emits no agent
+	 * events at all, so without the timer the stale flag would post a
+	 * spurious summary for the next unrelated turn. Also resets the plan
+	 * nudge flag — the armed run gets its own one-shot nudge budget.
+	 */
+	function armPendingSummary(name: string): void {
+		pendingSummaryTask = name;
+		planNudgeSent = false;
+		if (pendingSummaryTimer) clearTimeout(pendingSummaryTimer);
+		pendingSummaryTimer = setTimeout(() => {
+			pendingSummaryTimer = null;
+			if (!pendingSummaryTask) return;
+			const n = pendingSummaryTask;
+			pendingSummaryTask = null;
+			lastCtx?.ui.notify(`do-always: "${n}" failed to start (check model/API key)`, "error");
+		}, 10_000);
 	}
 	// Whether chain runs write a Markdown report file (config `report`,
 	// default true). Refreshed whenever the config is (re)loaded.
@@ -1026,6 +1057,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// completed auto-run task (config `hidePlan`, default true). Refreshed
 	// whenever the config is (re)loaded.
 	let hidePlanEnabled = true;
+	// Whether a completed auto-run Plan task whose reply has no usable plan
+	// block triggers one nudge follow-up asking the agent to emit it
+	// (config `planNudge`, default true). Refreshed whenever the config is
+	// (re)loaded.
+	let planNudgeEnabled = true;
 
 	/** The result of the plan questionnaire: the confirmed selection, or a withdrawal. */
 	type PlanQuestionnaireResult =
@@ -1082,9 +1118,38 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(base, "info");
 				return;
 			}
-			// The prompt asked for a plan block but none was usable — say why,
-			// so the fallback to a plain summary is not a mystery.
+			// The prompt asked for a plan block but none was usable — either
+			// nudge the agent once to emit it (the block is the whole point of
+			// a Plan task, and the findings are fresh in context), or say why
+			// the fallback to a plain summary is happening.
 			const diag = planBlockDiagnostics(captured.text);
+			// The nudge is a follow-up run, so it only works where the session
+			// stays interactive (TUI/RPC); print mode is one-shot. Dry-run
+			// (testplan) must never start a run. A valid-but-empty block is a
+			// legitimate outcome — never nudged. At most one nudge per auto-run.
+			const canNudge =
+				planNudgeEnabled &&
+				!planNudgeSent &&
+				!opts.dryRun &&
+				(ctx.mode === "tui" || ctx.mode === "rpc") &&
+				(diag.kind === "none" || diag.kind === "malformed");
+			if (canNudge) {
+				// Re-arm the auto-run machinery: the nudge run's reply goes
+				// through the same capture (message_end) → parse (agent_end) →
+				// offer (agent_settled) flow as the original run. The grace
+				// timer covers a nudge send that fails before the run starts.
+				// armPendingSummary resets the nudge flag (a new auto-run gets
+				// a fresh budget), so consume this run's budget AFTER arming —
+				// otherwise a second miss would nudge again (loop).
+				armPendingSummary(captured.taskName);
+				planNudgeSent = true;
+				ctx.ui.notify(
+					`do-always: ${captured.taskName} — reply had no usable plan block; asking the agent to emit it`,
+					"info",
+				);
+				pi.sendUserMessage(PLAN_NUDGE_PROMPT, { deliverAs: "followUp" });
+				return;
+			}
 			if (diag.kind === "none") {
 				ctx.ui.notify(`${base} — reply had no plan block, so no questionnaire was offered`, "warning");
 			} else if (diag.kind === "malformed") {
@@ -1986,6 +2051,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		reportEnabled = config.report;
 		questionnaireEnabled = config.questionnaire;
 		hidePlanEnabled = config.hidePlan;
+		planNudgeEnabled = config.planNudge;
 		refreshVisible(ctx.cwd, await getContext(ctx.cwd));
 		registerShortcut(config.shortcut, onError);
 	});
@@ -2114,15 +2180,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				? renderTaskPrompt(chosen, { ...strings, selected_commits: details })
 				: `${renderTaskPrompt(chosen, strings)}\n\nSelected commits:\n${details}`;
 
-			pendingSummaryTask = chosen.name;
-			if (pendingSummaryTimer) clearTimeout(pendingSummaryTimer);
-			pendingSummaryTimer = setTimeout(() => {
-				pendingSummaryTimer = null;
-				if (!pendingSummaryTask) return;
-				const name = pendingSummaryTask;
-				pendingSummaryTask = null;
-				lastCtx?.ui.notify(`do-always: "${name}" failed to start (check model/API key)`, "error");
-			}, 10_000);
+			armPendingSummary(chosen.name);
 			pi.sendUserMessage(prompt, { deliverAs: 'followUp' });
 			ctx.ui.notify(
 				`do-always: ${selected.length} commit${selected.length !== 1 ? "s" : ""} → ${chosen.name}`,
@@ -2142,18 +2200,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			// Fire-and-forget: sendUserMessage returns void; the run proceeds
 			// independently (see the chain control notes for why).
 			// Track the task so we can post a summary after agent_end.
-			pendingSummaryTask = task.name;
-			// If the run never starts (no agent events at all — same failure
-			// mode the chain's grace timer handles), drop the flag so a later
-			// unrelated turn can't post a spurious summary for this task.
-			if (pendingSummaryTimer) clearTimeout(pendingSummaryTimer);
-			pendingSummaryTimer = setTimeout(() => {
-				pendingSummaryTimer = null;
-				if (!pendingSummaryTask) return;
-				const name = pendingSummaryTask;
-				pendingSummaryTask = null;
-				lastCtx?.ui.notify(`do-always: "${name}" failed to start (check model/API key)`, "error");
-			}, 10_000);
+			armPendingSummary(task.name);
 			pi.sendUserMessage(prompt, { deliverAs: 'followUp' });
 			ctx.ui.notify(`do-always: auto-ran "${task.name}"`, "info");
 			return;
@@ -3039,6 +3086,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			reportEnabled = config.report;
 			questionnaireEnabled = config.questionnaire;
 			hidePlanEnabled = config.hidePlan;
+			planNudgeEnabled = config.planNudge;
 		}
 
 		// One context per command run: shared by visibility filtering, rendering,

@@ -12,6 +12,7 @@ import {
 	DEFAULT_SHORTCUT,
 	DEFAULT_TASKS,
 	MAX_FILES_LISTED,
+	PLAN_NUDGE_PROMPT,
 	PROMPT_CONTEXT_KEYS,
 	TEST_PLAN_SAMPLE_MALFORMED,
 	TEST_PLAN_SAMPLE_OK,
@@ -256,6 +257,31 @@ test("parseConfig ignores a non-boolean global hidePlan and reports it", () => {
 	assert.equal(out.hidePlan, undefined);
 	assert.equal(errors.length, 1);
 	assert.match(errors[0], /invalid "hidePlan"/);
+});
+
+test("parseConfig reads a global planNudge from the object form", () => {
+	assert.equal(parseConfig(JSON.stringify({ tasks: [], planNudge: false }), "test.json").planNudge, false);
+	assert.equal(parseConfig(JSON.stringify({ tasks: [], planNudge: true }), "test.json").planNudge, true);
+	assert.equal(parseConfig(JSON.stringify({ tasks: [] }), "test.json").planNudge, undefined);
+	assert.equal(parseConfig(JSON.stringify([{ name: "x", prompt: "p" }]), "test.json").planNudge, undefined);
+});
+
+test("parseConfig ignores a non-boolean global planNudge and reports it", () => {
+	const errors: string[] = [];
+	const out = parseConfig(JSON.stringify({ tasks: [], planNudge: 1 }), "test.json", (m) => errors.push(m));
+	assert.equal(out.planNudge, undefined);
+	assert.equal(errors.length, 1);
+	assert.match(errors[0], /invalid "planNudge"/);
+});
+
+test("PLAN_NUDGE_PROMPT carries the plan-block contract", () => {
+	// The nudge must restate the machine-readable contract the parse layer
+	// relies on: a plan-tagged fence, JSON-only content, block last.
+	assert.match(PLAN_NUDGE_PROMPT, /```plan/);
+	assert.match(PLAN_NUDGE_PROMPT, /\"summary\"/);
+	assert.match(PLAN_NUDGE_PROMPT, /\"tiers\"/);
+	assert.match(PLAN_NUDGE_PROMPT, /very last thing in your reply/);
+	assert.match(PLAN_NUDGE_PROMPT, /empty "tiers" array/);
 });
 
 test("parseConfig reads a string shortcut from the object form", () => {

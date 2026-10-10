@@ -210,11 +210,15 @@ block is not requested at all:
 
 Nothing is preselected. A Plan run that finds nothing to do replies with an
 empty tier list, and you just get the usual one-line summary. If the reply
-has no parseable `plan` block, the questionnaire is disabled, or the mode is
-not the TUI, the extension falls back to the plain summary notification —
-and when a questionnaire was expected, the notification says why (no plan
-block in the reply, or the block is not valid JSON), so a fallback is never
-a silent mystery. In non-TUI modes a parseable proposal is listed as a
+has no parseable `plan` block, the extension first sends **one nudge
+follow-up** asking the agent to emit the block (the findings are fresh in
+context, so this is a short, reliable turn) — the nudge run's reply goes
+through the same capture → parse → questionnaire flow. A second miss (or a
+nudge that is disabled by `planNudge`, or a non-interactive mode such as
+print) falls back to the plain summary notification — and when a
+questionnaire was expected, the notification says why (no plan block in the
+reply, or the block is not valid JSON), so a fallback is never a silent
+mystery. In non-TUI modes a parseable proposal is listed as a
 notification instead, so you can reply with the item numbers to execute. The
 questionnaire is offered only on the single auto-run path (selector pick,
 `/do-always <n>`, commit picker) — chain steps never get it.
@@ -266,6 +270,7 @@ In the object form you can also configure the selector shortcut:
 - `report` (optional) — whether chain runs write a Markdown report file in the project root (one per run, appended as each step finishes). Default `true`; set `false` to disable. The project file's value wins over the global one. See [Chains](#chains).
 - `questionnaire` (optional) — whether completed auto-run tasks whose reply carries a plan block offer the selection questionnaire. Default `true`; set `false` to keep the plain summary notification. The project file's value wins over the global one. See [Plan questionnaire](#plan-questionnaire).
 - `hidePlan` (optional) — whether the raw `plan` block is stripped from the transcript after a completed auto-run task (TUI only — in non-TUI modes the block is always kept). Default `true`; set `false` to keep the block visible in the conversation. The project file's value wins over the global one.
+- `planNudge` (optional) — whether a completed auto-run Plan task whose reply has no usable plan block (none at all — the model wrote the plan as plain prose — or malformed JSON) triggers one follow-up asking the agent to emit the block before the plain-summary fallback. At most one nudge per run; the nudge run's reply is parsed like any other. Default `true`; set `false` to keep the old behavior (warn and offer no questionnaire). The project file's value wins over the global one.
 - `aliases` (optional) — a global alias map: an object that maps short alias strings to task names, e.g. `{ "rc": "Review changes", "bl": "Build" }`. Each alias is case-insensitive and is tried before the task's own name, so `/do-always rc` resolves to the task named `Review changes`. Keys and values are trimmed; entries with empty keys or non-string values are silently dropped. The project file's value wins over the global one.
 
 ```json

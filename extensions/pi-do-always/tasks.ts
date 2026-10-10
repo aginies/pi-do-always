@@ -156,6 +156,14 @@ type DoAlwaysConfig =
 			 */
 			hidePlan?: boolean;
 			/**
+			 * Whether a completed auto-run Plan task whose reply has no usable
+			 * plan block (none at all, or malformed JSON) triggers one follow-up
+			 * asking the agent to emit the block before the plain-summary
+			 * fallback. Default true; set false to keep the old behavior (warn
+			 * and offer no questionnaire).
+			 */
+			planNudge?: boolean;
+			/**
 			 * A global alias map: `{ "rc": "Review changes" }` maps a short
 			 * alias string to a task name. Aliases are case-insensitive and
 			 * are tried before the task's own name. Invalid entries (non-string
@@ -197,6 +205,13 @@ interface ParsedDoAlwaysConfig {
 	 * undefined when the file does not set one (default: on).
 	 */
 	hidePlan: boolean | undefined;
+	/**
+	 * The `planNudge` field, if present: whether a completed auto-run Plan
+	 * task whose reply has no usable plan block triggers one follow-up asking
+	 * the agent to emit it. undefined when the file does not set one
+	 * (default: on).
+	 */
+	planNudge: boolean | undefined;
 	/**
 	 * A global alias map parsed from the config object: `{ "rc": "Review changes" }`.
 	 * undefined when the file does not set one.
@@ -538,14 +553,14 @@ export function parseConfig(
 		data = JSON.parse(raw);
 	} catch (err) {
 		onError(`do-always: invalid JSON in ${path}: ${err}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, aliases: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, aliases: undefined };
 	}
 
 	const list = Array.isArray(data) ? data : data?.tasks;
 
 	if (!Array.isArray(list)) {
 		onError(`do-always: ${path} must be a JSON array of tasks or {"tasks": [...]}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, aliases: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, aliases: undefined };
 	}
 
 	const tasks: DoAlwaysTask[] = [];
@@ -629,6 +644,11 @@ export function parseConfig(
 		if (typeof data.hidePlan === "boolean") hidePlan = data.hidePlan;
 		else onError(`do-always: ignoring invalid "hidePlan" in ${path} (expected true or false)`);
 	}
+	let planNudge: boolean | undefined;
+	if (!Array.isArray(data) && "planNudge" in data) {
+		if (typeof data.planNudge === "boolean") planNudge = data.planNudge;
+		else onError(`do-always: ignoring invalid "planNudge" in ${path} (expected true or false)`);
+	}
 	let aliases: Record<string, string> | undefined;
 	if (!Array.isArray(data) && "aliases" in data) {
 		if (typeof data.aliases === "object" && data.aliases !== null && !Array.isArray(data.aliases)) {
@@ -642,7 +662,7 @@ export function parseConfig(
 		}
 	}
 
-	return { tasks, shortcut, merge, report, questionnaire, hidePlan, aliases };
+	return { tasks, shortcut, merge, report, questionnaire, hidePlan, planNudge, aliases };
 }
 
 const KEY_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -1610,6 +1630,26 @@ export function formatCommitReviewPrompt(commits: SelectedCommit[]): string {
 export const PLAN_OUTPUT_INSTRUCTION =
 	"Plan block (required):\n" +
 	"End your reply with a fenced code block tagged plan (\`\`\`plan) containing ONLY the JSON object — nothing else:\n" +
+	'{"summary":"one-line summary","tiers":[{"id":"P0","label":"Critical","items":[{"title":"short action","detail":"where and why (file:line if known)"}]}]}\n' +
+	"Rules:\n" +
+	"- One tier per priority level, most urgent first (P0, P1, P2, …)\n" +
+	"- Each item must be one concrete, independently doable action\n" +
+	"- Use an empty \"tiers\" array when no action is needed\n" +
+	"- The fenced block must contain ONLY the JSON — no explanation, no comments, no text after the closing }\n" +
+	"- The plan block must be the very last thing in your reply\n";
+
+/**
+ * Follow-up sent when a completed auto-run Plan task's reply has no usable
+ * plan block (none at all — the model wrote the plan as plain prose — or
+ * malformed JSON the lenient parser could not recover). The agent has just
+ * done the work, so asking it to format its findings into the block is a
+ * short, reliable turn; the nudge run's reply goes through the same
+ * capture → parse → questionnaire flow as the original run. Sent at most
+ * once per auto-run (a second miss falls back to the plain summary).
+ */
+export const PLAN_NUDGE_PROMPT =
+	"Your previous reply did not include the required plan block (or it was not valid JSON).\n" +
+	"Based on your findings above, emit it now: end your reply with a fenced code block tagged plan (\`\`\`plan) containing ONLY the JSON object — nothing else:\n" +
 	'{"summary":"one-line summary","tiers":[{"id":"P0","label":"Critical","items":[{"title":"short action","detail":"where and why (file:line if known)"}]}]}\n' +
 	"Rules:\n" +
 	"- One tier per priority level, most urgent first (P0, P1, P2, …)\n" +

@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Plan-block nudge**: when a completed auto-run Plan task's reply has no
+  usable plan block — none at all (the model wrote the plan as plain prose
+  and never emitted the required ` ```plan ` fence) or malformed JSON the
+  lenient parser could not recover — the extension now sends one follow-up
+  asking the agent to emit the block, and the nudge run's reply goes through
+  the same capture → parse → questionnaire flow. At most one nudge per run
+  (a second miss falls back to the plain summary with the usual "why" note),
+  and it only happens where the session stays interactive (TUI/RPC) — print
+  mode is one-shot. New `planNudge` config (per file, global or project)
+  disables the nudge and restores the old warn-and-fallback behavior.
+
 ## [0.20.0] - 2026-10-09
 
 ### Added
