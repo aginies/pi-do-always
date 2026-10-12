@@ -43,7 +43,9 @@ For development you can also load it explicitly: `npm run dev` (runs `pi --exten
 |`/do-always replan`|Re-open the plan questionnaire for the last offered proposal (e.g. after an accidental Esc)|
 
 The selector supports direct number-pick (1-9), live type-to-filter, arrow/Enter navigation,
-mouse-wheel scrolling, and click-to-select. While a filter is active, typed digits refine the
+mouse-wheel scrolling, and click-to-select. The quick number-pick covers keys 1-9 only: rows
+numbered 10 and above (shown with two digits) need arrow/Enter or a click — while
+`/do-always <n>` on the command line accepts any number. While a filter is active, typed digits refine the
 filter instead of picking by number; clear the filter (backspace) to use number-pick again.
 Pause on a task for two seconds and its full prompt is previewed below the list, so you can
 see exactly what will be injected before running it; moving the selection or typing hides it
@@ -171,7 +173,11 @@ the conversation stays clean — the questionnaire still works, because the
 raw text is captured before the strip. In non-TUI modes the block stays in
 the transcript, so the model can resolve the item-number replies the
 notification offers. Set `hidePlan` to `false` (per task or
-globally) to keep the block visible. With the questionnaire disabled the
+globally) to keep the block visible. The execution run started by a
+questionnaire confirm is covered too: its prompt tells the model not to
+emit a `plan` block, and any imitated fence is stripped from its reply as
+well (TUI only, same `hidePlan` setting) — no raw JSON lingers after the
+flow completes. With the questionnaire disabled the
 block is not requested at all:
 
 ```
@@ -219,8 +225,17 @@ nudge that is disabled by `planNudge`, or a non-interactive mode such as
 print) falls back to the plain summary notification — and when a
 questionnaire was expected, the notification says why (no plan block in the
 reply, or the block is not valid JSON), so a fallback is never a silent
-mystery. In non-TUI modes a parseable proposal is listed as a
-notification instead, so you can reply with the item numbers to execute. The
+mystery. An interrupted Plan run (**Esc**, a provider error) does not lose
+the proposal: the task stays *owed* a plan block, so the turn that finishes
+the work — typically your own "continue" — is captured, stripped and offered
+exactly like the auto-run's own reply (the debt is dropped as soon as a
+completed turn answers without a block, so an unrelated later reply is never
+hijacked). In non-TUI modes a parseable proposal is listed as a
+notification instead, so you can reply with the item numbers to execute.
+That reply is interpreted by the model, not by the extension: no code parses
+item numbers — it works because the raw plan block stays in the transcript
+in non-TUI modes (`hidePlan` never strips it there), so the model can map
+your numbers back to the items. The
 questionnaire is offered only on the single auto-run path (selector pick,
 `/do-always <n>`, commit picker) — chain steps never get it.
 

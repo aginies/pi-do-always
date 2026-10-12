@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **One stray brace in a plan block cost the whole questionnaire**: an agent
+  that closed a tier with `}]}},` instead of `}]},` (an extra `}` where a
+  comma belongs) produced a block no repair could read — `extractJsonObject`
+  scans *past* a closer that does not match what is open, so the stray brace
+  survived into every candidate and each `JSON.parse` died on it. The result
+  was `plan block was not valid JSON`, no questionnaire, and the raw JSON left
+  in the transcript. The lenient parser now repairs mismatched closing tokens,
+  preferring the reading that drops the stray closer (which keeps every later
+  tier) over the one that closes the open containers at the mismatch (which
+  would truncate the block there). Braces inside string literals are never
+  treated as structure, and genuinely broken JSON — a missing comma, `{not
+  json}` — is still reported as malformed rather than guessed at. Dry-run it
+  with `/do-always testplan stray`.
+- **Plan questionnaire skipped when the auto-run was interrupted**: an aborted
+  or errored Plan run consumed the "pending auto-run" arming, so when the same
+  work was finished in a later turn (a plain "continue" after **Esc** or a
+  provider error) that reply's `plan` block was neither captured nor stripped —
+  no questionnaire, and the raw JSON stayed in the transcript. The Plan task is
+  now *owed* a block until a reply carries one (the questionnaire then opens
+  exactly as after a clean auto-run) or a completed turn proves the user moved
+  on; a run interrupted before the settle that had already emitted the block
+  offers it instead of dropping the capture with the run. Non-Plan auto-runs,
+  chain steps and new sessions never inherit the debt.
 - **Plan block leaked into the transcript when the reply's fence was never
   closed**: the transcript strip only removed closed `plan` fences, so the
   failure mode the lenient parser already recovers (truncated block, leaked
@@ -196,8 +219,8 @@ All notable changes to this project will be documented in this file.
   lists, still runnable by name and offered by the commit picker), and
   `notForCommits` (excluded from the commit picker).
 - New `{{selected_commits}}` prompt placeholder; `formatSelectedCommits`
-  builds the numbered detail block and `formatCommitReviewPrompt` composes
-  the review prompt from it.
+  builds the numbered detail block, which a task prompt interpolates (the
+  built-in "Review commits" task does) into the review prompt.
 
 ### Changed
 

@@ -16,6 +16,7 @@ import {
 	PROMPT_CONTEXT_KEYS,
 	TEST_PLAN_SAMPLE_MALFORMED,
 	TEST_PLAN_SAMPLE_OK,
+	TEST_PLAN_SAMPLE_STRAY_BRACE,
 	buildTableRows,
 	chainAdd,
 	chainClear,
@@ -25,7 +26,6 @@ import {
 	evaluateGuards,
 	evaluateWhen,
 	formatChainSequence,
-	formatCommitReviewPrompt,
 	formatList,
 	formatPlanExecutionPrompt,
 	planBlockDiagnostics,
@@ -1700,21 +1700,6 @@ test("formatSelectedCommits numbers multiple commits", () => {
 	assert.ok(out.includes("2. Commit 2000000"));
 });
 
-test("formatCommitReviewPrompt embeds the formatSelectedCommits block", () => {
-	const c: SelectedCommit = {
-		hash: "a".repeat(40),
-		shortHash: "aaaaaaa",
-		subject: "s",
-		date: "2026-10-01",
-		author: "A",
-		filesChanged: 1,
-		insertions: 1,
-		deletions: 1,
-		selectionOrder: 1,
-	};
-	assert.ok(formatCommitReviewPrompt([c]).includes(formatSelectedCommits([c])));
-});
-
 // Verify the 'Review commits' task exists in DEFAULT_TASKS and auto-runs (Plan category).
 const reviewTask = DEFAULT_TASKS.find((t) => t.name === "Review commits");
 test("'Review commits' task exists in DEFAULT_TASKS", () => {
@@ -1763,59 +1748,6 @@ test("Browse commits is only shown inside a git repo (when: git)", () => {
 
 test("DEFAULT_TASKS 'Review commits' prompt consumes {{selected_commits}}", () => {
 	assert.match(reviewTask?.prompt ?? "", /\{\{\s*selected_commits\s*\}\}/);
-});
-
-test("formatCommitReviewPrompt formats single commit prompt", () => {
-	const commits: SelectedCommit[] = [
-		{
-			hash: "a".repeat(40),
-			shortHash: "abc1234",
-			subject: "feat: new feature",
-			date: "2025-01-15",
-			author: "Alice",
-			filesChanged: 3,
-			insertions: 50,
-			deletions: 2,
-			selectionOrder: 1,
-		},
-	];
-	const prompt = formatCommitReviewPrompt(commits);
-	assert.ok(prompt.includes("Review the following git commit:"));
-	assert.ok(prompt.includes("Commit abc1234 (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"));
-	assert.ok(prompt.includes("feat: new feature"));
-	assert.ok(prompt.includes("git show aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-});
-
-test("formatCommitReviewPrompt formats multiple commits prompt", () => {
-	const commits: SelectedCommit[] = [
-		{
-			hash: "a".repeat(40),
-			shortHash: "abc1234",
-			subject: "feat: first",
-			date: "2025-01-15",
-			author: "Alice",
-			filesChanged: 1,
-			insertions: 10,
-			deletions: 0,
-			selectionOrder: 1,
-		},
-		{
-			hash: "b".repeat(40),
-			shortHash: "def5678",
-			subject: "fix: second",
-			date: "2025-01-14",
-			author: "Bob",
-			filesChanged: 2,
-			insertions: 5,
-			deletions: 3,
-			selectionOrder: 2,
-		},
-	];
-	const prompt = formatCommitReviewPrompt(commits);
-	assert.ok(prompt.includes("Review the following git commits:"));
-	assert.ok(prompt.includes("1. Commit abc1234"));
-	assert.ok(prompt.includes("2. Commit def5678"));
-	assert.ok(prompt.includes("git show <hash>"));
 });
 
 // Verify parseGitLogOutput
@@ -2229,6 +2161,10 @@ test("formatPlanExecutionPrompt lists the selected items in order with tier tags
 	assert.ok(prompt.includes("3. [P1] c"));
 	assert.ok(prompt.includes("4. [P1] d"));
 	assert.ok(prompt.includes("5. [P1] e"));
+	// The execution run must not answer with a plan fence (the plan-block
+	// instruction is still visible in the conversation context — say so
+	// explicitly, and the strip-only path in index.ts is the safety net).
+	assert.ok(prompt.includes("do NOT emit a ```plan block"));
 });
 
 test("formatPlanExecutionPrompt appends the detail when present", () => {
@@ -2375,6 +2311,22 @@ test("TEST_PLAN_SAMPLE_OK parses through the strict path and strips cleanly", ()
 	assert.ok(!text.includes("```plan"));
 });
 
+test("TEST_PLAN_SAMPLE_STRAY_BRACE parses through the closer repair", () => {
+	const p = parsePlanProposal(TEST_PLAN_SAMPLE_STRAY_BRACE);
+	assert.ok(p, "the stray-brace sample must parse — it is the /do-always testplan stray fixture");
+	// All three tiers survive: the repair drops the stray brace rather than
+	// truncating the block at it.
+	assert.deepEqual(
+		p.tiers.map((t) => t.id),
+		["P0", "P1", "P2"],
+	);
+	assert.deepEqual(planBlockDiagnostics(TEST_PLAN_SAMPLE_STRAY_BRACE), { kind: "ok", itemCount: 3 });
+	// The closed fence is stripped from the transcript like any parsed block.
+	const { text, removed } = stripPlanBlocks(TEST_PLAN_SAMPLE_STRAY_BRACE);
+	assert.equal(removed, true);
+	assert.equal(text, "Reviewed the code. Findings below.");
+});
+
 test("TEST_PLAN_SAMPLE_MALFORMED parses through the lenient path (unclosed fence, truncated JSON, trailing tags)", () => {
 	const p = parsePlanProposal(TEST_PLAN_SAMPLE_MALFORMED);
 	assert.ok(p);
@@ -2447,6 +2399,77 @@ test("parsePlanProposal auto-balances missing root closing braces", () => {
 	const p = parsePlanProposal(text);
 	assert.ok(p);
 	assert.equal(p.tiers[0].items[0].title, "item");
+});
+
+// ── Mismatched closing tokens ────────────────────────────────────────────────
+//
+// The failure observed in the wild: the agent closes a tier with `}]}},` where
+// `}]},` belongs — one stray brace instead of a comma. Every other repair scans
+// past that character, so the whole plan (all later tiers) was lost to it.
+
+/** The reported block: a stray `}` after the P0 tier, three tiers total. */
+const STRAY_BRACE_PLAN =
+	'```plan\n{"summary":"S","tiers":[' +
+	'{"id":"P0","label":"Critical","items":[{"title":"t0","detail":"d0"}]}},' +
+	'{"id":"P1","label":"High","items":[{"title":"t1","detail":"d1"}]},' +
+	'{"id":"P2","label":"Medium","items":[{"title":"t2"}]}]}\n```';
+
+test("parsePlanProposal repairs a stray closing brace between tiers", () => {
+	const p = parsePlanProposal(STRAY_BRACE_PLAN);
+	assert.ok(p, "the stray brace must not cost the whole plan");
+	// The "drop" reading is preferred precisely because it loses nothing: all
+	// three tiers survive, not just the one before the stray brace.
+	assert.deepEqual(
+		p.tiers.map((t) => t.id),
+		["P0", "P1", "P2"],
+	);
+	assert.equal(p.summary, "S");
+	assert.equal(p.tiers[0].items[0].title, "t0");
+	assert.equal(p.tiers[2].items[0].title, "t2");
+});
+
+test("planBlockDiagnostics agrees with the stray-closer repair", () => {
+	assert.deepEqual(planBlockDiagnostics(STRAY_BRACE_PLAN), { kind: "ok", itemCount: 3 });
+});
+
+test("parsePlanProposal repairs several stray closers", () => {
+	const text =
+		'```plan\n{"tiers":[{"id":"P0","items":[{"title":"a"}]}},{"id":"P1","items":[{"title":"b"}]}}]}\n```';
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.deepEqual(
+		p.tiers.map((t) => t.items[0].title),
+		["a", "b"],
+	);
+});
+
+test("parsePlanProposal repairs a closer that is missing, not stray", () => {
+	// The tier's own `}` is absent, so the root `}` shows up where a `]` is
+	// expected — the other reading of a mismatch.
+	const text = '```plan\n{"tiers":[{"items":[{"title":"only"}]}\n```';
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers[0].items[0].title, "only");
+});
+
+test("closers inside string literals are left alone", () => {
+	// A detail that happens to contain braces must not be treated as structure.
+	const text =
+		'```plan\n{"tiers":[{"id":"P0","items":[{"title":"a","detail":"guard with }}} and ]"}]}]}\n```';
+	const p = parsePlanProposal(text);
+	assert.ok(p);
+	assert.equal(p.tiers[0].items[0].detail, "guard with }}} and ]");
+});
+
+test("the closer repair does not rescue genuinely broken JSON", () => {
+	// A missing comma between array elements is not a closer problem: repairing
+	// it would mean inventing punctuation, so these stay malformed.
+	assert.equal(
+		planBlockDiagnostics('```plan\n{"tiers":[{"items":[{"title":"a"},{"title":"b"} "oops"]}]}\n```').kind,
+		"malformed",
+	);
+	assert.equal(parsePlanProposal("```plan\n{not json}\n```"), null);
+	assert.equal(parsePlanProposal("```plan\n{broken\n```"), null);
 });
 
 test("parsePlanProposal successfully parses the full MoCap report sample", () => {

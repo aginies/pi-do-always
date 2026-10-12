@@ -63,6 +63,7 @@ import {
 	PLAN_OUTPUT_INSTRUCTION,
 	TEST_PLAN_SAMPLE_MALFORMED,
 	TEST_PLAN_SAMPLE_OK,
+	TEST_PLAN_SAMPLE_STRAY_BRACE,
 	assistantText,
 	buildTableRows,
 	chainAdd,
@@ -77,7 +78,6 @@ import {
 	formatList,
 	formatPlanExecutionPrompt,
 	formatSelectedCommits,
-	groupCommitsByDate,
 	groupTasksByCategory,
 	isPlanTask,
 	isTaskVisible,
@@ -115,7 +115,6 @@ import {
 	validateChain,
 	type ChainStepOutcome,
 	type CommitInfo,
-	type DateGroup,
 	type DoAlwaysTask,
 	type PlanProposal,
 	type PlanSelection,
@@ -196,10 +195,22 @@ function loadConfig(
 	// override (the historical behavior), so existing configs are unaffected.
 	const mode = project.merge ?? global.merge ?? "override";
 
+	// Order the merged list by category so the selector numbers, digit-pick,
+	// `/do-always <n>`, and `list` all share one consistent order.
+	const merged = orderTasksByCategory(mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS, mode));
+	// Deprecation: the commit browser used to also open for any task named
+	// "Review commits" (configs predating the `browser` field). The name-based
+	// trigger is removed — warn so old configs adopt the explicit field.
+	for (const t of merged) {
+		if (t.name === "Review commits" && t.browser !== "commits") {
+			onError(
+				`do-always: task "Review commits" no longer opens the commit browser by name — add "browser": "commits" to it in do-always.json`,
+			);
+		}
+	}
+
 	return {
-		// Order the merged list by category so the selector numbers, digit-pick,
-		// `/do-always <n>`, and `list` all share one consistent order.
-		tasks: orderTasksByCategory(mergeTasks(global.tasks, project.tasks, DEFAULT_TASKS, mode)),
+		tasks: merged,
 		shortcut: resolveShortcut(global.shortcut, project.shortcut),
 		// The project file's value wins; otherwise the global value; otherwise
 		// reports are on.
@@ -224,10 +235,13 @@ function git(cwd: string, args: string[]): Promise<string | undefined> {
 		// No stdio option: execFile's string-encoding overload doesn't accept
 		// it, and stdin/stderr need no special handling here (no input is
 		// written; stderr is simply ignored by the callback).
+		// maxBuffer well above execFile's 1MB default: a huge repo's
+		// `status --porcelain` or a `log --shortstat` page must not overflow
+		// and silently resolve undefined.
 		execFile(
 			"git",
 			args,
-			{ cwd, encoding: "utf-8" },
+			{ cwd, encoding: "utf-8", maxBuffer: 32 * 1024 * 1024 },
 			(error, stdout) => {
 				if (error) {
 					resolve(undefined);
@@ -343,7 +357,7 @@ async function fetchCommitsPage(
 	cwd: string,
 	page = 0,
 	pageSize = COMMIT_BROWSER_MAX,
-): Promise<{ commits: CommitInfo[]; groups: DateGroup[]; hasMore: boolean }> {
+): Promise<{ commits: CommitInfo[]; hasMore: boolean }> {
 	const countToFetch = pageSize + 1;
 	const skip = page * pageSize;
 	const format = "COMMIT%x09%H%x09%h%x09%s%x09%ad%x09%an";
@@ -357,14 +371,13 @@ async function fetchCommitsPage(
 		"--date=short",
 	]);
 	if (!logOutput) {
-		return { commits: [], groups: [], hasMore: false };
+		return { commits: [], hasMore: false };
 	}
 
 	const allParsed = parseGitLogOutput(logOutput);
 	const hasMore = allParsed.length > pageSize;
 	const commits = hasMore ? allParsed.slice(0, pageSize) : allParsed;
-	const groups = groupCommitsByDate(commits);
-	return { commits, groups, hasMore };
+	return { commits, hasMore };
 }
 
 /**
@@ -376,10 +389,10 @@ async function fetchCommitsPage(
  */
 function browseCommits(
 	ctx: ExtensionContext,
-	initialData?: { commits: CommitInfo[]; groups: DateGroup[]; hasMore: boolean },
+	initialData?: { commits: CommitInfo[]; hasMore: boolean },
 ): Promise<SelectedCommit[] | null> {
 	return new Promise<SelectedCommit[] | null>((resolve) => {
-		const pageCache = new Map<number, { commits: CommitInfo[]; groups: DateGroup[]; hasMore: boolean }>();
+		const pageCache = new Map<number, { commits: CommitInfo[]; hasMore: boolean }>();
 		let page = 0;
 		if (initialData) {
 			pageCache.set(0, initialData);
@@ -430,7 +443,7 @@ function browseCommits(
 			}
 
 			function getCurrentPageData() {
-				return pageCache.get(page) ?? { commits: [], groups: [], hasMore: false };
+				return pageCache.get(page) ?? { commits: [], hasMore: false };
 			}
 
 			function getVisibleCommits(): CommitInfo[] {
@@ -1010,6 +1023,46 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// to the plain summary). Reset when a new auto-run is armed and on
 	// session start.
 	let planNudgeSent = false;
+	// Strip-only run: an execution follow-up sent after a questionnaire
+	// confirm. Its reply gets no summary and no questionnaire, but the model
+	// may imitate the plan-block instruction still visible in the conversation
+	// context and end the summary with a raw ```plan fence nobody consumes —
+	// message_end strips it from the transcript (TUI only, honoring hidePlan).
+	// Cleared when the run settles (agent_settled), when a new auto-run is
+	// armed, and on session start; the grace timer covers a send that fails
+	// before agent_start, so the flag never lingers into an unrelated turn
+	// (where it could strip a genuine plan fence from the user's content).
+	let stripOnlyRun = false;
+	let stripOnlyTimer: NodeJS.Timeout | null = null;
+	// The Plan auto-run whose plan block has NOT landed yet. Armed with the
+	// auto-run and, unlike pendingSummaryTask, it SURVIVES an aborted/errored
+	// run: that run emits no block (it died mid-flight), and the same work is
+	// normally finished by the user's next "continue" turn — whose reply is
+	// then captured, stripped and offered exactly like the auto-run's own.
+	// Without it, an interrupted Plan run means no questionnaire at all and a
+	// raw ```plan fence left in the transcript. Cleared when a reply is
+	// captured, when a completed follow-up turn carries no block (the user
+	// moved on), when a non-Plan auto-run is armed, and on session start.
+	let planFollowUpTask: string | null = null;
+
+	/** Arm the execution run's strip-only flag with a failed-to-start grace timer. */
+	function armStripOnly(): void {
+		stripOnlyRun = true;
+		if (stripOnlyTimer) clearTimeout(stripOnlyTimer);
+		stripOnlyTimer = setTimeout(() => {
+			stripOnlyTimer = null;
+			stripOnlyRun = false;
+		}, 10_000);
+	}
+
+	/** Clear the strip-only flag and its grace timer. */
+	function clearStripOnly(): void {
+		stripOnlyRun = false;
+		if (stripOnlyTimer) {
+			clearTimeout(stripOnlyTimer);
+			stripOnlyTimer = null;
+		}
+	}
 
 	/** Clear the auto-run summary flag and its grace timer (session start). */
 	function resetPendingSummary(): void {
@@ -1021,6 +1074,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		pendingPlanRaw = null;
 		lastAssistantText = null;
 		planNudgeSent = false;
+		planFollowUpTask = null;
+		clearStripOnly();
 		if (pendingSummaryTimer) {
 			clearTimeout(pendingSummaryTimer);
 			pendingSummaryTimer = null;
@@ -1037,12 +1092,19 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	function armPendingSummary(name: string): void {
 		pendingSummaryTask = name;
 		planNudgeSent = false;
+		// Only a run whose prompt asked for a plan block can be expected to
+		// deliver one later (see planFollowUpTask).
+		planFollowUpTask = asksForPlanBlock(name) ? name : null;
+		// A new auto-run supersedes any pending execution-run strip.
+		clearStripOnly();
 		if (pendingSummaryTimer) clearTimeout(pendingSummaryTimer);
 		pendingSummaryTimer = setTimeout(() => {
 			pendingSummaryTimer = null;
 			if (!pendingSummaryTask) return;
 			const n = pendingSummaryTask;
 			pendingSummaryTask = null;
+			// The run never happened, so no plan block is owed for it either.
+			planFollowUpTask = null;
 			lastCtx?.ui.notify(`do-always: "${n}" failed to start (check model/API key)`, "error");
 		}, 10_000);
 	}
@@ -1093,6 +1155,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return `${PLAN_OUTPUT_INSTRUCTION}\n\n${base}`;
 		}
 		return base;
+	}
+
+	/** Whether the armed auto-run's prompt carried PLAN_OUTPUT_INSTRUCTION. */
+	function asksForPlanBlock(name: string): boolean {
+		return planTaskFor(name) !== null;
 	}
 
 	/**
@@ -1196,6 +1263,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					"info",
 				);
 			} else {
+				// The execution run gets no questionnaire; strip any imitated
+				// plan fence from its reply (honoring hidePlan) so no raw JSON
+				// lingers in the transcript.
+				if (task?.hidePlan ?? hidePlanEnabled) armStripOnly();
 				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 				ctx.ui.notify(
 					`do-always: executing ${result.items.length} selected item(s) from the "${captured.taskName}" plan`,
@@ -1329,37 +1400,37 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					if (listRows.length > MAX_VISIBLE) {
 						lines.push(theme.fg("dim", `  (${anchor + 1}/${listRows.length})`));
 					}
-				// Pinned Confirm row (always visible, outside the scroll window).
-				lines.push("");
-				lines.push(theme.fg("dim", `  ${"─".repeat(Math.max(1, width - 4))}`));
-				const totalItems = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
-				const confirmLabel = `Confirm (${selection.size}/${totalItems})`;
-				if (cursor === rows.length - 1) {
-					lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", "►")} ${confirmLabel}`)));
-				} else if (selection.size > 0) {
-					lines.push(theme.fg("accent", `  ${confirmLabel}`));
-				} else {
-					lines.push(theme.fg("dim", `  ${confirmLabel}`));
-				}
-				rowLine.set(lines.length - 1, { kind: "confirm" });
-				if (noteKey !== null) {
-					// Note editor: replaces the key hint while active.
-					lines.push(theme.fg("accent", truncateToWidth(`  note> ${noteDraft}`, width - 2, "")));
-					lines.push(theme.fg("dim", "  enter save note  •  esc cancel"));
-				} else {
-					lines.push(
-						theme.fg(
-							"dim",
-							truncateToWidth(
-								`  space/⏎ toggle  •  a all  •  ctrl+u clear  •  e note  •  ⏎ confirm  •  esc withdraw`,
-								width - 2,
-								"",
+					// Pinned Confirm row (always visible, outside the scroll window).
+					lines.push("");
+					lines.push(theme.fg("dim", `  ${"─".repeat(Math.max(1, width - 4))}`));
+					const totalItems = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
+					const confirmLabel = `Confirm (${selection.size}/${totalItems})`;
+					if (cursor === rows.length - 1) {
+						lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", "►")} ${confirmLabel}`)));
+					} else if (selection.size > 0) {
+						lines.push(theme.fg("accent", `  ${confirmLabel}`));
+					} else {
+						lines.push(theme.fg("dim", `  ${confirmLabel}`));
+					}
+					rowLine.set(lines.length - 1, { kind: "confirm" });
+					if (noteKey !== null) {
+						// Note editor: replaces the key hint while active.
+						lines.push(theme.fg("accent", truncateToWidth(`  note> ${noteDraft}`, width - 2, "")));
+						lines.push(theme.fg("dim", "  enter save note  •  esc cancel"));
+					} else {
+						lines.push(
+							theme.fg(
+								"dim",
+								truncateToWidth(
+									`  space/⏎ toggle  •  a all  •  ctrl+u clear  •  e note  •  ⏎ confirm  •  esc withdraw`,
+									width - 2,
+									"",
+								),
 							),
-						),
-					);
+						);
+					}
+					return lines;
 				}
-				return lines;
-			}
 
 				function toggleAt(row: Row) {
 					if (row.kind === "tier") {
@@ -1593,15 +1664,6 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Finish the report file: append the summary footer. Called on every
-	 * terminal path (complete, stopped, skipped); a no-op when no report was
-	 * created (disabled or write failure). A run that produced nothing worth
-	 * keeping (no completed step, no result text) leaves no file behind — see
-	 * `reportWorthKeeping`. When the chain completed fully (all steps done),
-	 * removes the status widget so nothing lingers below the prompt; otherwise
-	 * keeps it as a trace with the report path in the note.
-	 */
-	/**
 	 * Write the deferred report header so the file exists before the first
 	 * section/footer append. Returns false when there is no report or the
 	 * write failed (a warning was shown); the chain runs on without a file.
@@ -1619,6 +1681,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	/**
+	 * Finish the report file: append the summary footer. Called on every
+	 * terminal path (complete, stopped, skipped); a no-op when no report was
+	 * created (disabled or write failure). A run that produced nothing worth
+	 * keeping (no completed step, no result text) leaves no file behind — see
+	 * `reportWorthKeeping`. When the chain completed fully (all steps done),
+	 * removes the status widget so nothing lingers below the prompt; otherwise
+	 * keeps it as a trace with the report path in the note.
+	 */
 	async function finishReport(ctx: ExtensionContext): Promise<void> {
 		if (!chainReport || !chainStatus) return;
 		const statuses = chainStatus.steps.map((s) => s.status);
@@ -1669,7 +1740,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		const lines: string[] = [];
 		lines.push(`# do-always chain report — ${new Date().toISOString().slice(0, 10)}`);
 		lines.push("");
-		lines.push(`- Project: ${chainReport.display}`);
+		lines.push(`- Project: ${ctx.cwd}`);
 		lines.push(`- Steps: ${chainStatus.steps.map((s) => s.name).join(" → ")}`);
 		lines.push("");
 		if (omitted > 0) {
@@ -1777,6 +1848,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			clearTimeout(pendingSummaryTimer);
 			pendingSummaryTimer = null;
 		}
+		// A strip-only execution run keeps its flag for the run's lifetime
+		// (message_end fires after this); only its grace timer is cancelled.
+		if (stripOnlyTimer) {
+			clearTimeout(stripOnlyTimer);
+			stripOnlyTimer = null;
+		}
 		// A new run began before the captured plan proposal was offered (the
 		// user typed a prompt right after the Plan run ended) — it is stale.
 		pendingProposal = null;
@@ -1837,47 +1914,77 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Hide the plan block: while a single auto-run Plan task is in flight
-	 * (its prompt carried PLAN_OUTPUT_INSTRUCTION), capture the reply's raw
-	 * text for the questionnaire, then — in the TUI — replace the finalized
+	 * The task `name` when it is a Plan task whose questionnaire is enabled —
+	 * i.e. the tasks whose prompt carries PLAN_OUTPUT_INSTRUCTION (the same
+	 * gate as renderTaskPrompt). null for anything else.
+	 */
+	function planTaskFor(name: string | null): DoAlwaysTask | null {
+		if (!name) return null;
+		const task = tasks.find((t) => t.name === name);
+		if (!task || !isPlanTask(task) || !(task.questionnaire ?? questionnaireEnabled)) return null;
+		return task;
+	}
+
+	/**
+	 * The Plan task whose reply carries — or still owes — the plan block for
+	 * the run in flight: the armed auto-run, or, after that run was
+	 * interrupted, the follow-up turn finishing the same work. Only a task
+	 * whose prompt actually carried PLAN_OUTPUT_INSTRUCTION qualifies, so a
+	 * plan fence in any other reply is the user's content and stays untouched.
+	 */
+	function planCaptureTask(): DoAlwaysTask | null {
+		return planTaskFor(pendingSummaryTask ?? planFollowUpTask);
+	}
+
+	/**
+	 * The TUI transcript strip: the message with its plan blocks removed, or
+	 * undefined to leave the transcript alone. Non-TUI modes keep the block —
+	 * it is the model's only record of the proposal, and the user may reply
+	 * with item numbers to execute — and `hide` (resolved from `hidePlan`, per
+	 * task then global) opts out of the strip.
+	 */
+	function stripPlanForTranscript(
+		message: MessageEndEvent["message"],
+		hide: boolean,
+	): { message: MessageEndEvent["message"] } | undefined {
+		if (!hide || lastCtx?.mode !== "tui") return undefined;
+		const stripped = stripPlanFromMessage(message);
+		return stripped ? { message: stripped } : undefined;
+	}
+
+	/**
+	 * Hide the plan block: while a Plan task is owed one (its prompt carried
+	 * PLAN_OUTPUT_INSTRUCTION — the auto-run in flight, or the turn that
+	 * finishes the work after that run was interrupted), capture the reply's
+	 * raw text for the questionnaire, then — in the TUI — replace the finalized
 	 * message with the plan block(s) stripped out. The runtime applies the
 	 * replacement in place, so the stripped text is what the model sees in
 	 * later turns and what the session file persists. In non-TUI modes the
 	 * block stays in the transcript: it is the model's only record of the
-	 * proposal, and the user may reply with item numbers to execute. Scoped
-	 * to the pending auto-run Plan task (renderTaskPrompt's gate), so a
-	 * plan-tagged JSON block in a normal conversation or in a non-Plan
-	 * auto-run's reply is never touched; `hidePlan` (per task, then global)
-	 * opts out of the strip.
+	 * proposal, and the user may reply with item numbers to execute. Scoped to
+	 * the owed Plan task (planCaptureTask), so a plan-tagged JSON block in a
+	 * normal conversation or in a non-Plan auto-run's reply is never touched;
+	 * `hidePlan` (per task, then global) opts out of the strip.
 	 */
 	pi.on("message_end", (event) => {
-		if (event.message.role !== "assistant" || !pendingSummaryTask) return;
-		const task = tasks.find((t) => t.name === pendingSummaryTask);
-		// Only the runs whose prompt carried PLAN_OUTPUT_INSTRUCTION (Plan
-		// tasks with the questionnaire enabled — renderTaskPrompt's gate)
-		// may have the block captured and stripped; a plan fence in any other
-		// reply is the user's content and stays in the transcript.
-		if (!task || !isPlanTask(task) || !(task.questionnaire ?? questionnaireEnabled)) return;
+		if (event.message.role !== "assistant") return;
+		const task = planCaptureTask();
+		if (!task) {
+			// Nothing owes a plan block: this is either the execution follow-up
+			// sent after a questionnaire confirm (strip any imitated fence so no
+			// raw JSON lingers — arming already honored `hidePlan`) or an
+			// unrelated turn (leave it untouched).
+			if (!stripOnlyRun) return;
+			return stripPlanForTranscript(event.message, true);
+		}
 		const text = assistantText(event.message.content);
-		const hasFence = /(?:```+|~~~+)[^\S\n]*plan\b/i.test(text);
-		if (!hasFence && !pendingPlanRaw) return;
+		if (!/(?:```+|~~~+)[^\S\n]*plan\b/i.test(text) && !pendingPlanRaw) return;
 		// Capture the raw (unstripped) text for the questionnaire — after the
 		// strip below the message text no longer carries the block. If an earlier
 		// message began the block, append this turn's text so split fences / trailing
 		// tags are included in the capture.
-		if (pendingPlanRaw) {
-			pendingPlanRaw += "\n" + text;
-		} else {
-			pendingPlanRaw = text;
-		}
-		// TUI-only strip: in non-TUI modes the block stays in the transcript
-		// so the model can resolve the item-number replies the notification
-		// offers (and the session file keeps the proposal on record).
-		if (lastCtx?.mode !== "tui") return;
-		// `hidePlan` (per task, then global) opts out of the strip.
-		if (!(task.hidePlan ?? hidePlanEnabled)) return;
-		const stripped = stripPlanFromMessage(event.message);
-		if (stripped) return { message: stripped };
+		pendingPlanRaw = pendingPlanRaw ? pendingPlanRaw + "\n" + text : text;
+		return stripPlanForTranscript(event.message, task.hidePlan ?? hidePlanEnabled);
 	});
 
 	pi.on("agent_end", (event) => {
@@ -1911,12 +2018,43 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						taskName: pendingSummaryTask,
 						text: pendingPlanRaw ?? assistantText(lastAssistant.content),
 					};
+					// The reply landed — nothing further is owed.
+					planFollowUpTask = null;
 				} else {
-					const summary = stepSummary(outcome, pendingSummaryTask, 0, 0);
-					lastCtx?.ui.notify(`do-always: ${summary}`, "info");
+					// The run was interrupted (Esc, provider error, a stop that
+					// never produced the final message).
+					if (pendingPlanRaw) {
+						// The block had already been emitted before the
+						// interruption, so the proposal is real — offer it rather
+						// than dropping the capture with the run.
+						pendingProposal = { taskName: pendingSummaryTask, text: pendingPlanRaw };
+						planFollowUpTask = null;
+					} else {
+						const summary = stepSummary(outcome, pendingSummaryTask, 0, 0);
+						lastCtx?.ui.notify(`do-always: ${summary}`, "info");
+						// planFollowUpTask stays armed: this run never produced
+						// the block it was asked for, so the next turn may.
+					}
 				}
 			}
 			pendingSummaryTask = null;
+			pendingPlanRaw = null;
+			return;
+		}
+		// The follow-up turn after an interrupted Plan auto-run (see
+		// planFollowUpTask): when it carries the block, its captured reply is
+		// offered as the proposal; when it finishes without one the user moved
+		// on and the debt is dropped; when it too is interrupted the next turn
+		// is still expected.
+		if (!chainWaiter && planFollowUpTask) {
+			const lastAssistant = lastAssistantMessage(event.messages);
+			const outcome = lastAssistant ? outcomeFromStopReason(lastAssistant.stopReason) : null;
+			if (pendingPlanRaw) {
+				pendingProposal = { taskName: planFollowUpTask, text: pendingPlanRaw };
+				planFollowUpTask = null;
+			} else if (outcome === "completed") {
+				planFollowUpTask = null;
+			}
 			pendingPlanRaw = null;
 			return;
 		}
@@ -1970,6 +2108,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// truly idle. A settle with no waiter is a plain user turn (or the
 	// settle of a completed auto-run, which offers its captured reply).
 	pi.on("agent_settled", () => {
+		// The session is fully idle — every message_end of the finished run
+		// has fired, so the execution follow-up's strip-only flag is done.
+		clearStripOnly();
 		if (chainWaiter) {
 			settleChainWaiter(chainWaiter.started ? (chainWaiter.outcome ?? "completed") : "failed-to-start");
 			return;
@@ -2007,11 +2148,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * Send a prompt and resolve when the run it starts has fully settled,
 	 * reporting the run's outcome (see armWaiter).
 	 */
-		function sendAndWait(prompt: string, graceMs = 10_000, stepIndex = 0): Promise<ChainStepOutcome> {
-				const done = armWaiter(graceMs, stepIndex);
-				pi.sendUserMessage(prompt, { deliverAs: 'followUp' });
-				return done;
-		}
+	function sendAndWait(prompt: string, graceMs = 10_000, stepIndex = 0): Promise<ChainStepOutcome> {
+		const done = armWaiter(graceMs, stepIndex);
+		pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+		return done;
+	}
 
 	/** Filter tasks by visibility (`hidden` flag + `when` condition) and refresh the completion cache. */
 	function refreshVisible(cwd: string, context: TaskContext): DoAlwaysTask[] {
@@ -2105,13 +2246,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	/** Put the task prompt into the editor (TUI) or send it as a user message (other modes). */
 	async function fillPrompt(task: DoAlwaysTask, ctx: ExtensionContext, context: TaskContext): Promise<void> {
 		// Commit browser: any task with `browser: "commits"` opens the
-		// date-grouped browser first. The name check keeps configs that
-		// predate the field working. After the selection: a task whose prompt
+		// date-grouped browser first (the legacy name-based trigger for
+		// "Review commits" is gone — loadConfig warns old configs to adopt
+		// the field). After the selection: a task whose prompt
 		// references {{selected_commits}} runs itself on the selection; a
 		// generic entry (e.g. "Browse commits") proposes the Plan tasks to
 		// run on it — hidden tasks included, since they exist to be picked
 		// here (non-TUI: the first one whose guards pass).
-		if (task.browser === "commits" || task.name === "Review commits") {
+		if (task.browser === "commits") {
 			let selected: SelectedCommit[] = [];
 			if (ctx.mode !== "tui") {
 				const initialData = await fetchCommitsPage(ctx.cwd, 0, 1);
@@ -3159,10 +3301,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// run. Samples: "ok" (default) is a well-formed reply with a closed
 		// plan block; "malformed" is the failure mode observed in the wild
 		// (unclosed fence, JSON cut off before the root brace, trailing
-		// tool-call XML tags); "last" uses the last assistant reply of this
-		// session — the way to check why the questionnaire was or wasn't
-		// offered after a real Plan run. Confirming never sends anything:
-		// the execution prompt is printed instead.
+		// tool-call XML tags); "stray" is the other one (complete JSON, but a
+		// tier closed with an extra brace — exercises the closer repair);
+		// "last" uses the last assistant reply of this session — the way to
+		// check why the questionnaire was or wasn't offered after a real Plan
+		// run. Confirming never sends anything: the execution prompt is
+		// printed instead.
 		if (arg.toLowerCase().startsWith("testplan")) {
 			const [, sub = "ok"] = arg.toLowerCase().split(/\s+/);
 			let text: string;
@@ -3177,11 +3321,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			} else if (sub === "malformed") {
 				text = TEST_PLAN_SAMPLE_MALFORMED;
 				label = "the malformed sample (unclosed fence, truncated JSON, trailing tool tags)";
+			} else if (sub === "stray") {
+				text = TEST_PLAN_SAMPLE_STRAY_BRACE;
+				label = "the stray-brace sample (complete JSON, one tier closed with an extra brace)";
 			} else if (sub === "ok") {
 				text = TEST_PLAN_SAMPLE_OK;
 				label = "the well-formed sample";
 			} else {
-				ctx.ui.notify("do-always: testplan [ok|malformed|last] — unknown sample (use ok, malformed, or last)", "info");
+				ctx.ui.notify("do-always: testplan [ok|malformed|stray|last] — unknown sample (use ok, malformed, stray, or last)", "info");
 				return;
 			}
 			// Always say what the parser concluded — that is the point of the

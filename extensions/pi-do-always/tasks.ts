@@ -571,41 +571,41 @@ export function parseConfig(
 				name: t.name,
 				prompt: t.prompt,
 			};
-				if (typeof t.description === "string") task.description = t.description;
-				if (typeof t.category === "string" && t.category.trim() !== "") task.category = t.category.trim();
-				if (typeof t.autoRun === "boolean") task.autoRun = t.autoRun;
-				if (typeof t.requireDirty === "boolean") task.requireDirty = t.requireDirty;
-				if (typeof t.hidden === "boolean") task.hidden = t.hidden;
-				if (typeof t.notForCommits === "boolean") task.notForCommits = t.notForCommits;
-				if (typeof t.questionnaire === "boolean") task.questionnaire = t.questionnaire;
-				if (typeof t.hidePlan === "boolean") task.hidePlan = t.hidePlan;
-				if (t.aliases !== undefined) {
-					if (Array.isArray(t.aliases) && t.aliases.every((a) => typeof a === "string")) {
-						task.aliases = t.aliases.filter((a) => a.trim() !== "");
-					} else {
-						onError(`do-always: ignoring invalid "aliases" in ${path} (expected an array of strings)`);
-					}
+			if (typeof t.description === "string") task.description = t.description;
+			if (typeof t.category === "string" && t.category.trim() !== "") task.category = t.category.trim();
+			if (typeof t.autoRun === "boolean") task.autoRun = t.autoRun;
+			if (typeof t.requireDirty === "boolean") task.requireDirty = t.requireDirty;
+			if (typeof t.hidden === "boolean") task.hidden = t.hidden;
+			if (typeof t.notForCommits === "boolean") task.notForCommits = t.notForCommits;
+			if (typeof t.questionnaire === "boolean") task.questionnaire = t.questionnaire;
+			if (typeof t.hidePlan === "boolean") task.hidePlan = t.hidePlan;
+			if (t.aliases !== undefined) {
+				if (Array.isArray(t.aliases) && t.aliases.every((a) => typeof a === "string")) {
+					task.aliases = t.aliases.filter((a) => a.trim() !== "");
+				} else {
+					onError(`do-always: ignoring invalid "aliases" in ${path} (expected an array of strings)`);
 				}
-				if (t.browser !== undefined) {
-					if (typeof t.browser === "string" && BROWSER_TYPES.includes(t.browser as BrowserType)) {
-						task.browser = t.browser as BrowserType;
-					} else {
-						onError(`do-always: ignoring invalid "browser" in ${path} (expected one of: ${BROWSER_TYPES.join(", ")})`);
-					}
+			}
+			if (t.browser !== undefined) {
+				if (typeof t.browser === "string" && BROWSER_TYPES.includes(t.browser as BrowserType)) {
+					task.browser = t.browser as BrowserType;
+				} else {
+					onError(`do-always: ignoring invalid "browser" in ${path} (expected one of: ${BROWSER_TYPES.join(", ")})`);
 				}
-				if (t.guards !== undefined) {
-					if (Array.isArray(t.guards)) {
-						const guards: Guard[] = [];
-						for (const g of t.guards) {
-							const parsed = parseGuard(g, path, onError);
-							if (parsed) guards.push(parsed);
-						}
-						if (guards.length > 0) task.guards = guards;
-					} else {
-						onError(`do-always: ignoring invalid "guards" in ${path} (expected an array of guards)`);
+			}
+			if (t.guards !== undefined) {
+				if (Array.isArray(t.guards)) {
+					const guards: Guard[] = [];
+					for (const g of t.guards) {
+						const parsed = parseGuard(g, path, onError);
+						if (parsed) guards.push(parsed);
 					}
+					if (guards.length > 0) task.guards = guards;
+				} else {
+					onError(`do-always: ignoring invalid "guards" in ${path} (expected an array of guards)`);
 				}
-				if (t.when !== undefined) {
+			}
+			if (t.when !== undefined) {
 				if (isValidWhen(t.when)) {
 					task.when = t.when;
 				} else {
@@ -1572,8 +1572,8 @@ export function groupCommitsByDate(commits: CommitInfo[]): DateGroup[] {
 /**
  * Format the selected commits as a numbered detail block (hash, subject,
  * author, date, stats per commit). Injected into task prompts via the
- * `{{selected_commits}}` placeholder; composed into the full review prompt by
- * `formatCommitReviewPrompt`.
+ * `{{selected_commits}}` placeholder (or appended as a "Selected commits:"
+ * block) by the commit-browser flow in index.ts.
  */
 export function formatSelectedCommits(commits: SelectedCommit[]): string {
 	const count = commits.length;
@@ -1588,27 +1588,6 @@ export function formatSelectedCommits(commits: SelectedCommit[]): string {
 			);
 		})
 		.join("\n\n");
-}
-
-/**
- * Build the review prompt for the selected commits to send to the agent.
- */
-export function formatCommitReviewPrompt(commits: SelectedCommit[]): string {
-	const count = commits.length;
-	const commitDetails = formatSelectedCommits(commits);
-
-	const showCmd = count === 1 ? `git show ${commits[0].hash}` : "git show <hash>";
-
-	return (
-		`Review the following git commit${count !== 1 ? "s" : ""}:\n\n` +
-		`${commitDetails}\n\n` +
-		`Please inspect the changes using \`${showCmd}\` (and any related files in the repository). ` +
-		`Double-check the changes for:\n` +
-		`1. Bugs, edge cases, potential regressions, and logic errors.\n` +
-		`2. Code quality, security, and unintended side effects.\n` +
-		`3. Consistency with surrounding project patterns and tests.\n\n` +
-		`Summarize your findings for each commit and propose a plan for any fixes if needed. Do not make changes yet.`
-	);
 }
 
 // ── Plan proposal ────────────────────────────────────────────────────────────
@@ -1684,6 +1663,22 @@ export const TEST_PLAN_SAMPLE_MALFORMED =
 	"</parameter>\n" +
 	"</function>\n" +
 	"</tool_call>";
+
+/**
+ * Sample reply for `/do-always testplan stray`: the second failure mode
+ * observed in the wild — the JSON is complete but one tier is closed with an
+ * extra brace (`}]}},` where `}]},` belongs). Parses only through the lenient
+ * path's mismatched-closer repair; without it the stray brace costs every
+ * later tier.
+ */
+export const TEST_PLAN_SAMPLE_STRAY_BRACE =
+	"Reviewed the code. Findings below.\n\n" +
+	"```plan\n" +
+	'{"summary":"Split index.ts and de-duplicate the default tasks","tiers":[' +
+	'{"id":"P0","label":"Critical","items":[{"title":"Remove the redundant do-always.json","detail":"byte-for-byte the same 13 tasks as DEFAULT_TASKS"}]}},' +
+	'{"id":"P1","label":"High","items":[{"title":"Split index.ts into focused modules","detail":"3389 lines mixing 8+ concerns"}]},' +
+	'{"id":"P2","label":"Medium","items":[{"title":"Share the keyboard-navigation boilerplate","detail":"browseCommits, showPlanQuestionnaire and showSelector repeat it"}]}]}\n' +
+	"```\n";
 
 /** One concrete action item proposed by a Plan run. */
 export interface PlanItem {
@@ -1903,31 +1898,113 @@ function extractJsonObject(str: string): string | null {
 }
 
 /**
- * Parse JSON with fallbacks for common LLM quirks:
+ * The first closing token that does not match what is open, and the containers
+ * still open at that point (`mismatchAt` is -1 when every closer matches).
+ */
+function scanJsonClosers(str: string): { mismatchAt: number; open: string[] } {
+	let inString = false;
+	let escaped = false;
+	const open: string[] = [];
+	for (let i = 0; i < str.length; i++) {
+		const ch = str[i];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (ch === "\\") escaped = true;
+			else if (ch === '"') inString = false;
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+		} else if (ch === "{" || ch === "[") {
+			open.push(ch === "{" ? "}" : "]");
+		} else if (ch === "}" || ch === "]") {
+			if (open.length === 0 || open[open.length - 1] !== ch) return { mismatchAt: i, open };
+			open.pop();
+		}
+	}
+	return { mismatchAt: -1, open };
+}
+
+/**
+ * Repair mismatched closing tokens. The observed failure is a stray closer —
+ * an agent emitting `}]}},` where `}]},` belongs — which is fatal to every
+ * other repair: extractJsonObject scans past it (the closer simply does not
+ * pop), so the character survives into each candidate and the whole plan is
+ * lost to one misplaced brace.
+ *
+ * Two readings are returned, best guess first, because which one is right
+ * depends on text the scanner has not reached yet:
+ *   "drop"      — the closer is stray, so removing it (and any further strays)
+ *                 keeps every tier that follows. Preferred: it loses nothing.
+ *   "autoclose" — a closer is missing, so the still-open inner containers are
+ *                 closed at the mismatch and the text after it is dropped.
+ *
+ * Empty when every closer matches (nothing to repair), so well-formed and
+ * merely-truncated blocks keep their existing path untouched.
+ */
+function repairMismatchedClosers(str: string): string[] {
+	const first = scanJsonClosers(str);
+	if (first.mismatchAt === -1) return [];
+	const out: string[] = [];
+
+	// "drop": remove each stray closer in turn, then close whatever is still
+	// open so a block that was also truncated mid-tail still parses.
+	let dropped = str;
+	for (let guard = 0; guard < 64; guard++) {
+		const scan = scanJsonClosers(dropped);
+		if (scan.mismatchAt === -1) {
+			dropped += scan.open.reverse().join("");
+			break;
+		}
+		dropped = dropped.slice(0, scan.mismatchAt) + dropped.slice(scan.mismatchAt + 1);
+	}
+	if (dropped !== str) out.push(dropped);
+
+	// "autoclose": close the containers the mismatched closer jumped over,
+	// then honour that closer and stop — the rest sits outside the object.
+	const closer = str[first.mismatchAt];
+	const open = first.open.slice();
+	const needed: string[] = [];
+	while (open.length > 0 && open[open.length - 1] !== closer) needed.push(open.pop()!);
+	const autoclose =
+		str.slice(0, first.mismatchAt) + needed.join("") + (open.length > 0 ? closer : "");
+	if (autoclose !== str && !out.includes(autoclose)) out.push(autoclose);
+
+	return out;
+}
+
+/**
+ * Parse JSON with fallbacks for common LLM quirks, best guess first:
  * 1. Direct JSON.parse
  * 2. Extracting { ... } ignoring trailing tags/prose and auto-closing missing braces
  * 3. Sanitizing literal newlines inside string literals
+ * 4. Repairing mismatched closing tokens of 2 and 3 (see repairMismatchedClosers)
+ *
+ * The first candidate that parses wins; when none does, the last parse error is
+ * reported so planBlockDiagnostics can explain the failure.
  */
 function parseLenientJson(raw: string): { data: unknown; error: string | null } {
+	const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 	try {
 		return { data: JSON.parse(raw.trim()), error: null };
 	} catch (err1) {
 		const extracted = extractJsonObject(raw);
-		if (extracted) {
+		if (extracted === null) return { data: null, error: message(err1) };
+
+		const bases = [extracted];
+		const sanitized = sanitizeJsonStrings(extracted);
+		if (sanitized !== extracted) bases.push(sanitized);
+		const candidates = [...bases, ...bases.flatMap(repairMismatchedClosers)];
+
+		let lastError = message(err1);
+		for (const candidate of candidates) {
 			try {
-				return { data: JSON.parse(extracted), error: null };
-			} catch (err2) {
-				try {
-					const sanitized = sanitizeJsonStrings(extracted);
-					return { data: JSON.parse(sanitized), error: null };
-				} catch (err3) {
-					const rawErr = err3 instanceof Error ? err3.message : String(err3);
-					return { data: null, error: rawErr };
-				}
+				return { data: JSON.parse(candidate), error: null };
+			} catch (err) {
+				lastError = message(err);
 			}
 		}
-		const rawErr = err1 instanceof Error ? err1.message : String(err1);
-		return { data: null, error: rawErr };
+		return { data: null, error: lastError };
 	}
 }
 
@@ -2184,7 +2261,8 @@ export function formatPlanExecutionPrompt(selected: PlanSelectionEntry[], taskNa
 	const lines: string[] = [
 		`Execute the following action items from the "${taskName}" plan proposal, in exactly this order. ` +
 			"Do ONLY these items — skip every other item from the proposal, and do not start anything else. " +
-			"When done, summarize what you changed.",
+			"When done, summarize what you changed. " +
+			"This is an execution run: do NOT emit a ```plan block in your reply — a plain summary is enough.",
 		"",
 	];
 	selected.forEach(({ tier, item, note }, i) => {
