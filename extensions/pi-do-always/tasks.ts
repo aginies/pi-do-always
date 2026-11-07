@@ -164,6 +164,15 @@ type DoAlwaysConfig =
 			 */
 			planNudge?: boolean;
 			/**
+			 * Whether an ORDINARY turn (no Plan auto-run armed) whose reply ENDS
+			 * with a parseable plan block still opens the questionnaire. Models
+			 * imitate the plan-block instruction that is still visible in the
+			 * conversation context, so a plain "propose something" turn can end
+			 * with a real proposal nobody consumes. Default true; set false to
+			 * leave such a block in the transcript untouched.
+			 */
+			anyPlan?: boolean;
+			/**
 			 * A global alias map: `{ "rc": "Review changes" }` maps a short
 			 * alias string to a task name. Aliases are case-insensitive and
 			 * are tried before the task's own name. Invalid entries (non-string
@@ -212,6 +221,12 @@ interface ParsedDoAlwaysConfig {
 	 * (default: on).
 	 */
 	planNudge: boolean | undefined;
+	/**
+	 * The `anyPlan` field, if present: whether an ordinary turn whose reply
+	 * ends with a parseable plan block opens the questionnaire too.
+	 * undefined when the file does not set one (default: on).
+	 */
+	anyPlan: boolean | undefined;
 	/**
 	 * A global alias map parsed from the config object: `{ "rc": "Review changes" }`.
 	 * undefined when the file does not set one.
@@ -553,14 +568,14 @@ export function parseConfig(
 		data = JSON.parse(raw);
 	} catch (err) {
 		onError(`do-always: invalid JSON in ${path}: ${err}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, aliases: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined };
 	}
 
 	const list = Array.isArray(data) ? data : data?.tasks;
 
 	if (!Array.isArray(list)) {
 		onError(`do-always: ${path} must be a JSON array of tasks or {"tasks": [...]}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, aliases: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined };
 	}
 
 	const tasks: DoAlwaysTask[] = [];
@@ -649,6 +664,11 @@ export function parseConfig(
 		if (typeof data.planNudge === "boolean") planNudge = data.planNudge;
 		else onError(`do-always: ignoring invalid "planNudge" in ${path} (expected true or false)`);
 	}
+	let anyPlan: boolean | undefined;
+	if (!Array.isArray(data) && "anyPlan" in data) {
+		if (typeof data.anyPlan === "boolean") anyPlan = data.anyPlan;
+		else onError(`do-always: ignoring invalid "anyPlan" in ${path} (expected true or false)`);
+	}
 	let aliases: Record<string, string> | undefined;
 	if (!Array.isArray(data) && "aliases" in data) {
 		if (typeof data.aliases === "object" && data.aliases !== null && !Array.isArray(data.aliases)) {
@@ -662,7 +682,7 @@ export function parseConfig(
 		}
 	}
 
-	return { tasks, shortcut, merge, report, questionnaire, hidePlan, planNudge, aliases };
+	return { tasks, shortcut, merge, report, questionnaire, hidePlan, planNudge, anyPlan, aliases };
 }
 
 const KEY_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -2057,7 +2077,7 @@ export function planBlockDiagnostics(text: string): PlanBlockDiagnostic {
 			}
 			continue;
 		}
-		const proposal = normalizePlanData(parsed.data);
+		const proposal = normalizePlanData(parsed.data, fences[i].body);
 		if (proposal) {
 			const count = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
 			if (count > 0) return { kind: "ok", itemCount: count };
@@ -2070,6 +2090,28 @@ export function planBlockDiagnostics(text: string): PlanBlockDiagnostic {
 }
 
 /**
+ * Whether `text` ENDS with a plan block: a plan fence whose body runs to the
+ * end of the reply — a closed fence with nothing but whitespace after it, or a
+ * fence the reply never closed. This is the shape PLAN_OUTPUT_INSTRUCTION asks
+ * for ("the plan block must be the very last thing in your reply"), so a reply
+ * ending with one is a proposal even when no Plan auto-run asked for it, while
+ * a plan fence quoted mid-reply (documentation, an example, a discussion of the
+ * format) is ordinary content.
+ */
+export function endsWithPlanBlock(text: string): boolean {
+	if (typeof text !== "string" || text === "") return false;
+	const closedRe = new RegExp(PLAN_CLOSED_FENCE_RE.source, "gi");
+	let lastEnd = -1;
+	let match: RegExpExecArray | null;
+	while ((match = closedRe.exec(text)) !== null) lastEnd = match.index + match[0].length;
+	const tail = lastEnd >= 0 ? text.slice(lastEnd) : text;
+	if (tail.trim() === "") return lastEnd >= 0;
+	// No closed fence at the end: an unclosed plan fence running to the end of
+	// the text counts too (the lenient parser reads it as the plan block).
+	return PLAN_UNCLOSED_FENCE_RE.test(tail);
+}
+
+/**
  * Normalize one plan block's JSON body. Accepts the tiered shape
  * ({tiers: [{id, label, items: [...]}]}) and a lenient flat shape
  * ({items: [{tier, title, ...}]}, grouped preserving first-seen tier
@@ -2078,11 +2120,119 @@ export function planBlockDiagnostics(text: string): PlanBlockDiagnostic {
  */
 function normalizePlanJson(raw: string): PlanProposal | null {
 	const { data } = parseLenientJson(raw);
-	return normalizePlanData(data);
+	return normalizePlanData(data, raw);
 }
 
-function normalizePlanData(data: unknown): PlanProposal | null {
-	if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+/**
+ * Recover plan tiers directly from a block's raw JSON body, ignoring the
+ * enclosing `tiers` array / root object structure. This is the last-resort
+ * path for blocks whose braces were written out of order — e.g. a stray `]`
+ * that closes the `tiers` array early so `extractJsonObject` stops at the
+ * first balanced point and silently drops every tier emitted after it.
+ *
+ * A tier is any balanced `{ ... }` object that carries a non-empty `items`
+ * array but is not itself the plan root (no `summary`/`tiers` markers). The
+ * root, the `tiers` array, and the leaf items (which have no `items` key) are
+ * all excluded, so only the tier objects survive — wherever they sit in the
+ * text, nested or flat, even when the container braces are broken.
+ */
+function mineTiers(rawBody: string): string[] {
+	// matchBrace: index of the char closing the open bracket at openIdx, or -1.
+	const matchBrace = (
+		s: string,
+		openIdx: number,
+		openChar: string,
+		closeChar: string,
+	): number => {
+		let inString = false;
+		let escaped = false;
+		let depth = 0;
+		for (let i = openIdx; i < s.length; i++) {
+			const ch = s[i];
+			if (inString) {
+				if (escaped) escaped = false;
+				else if (ch === "\\") escaped = true;
+				else if (ch === "\"") inString = false;
+				continue;
+			}
+			if (ch === "\"") inString = true;
+			else if (ch === openChar) depth++;
+			else if (ch === closeChar) {
+				depth--;
+				if (depth === 0) return i;
+			}
+		}
+		return -1;
+	};
+
+	// Every balanced { ... } object in the text, at any nesting depth. Braces
+	// inside string literals are ignored.
+	const objects: { start: number; end: number }[] = [];
+	let inString = false;
+	let escaped = false;
+	const stack: number[] = [];
+	for (let i = 0; i < rawBody.length; i++) {
+		const ch = rawBody[i];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (ch === "\\") escaped = true;
+			else if (ch === "\"") inString = false;
+			continue;
+		}
+		if (ch === "\"") inString = true;
+		else if (ch === "{") stack.push(i);
+		else if (ch === "}") {
+			const open = stack.pop();
+			if (open !== undefined) objects.push({ start: open, end: i });
+		}
+	}
+
+	const isTier = (objText: string): boolean => {
+		// Exclude the plan root, which carries summary/tiers markers.
+		if (/"(tiers|summary)"\s*:/.test(objText)) return false;
+		const key = objText.match(/"items"\s*:/);
+		if (!key) return false;
+		const arrStart = objText.indexOf("[", key.index);
+		if (arrStart === -1) return false;
+		const arrEnd = matchBrace(objText, arrStart, "[", "]");
+		if (arrEnd === -1) return false;
+		const inner = objText.slice(arrStart + 1, arrEnd).trim();
+		return inner.length > 0 && inner[0] !== "]";
+	};
+
+	const tierObjects = objects
+		.filter((o) => isTier(rawBody.slice(o.start, o.end + 1)))
+		.sort((a, b) => a.start - b.start);
+
+	// Keep only the outermost tier objects (a tier never legitimately nests
+	// inside another tier), in document order.
+	const kept: { start: number; end: number }[] = [];
+	for (const o of tierObjects) {
+		if (!kept.some((k) => k.start <= o.start && k.end >= o.end)) kept.push(o);
+	}
+	return kept.map((o) => rawBody.slice(o.start, o.end + 1));
+}
+
+/** Normalize a list of tier objects mined from a raw plan body, in order. */
+function normalizeMinedTiers(rawBody: string): PlanTier[] {
+	const tiers: PlanTier[] = [];
+	for (const objText of mineTiers(rawBody)) {
+		const { data } = parseLenientJson(objText);
+		if (data === null || data === undefined) continue;
+		const tier = normalizePlanTier(data, tiers.length);
+		if (tier) tiers.push(tier);
+	}
+	return tiers;
+}
+
+function normalizePlanData(data: unknown, rawBody?: string): PlanProposal | null {
+	// Mine first: this is the only path that recovers tiers when the whole
+	// block fails to parse (e.g. a stray `]` that closes the tiers array and
+	// the root before later tiers, leaving them outside every container).
+	const mined = rawBody ? normalizeMinedTiers(rawBody) : null;
+	if (typeof data !== "object" || data === null || Array.isArray(data)) {
+		return mined && mined.length ? { summary: extractSummaryFromBody(rawBody), tiers: mined } : null;
+	}
 	const obj = data as Record<string, unknown>;
 	const summary =
 		typeof obj.summary === "string" && obj.summary.trim() !== "" ? obj.summary.trim() : undefined;
@@ -2107,8 +2257,24 @@ function normalizePlanData(data: unknown): PlanProposal | null {
 		}
 		for (const tier of byTier.values()) tiers.push(tier);
 	}
+
+	// If the structured tiers array / flat shape yielded fewer tiers than the
+	// mining fallback found, prefer the mining result: a stray closer that
+	// closed the `tiers` array early makes the structured path stop after the
+	// first tier, while mining still recovers every tier in the block.
+	if (mined && mined.length > tiers.length) tiers.splice(0, tiers.length, ...mined);
+
 	if (tiers.length === 0) return null;
-	return { summary, tiers };
+	return { summary: summary ?? extractSummaryFromBody(rawBody), tiers };
+}
+
+/** Best-effort summary string from a raw plan body when the JSON did not parse. */
+function extractSummaryFromBody(rawBody?: string): string | undefined {
+	if (!rawBody) return undefined;
+	const m = rawBody.match(/"summary"\s*:\s*"((?:\\.|[^"\\])*)"/);
+	if (!m) return undefined;
+	const s = m[1].replace(/\\n/g, " ").replace(/\\"/g, "\"").trim();
+	return s || undefined;
 }
 
 /** Normalize one tier entry; null when it carries no valid items. */

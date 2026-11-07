@@ -239,6 +239,17 @@ your numbers back to the items. The
 questionnaire is offered only on the single auto-run path (selector pick,
 `/do-always <n>`, commit picker) — chain steps never get it.
 
+A plan block does not have to come from a Plan task to be actionable: the
+plan-block instruction stays visible in the conversation context, so models
+imitate it and end an **ordinary** reply with a real proposal. Such a reply is
+captured the same way (raw text kept for the parser, fence stripped from the
+transcript per `hidePlan`) and opens the questionnaire under the name
+`Ad-hoc plan`. The gate is deliberately narrow — the block must be the very
+last thing in the reply and must parse to at least one action item — so a plan
+fence quoted mid-reply as documentation or an example is left alone, and a
+reply that goes on after the block is not hijacked. Set `anyPlan` to `false`
+to restrict proposals to Plan tasks only.
+
 ## Tasks configuration
 
 Tasks are read from JSON files (an array of tasks, or the object form `{"tasks": [...], "shortcut": "f4"}`):
@@ -287,6 +298,7 @@ In the object form you can also configure the selector shortcut:
 - `questionnaire` (optional) — whether completed auto-run tasks whose reply carries a plan block offer the selection questionnaire. Default `true`; set `false` to keep the plain summary notification. The project file's value wins over the global one. See [Plan questionnaire](#plan-questionnaire).
 - `hidePlan` (optional) — whether the raw `plan` block is stripped from the transcript after a completed auto-run task (TUI only — in non-TUI modes the block is always kept). Default `true`; set `false` to keep the block visible in the conversation. The project file's value wins over the global one.
 - `planNudge` (optional) — whether a completed auto-run Plan task whose reply has no usable plan block (none at all — the model wrote the plan as plain prose — or malformed JSON) triggers one follow-up asking the agent to emit the block before the plain-summary fallback. At most one nudge per run; the nudge run's reply is parsed like any other. Default `true`; set `false` to keep the old behavior (warn and offer no questionnaire). The project file's value wins over the global one.
+- `anyPlan` (optional) — whether an **ordinary** turn (no Plan auto-run armed) whose reply *ends* with a parseable plan block is captured, stripped and offered as a proposal too. Models imitate the plan-block instruction that is still visible in the conversation context, so a plain "what should we do?" turn can end with a real proposal; without this the raw JSON just sits in the transcript with no way to act on it. The gate is narrow — the block must be the very last thing in the reply and must parse to at least one action item — so a plan fence quoted mid-reply (documentation, an example) is never touched. Default `true`; set `false` to only ever offer proposals from Plan tasks. The project file's value wins over the global one.
 - `aliases` (optional) — a global alias map: an object that maps short alias strings to task names, e.g. `{ "rc": "Review changes", "bl": "Build" }`. Each alias is case-insensitive and is tried before the task's own name, so `/do-always rc` resolves to the task named `Review changes`. Keys and values are trimmed; entries with empty keys or non-string values are silently dropped. The project file's value wins over the global one.
 
 ```json

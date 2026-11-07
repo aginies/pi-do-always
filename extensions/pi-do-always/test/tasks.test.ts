@@ -22,6 +22,7 @@ import {
 	chainClear,
 	chainRemove,
 	chainRunLabel,
+	endsWithPlanBlock,
 	chainUndo,
 	evaluateGuards,
 	evaluateWhen,
@@ -2521,4 +2522,83 @@ test("parsePlanProposal successfully parses the full MoCap report sample", () =>
 	const totalItems = p.tiers.reduce((n, t) => n + t.items.length, 0);
 	assert.equal(totalItems, 13);
 	assert.deepEqual(planBlockDiagnostics(text), { kind: "ok", itemCount: 13 });
+});
+
+// ---------------------------------------------------------------------------
+// Tier mining (0.23.0) — a block whose containers were closed out of order
+//
+// A stray `]` that closes the `tiers` array early makes the structured read
+// stop at the first balanced point, silently dropping every tier emitted after
+// it. normalizePlanData therefore also mines the raw body: every balanced
+// { ... } object carrying a non-empty `items` array (the root and the leaf
+// items excluded) is a tier, outermost first, in document order.
+// ---------------------------------------------------------------------------
+
+const FENCE = "```";
+/** Wrap a raw plan body the way an agent's reply does. */
+const planText = (body: string) => `Done.\n\n${FENCE}plan\n${body}\n${FENCE}\n`;
+
+test("parsePlanProposal recovers every tier when a stray ] closes the tiers array early", () => {
+	const body =
+		'{"summary":"Two tiers","tiers":[' +
+		'{"id":"P0","label":"Critical","items":[{"title":"first","detail":"a.ts:1"}]}],' + // stray ] closes tiers
+		'{"id":"P1","label":"Important","items":[{"title":"second","detail":"b.ts:2"}]}]}';
+	const p = parsePlanProposal(planText(body));
+	assert.ok(p, "the block is still a usable proposal");
+	assert.equal(p.summary, "Two tiers", "the summary is read from the raw body");
+	assert.deepEqual(
+		p.tiers.map((t) => [t.id, t.label, t.items.map((i) => i.title)]),
+		[
+			["P0", "Critical", ["first"]],
+			["P1", "Important", ["second"]],
+		],
+		"the tier AFTER the stray closer survives, in document order",
+	);
+});
+
+test("tier mining keeps working when the root object never closes", () => {
+	const body =
+		'{"summary":"S","tiers":[{"id":"P0","items":[{"title":"a"}]}],{"id":"P1","items":[{"title":"b"}]}';
+	const p = parsePlanProposal(planText(body));
+	assert.ok(p);
+	assert.deepEqual(
+		p.tiers.map((t) => t.items.map((i) => i.title)),
+		[["a"], ["b"]],
+	);
+});
+
+test("tier mining reads tiers that sit outside any array", () => {
+	const body = '{"summary":"S","tiers":[{"id":"P0","items":[{"title":"a"}]}] {"id":"P1","items":[{"title":"b"}]}';
+	const p = parsePlanProposal(planText(body));
+	assert.ok(p);
+	assert.equal(p.tiers.length, 2);
+	assert.equal(p.summary, "S");
+});
+
+test("tier mining never invents tiers out of leaf items or the root", () => {
+	// A well-formed block must come out unchanged: the root carries
+	// summary/tiers (excluded) and the items have no `items` key (excluded).
+	const body =
+		'{"summary":"S","tiers":[{"id":"P0","label":"Critical","items":[{"title":"a","detail":"d"}]}]}';
+	const p = parsePlanProposal(planText(body));
+	assert.ok(p);
+	assert.equal(p.tiers.length, 1);
+	assert.equal(p.tiers[0].items.length, 1);
+	assert.equal(p.tiers[0].items[0].title, "a");
+});
+
+// ---------------------------------------------------------------------------
+// endsWithPlanBlock (0.24.0) — the gate for the ad-hoc capture
+// ---------------------------------------------------------------------------
+
+test("endsWithPlanBlock accepts only a block at the very end of the reply", () => {
+	const block = `${FENCE}plan\n{"summary":"s","tiers":[]}\n${FENCE}`;
+	assert.equal(endsWithPlanBlock(`Here you go.\n\n${block}`), true, "a closed trailing fence");
+	assert.equal(endsWithPlanBlock(`Here you go.\n\n${block}\n\n  `), true, "trailing whitespace still counts");
+	assert.equal(endsWithPlanBlock(`Here you go.\n\n${block}\nUse that shape yourself.`), false, "prose after it is content");
+	assert.equal(endsWithPlanBlock('Intro.\n\n```plan\n{"summary":"s"'), true, "an unclosed trailing fence counts too");
+	assert.equal(endsWithPlanBlock("A plain reply with no fence at all"), false);
+	assert.equal(endsWithPlanBlock("```plan mentioned inline``` and more text"), false);
+	assert.equal(endsWithPlanBlock(""), false);
+	assert.equal(endsWithPlanBlock(undefined as unknown as string), false, "non-string input is safe");
 });

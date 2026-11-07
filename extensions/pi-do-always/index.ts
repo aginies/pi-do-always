@@ -76,6 +76,7 @@ import {
 	evaluateWhen,
 	formatChainSequence,
 	formatList,
+	endsWithPlanBlock,
 	formatPlanExecutionPrompt,
 	formatSelectedCommits,
 	groupTasksByCategory,
@@ -177,6 +178,8 @@ function loadConfig(
 	hidePlan: boolean;
 	/** Whether a missing plan block triggers one nudge follow-up (default true). */
 	planNudge: boolean;
+	/** Whether an ordinary turn's trailing plan block is offered too (default true). */
+	anyPlan: boolean;
 } {
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
@@ -186,10 +189,10 @@ function loadConfig(
 
 	const global = globalRaw !== null
 		? parseConfig(globalRaw, globalPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined };
 	const project = projectRaw !== null
 		? parseConfig(projectRaw, projectPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined };
 
 	// The project file's merge mode wins; otherwise the global value; otherwise
 	// override (the historical behavior), so existing configs are unaffected.
@@ -221,6 +224,9 @@ function loadConfig(
 		hidePlan: project.hidePlan ?? global.hidePlan ?? true,
 		// Same precedence: project, then global, then on (the nudge is sent).
 		planNudge: project.planNudge ?? global.planNudge ?? true,
+		// Same precedence: project, then global, then on (a trailing plan block
+		// in an ordinary turn is offered as a proposal too).
+		anyPlan: project.anyPlan ?? global.anyPlan ?? true,
 	};
 }
 
@@ -1072,6 +1078,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		pendingProposal = null;
 		lastProposal = null;
 		pendingPlanRaw = null;
+		adhocPlanRaw = null;
 		lastAssistantText = null;
 		planNudgeSent = false;
 		planFollowUpTask = null;
@@ -1124,6 +1131,27 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// (config `planNudge`, default true). Refreshed whenever the config is
 	// (re)loaded.
 	let planNudgeEnabled = true;
+	// Whether an ordinary turn (no Plan auto-run armed) whose reply ENDS with
+	// a parseable plan block is captured, stripped and offered as a proposal
+	// too (config `anyPlan`, default true). Models imitate the plan-block
+	// instruction that is still visible in the conversation context, so a plain
+	// "what should we do?" turn can end with a real proposal nobody consumes —
+	// raw JSON in the transcript and no way to act on it. Refreshed whenever
+	// the config is (re)loaded.
+	let anyPlanEnabled = true;
+
+	/**
+	 * The proposal name shown for a plan block captured outside a Plan
+	 * auto-run (see `anyPlanEnabled`). It is not a task name, so
+	 * offerPlanProposal falls back to the global `questionnaire`/`hidePlan`
+	 * settings for it.
+	 */
+	const AD_HOC_PLAN_LABEL = "Ad-hoc plan";
+	// The raw (unstripped) text of an ordinary turn whose reply ended with a
+	// parseable plan block. Captured at message_end, turned into the pending
+	// proposal at agent_end, cleared on agent_start (a new run makes it stale)
+	// and on session start.
+	let adhocPlanRaw: string | null = null;
 
 	/** The result of the plan questionnaire: the confirmed selection, or a withdrawal. */
 	type PlanQuestionnaireResult =
@@ -1858,6 +1886,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// user typed a prompt right after the Plan run ended) — it is stale.
 		pendingProposal = null;
 		pendingPlanRaw = null;
+		adhocPlanRaw = null;
 		// The run actually began — time the step for the report.
 		if (chainReport) chainReport.stepStartedAt = new Date();
 		// Fill-first: step 1 left the editor and is running — update the
@@ -1953,6 +1982,40 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Ad-hoc plan capture: an ORDINARY turn (no Plan auto-run armed, no chain
+	 * step in flight) whose reply ENDS with a parseable plan block. Models
+	 * imitate the PLAN_OUTPUT_INSTRUCTION that is still visible in the
+	 * conversation context, so a plain "what should we do?" turn can end with a
+	 * real proposal nobody consumes: raw JSON in the transcript and no way to
+	 * act on it. Captured like an auto-run's block (raw text kept for the
+	 * parser, fence stripped from the TUI transcript per `hidePlan`) and offered
+	 * at the settle under the AD_HOC_PLAN_LABEL name.
+	 *
+	 * Deliberately narrow, so a plan fence that is *content* is never eaten:
+	 * the block must be the very last thing in the message and must parse to at
+	 * least one action item — a fence quoted mid-reply (documentation, an
+	 * example, a discussion of the format) is left alone. `anyPlan: false`
+	 * disables the whole path.
+	 */
+	function captureAdhocPlan(
+		message: MessageEndEvent["message"],
+	): { message: MessageEndEvent["message"] } | undefined {
+		if (message.role !== "assistant") return undefined;
+		if (!anyPlanEnabled || !questionnaireEnabled) return undefined;
+		// Chain steps never get the questionnaire (see runChainSteps).
+		if (chainWaiter || chainActive) return undefined;
+		const text = assistantText(message.content);
+		if (text.trim() === "") return undefined;
+		if (!endsWithPlanBlock(text) || planBlockDiagnostics(text).kind !== "ok") return undefined;
+		// A run can finalize several assistant messages; the last one that ends
+		// with a proposal wins. The capture is never dropped once its fence has
+		// been stripped below, or the proposal would vanish from the transcript
+		// without ever being offered.
+		adhocPlanRaw = text;
+		return stripPlanForTranscript(message, hidePlanEnabled);
+	}
+
+	/**
 	 * Hide the plan block: while a Plan task is owed one (its prompt carried
 	 * PLAN_OUTPUT_INSTRUCTION — the auto-run in flight, or the turn that
 	 * finishes the work after that run was interrupted), capture the reply's
@@ -1973,9 +2036,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			// Nothing owes a plan block: this is either the execution follow-up
 			// sent after a questionnaire confirm (strip any imitated fence so no
 			// raw JSON lingers — arming already honored `hidePlan`) or an
-			// unrelated turn (leave it untouched).
-			if (!stripOnlyRun) return;
-			return stripPlanForTranscript(event.message, true);
+			// unrelated turn (leave it untouched, unless it ENDS with a real
+			// proposal — see captureAdhocPlan).
+			if (stripOnlyRun) return stripPlanForTranscript(event.message, true);
+			return captureAdhocPlan(event.message);
 		}
 		const text = assistantText(event.message.content);
 		if (!/(?:```+|~~~+)[^\S\n]*plan\b/i.test(text) && !pendingPlanRaw) return;
@@ -2056,6 +2120,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				planFollowUpTask = null;
 			}
 			pendingPlanRaw = null;
+			return;
+		}
+		if (!chainWaiter && adhocPlanRaw) {
+			// An ordinary turn ended with a plan block nobody asked for (see
+			// captureAdhocPlan): offer it as an ad-hoc proposal, exactly like an
+			// auto-run's own block.
+			pendingProposal = { taskName: AD_HOC_PLAN_LABEL, text: adhocPlanRaw };
+			adhocPlanRaw = null;
 			return;
 		}
 		if (!chainWaiter) return;
@@ -2201,6 +2273,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		questionnaireEnabled = config.questionnaire;
 		hidePlanEnabled = config.hidePlan;
 		planNudgeEnabled = config.planNudge;
+		anyPlanEnabled = config.anyPlan;
 		refreshVisible(ctx.cwd, await getContext(ctx.cwd));
 		registerShortcut(config.shortcut, onError);
 	});
@@ -3248,6 +3321,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			questionnaireEnabled = config.questionnaire;
 			hidePlanEnabled = config.hidePlan;
 			planNudgeEnabled = config.planNudge;
+			anyPlanEnabled = config.anyPlan;
 		}
 
 		// One context per command run: shared by visibility filtering, rendering,

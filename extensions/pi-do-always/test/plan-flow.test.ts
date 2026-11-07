@@ -19,7 +19,7 @@ type Part = { type: string; text?: string };
 type Msg = { role: string; content: Part[]; stopReason?: string };
 type Handler = (event: Record<string, unknown>, ctx: Record<string, unknown>) => unknown;
 /** The questionnaire component the extension hands back from ui.custom. */
-type Overlay = { handleInput?: (data: string) => void };
+type Overlay = { handleInput?: (data: string) => void; render?: (width: number) => string[] };
 
 interface Harness {
 	emit(event: string, payload?: Record<string, unknown>): Promise<void>;
@@ -28,6 +28,8 @@ interface Harness {
 	command(args: string): Promise<void>;
 	turn(messages: Msg[]): Promise<void>;
 	questionnaireOpened(): boolean;
+	/** The open questionnaire's rendered text ("" when none is open). */
+	overlayText(): string;
 	/** Answer the open questionnaire the way the TUI keys would. */
 	answer(kind: "confirm" | "withdraw"): Promise<void>;
 	sent(): string[];
@@ -35,10 +37,10 @@ interface Harness {
 	settle(): Promise<void>;
 }
 
-/** Boot the extension against a stub runtime with `tasks` as the global config. */
-function harness(tasks: unknown[]): Harness {
+/** Boot the extension against a stub runtime; `extra` adds config-file keys. */
+function harness(tasks: unknown[], extra: Record<string, unknown> = {}): Harness {
 	const dir = mkdtempSync(join(tmpdir(), "pi-do-always-test-"));
-	writeFileSync(join(dir, "do-always.json"), JSON.stringify({ tasks }));
+	writeFileSync(join(dir, "do-always.json"), JSON.stringify({ tasks, ...extra }));
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = dir;
 
@@ -156,6 +158,7 @@ function harness(tasks: unknown[]): Harness {
 			await h.settle();
 		},
 		questionnaireOpened: () => overlayOpened,
+		overlayText: () => (overlay?.render ? overlay.render(80).join("\n") : ""),
 		async answer(kind) {
 			(overlay as (Overlay & { __answer?: (k: string) => void }) | null)?.__answer?.(kind);
 			await h.settle();
@@ -239,7 +242,10 @@ test("Plan run aborted AFTER emitting the block still offers it", async () => {
 });
 
 test("a completed follow-up with no plan block drops the expectation", async () => {
-	const h = harness([PLAN_TASK]);
+	// anyPlan off: this test is about the Plan DEBT lapsing, and since 0.24.0 a
+	// trailing block in an ordinary turn is captured on its own (see the ad-hoc
+	// tests below) — which would open a questionnaire for the wrong reason.
+	const h = harness([PLAN_TASK], { anyPlan: false });
 	await h.start();
 	await h.command("flow plan");
 	await h.turn([textReply("interrupted", "aborted")]);
@@ -251,7 +257,9 @@ test("a completed follow-up with no plan block drops the expectation", async () 
 });
 
 test("an interrupted non-Plan auto-run never captures a later fence", async () => {
-	const h = harness([PLAIN_TASK]);
+	// anyPlan off: a Do task owes no block, and the ad-hoc path (0.24.0) is
+	// covered by its own tests below.
+	const h = harness([PLAIN_TASK], { anyPlan: false });
 	await h.start();
 	await h.command("flow build");
 	await h.turn([textReply("interrupted", "aborted")]);
@@ -262,7 +270,9 @@ test("an interrupted non-Plan auto-run never captures a later fence", async () =
 });
 
 test("session_start clears a pending Plan follow-up", async () => {
-	const h = harness([PLAN_TASK]);
+	// anyPlan off: what is asserted here is that the debt does not survive a new
+	// session, not the ad-hoc capture of a trailing block.
+	const h = harness([PLAN_TASK], { anyPlan: false });
 	await h.start();
 	await h.command("flow plan");
 	await h.turn([textReply("interrupted", "aborted")]);
@@ -327,4 +337,86 @@ test("a plan block with a stray closing brace still opens the questionnaire", as
 		h.sent().some((s) => s.includes("t1")),
 		"the tier AFTER the stray brace is still selectable and sent",
 	);
+});
+
+// ── Ad-hoc plan capture (anyPlan, 0.24.0) ────────────────────────────────────
+//
+// Models imitate the plan-block instruction that is still visible in the
+// conversation context, so an ORDINARY turn can end with a real proposal nobody
+// asked for. Such a reply is captured like an auto-run's block (raw text kept
+// for the parser, fence stripped per hidePlan) and offered as "Ad-hoc plan".
+
+test("an ordinary turn ending with a plan block is offered as an ad-hoc proposal", async () => {
+	const h = harness([PLAIN_TASK]); // no Plan task ever runs here
+	await h.start();
+	const reply = planReply("adhoc");
+	await h.turn([reply]);
+	assert.equal(h.questionnaireOpened(), true, "a trailing block is actionable");
+	assert.ok(h.overlayText().includes("Ad-hoc plan"), "and it is offered under the ad-hoc name");
+	assert.equal(hasFence(reply), false, "the fence is stripped from the transcript");
+	await h.answer("confirm");
+	assert.ok(h.sent().some((s) => s.startsWith("Execute the following action items")), "confirming sends the selection");
+});
+
+test("an ad-hoc block is captured even with no task configured at all", async () => {
+	const h = harness([]);
+	await h.start();
+	const reply = planReply("no-tasks");
+	await h.turn([reply]);
+	assert.equal(h.questionnaireOpened(), true);
+	assert.ok(h.overlayText().includes("Ad-hoc plan"));
+});
+
+test("a plan fence quoted mid-reply is left alone", async () => {
+	const h = harness([PLAIN_TASK]);
+	await h.start();
+	// The block is followed by prose: it is content (documentation, an example),
+	// not a proposal the user is being handed.
+	const quoted = (planReply("quoted").content[0]?.text ?? "") + "\nUse that shape in your own prompt.";
+	const reply = textReply(quoted);
+	await h.turn([reply]);
+	assert.equal(h.questionnaireOpened(), false, "only a TRAILING block is captured");
+	assert.equal(hasFence(reply), true, "and the fence stays in the transcript");
+});
+
+test("an unclosed trailing plan fence is captured too", async () => {
+	const h = harness([PLAIN_TASK]);
+	await h.start();
+	// The failure mode the lenient parser already recovers: the reply ends
+	// inside the fence (truncated output, trailing tool tags).
+	const reply = textReply(
+		"Here is what I would do.\n\n```plan\n" +
+			'{"summary":"T","tiers":[{"id":"P1","label":"High","items":[{"title":"t1","detail":"d1"}]}]}',
+	);
+	await h.turn([reply]);
+	assert.equal(h.questionnaireOpened(), true, "the trailing unclosed block is still a proposal");
+	assert.ok(h.overlayText().includes("t1"), "and its items are selectable");
+});
+
+test("anyPlan: false restricts proposals to Plan tasks", async () => {
+	const h = harness([PLAIN_TASK], { anyPlan: false });
+	await h.start();
+	const reply = planReply("adhoc-off");
+	await h.turn([reply]);
+	assert.equal(h.questionnaireOpened(), false, "an ordinary turn is never captured");
+	assert.equal(hasFence(reply), true, "and its fence is not stripped");
+});
+
+test("the global questionnaire switch also disables the ad-hoc capture", async () => {
+	const h = harness([PLAIN_TASK], { questionnaire: false });
+	await h.start();
+	const reply = planReply("adhoc-noq");
+	await h.turn([reply]);
+	assert.equal(h.questionnaireOpened(), false);
+	assert.equal(hasFence(reply), true);
+});
+
+test("a Plan auto-run's own block is never offered twice as ad-hoc", async () => {
+	const h = harness([PLAN_TASK]);
+	await h.start();
+	await h.command("flow plan");
+	const reply = planReply("once");
+	await h.turn([reply]);
+	assert.equal(h.questionnaireOpened(), true);
+	assert.ok(h.overlayText().includes("Flow Plan"), "offered under the task's name, not as Ad-hoc plan");
 });

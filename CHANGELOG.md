@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.24.0] - 2026-10-26
+
+### Added
+
+- **Ad-hoc plan proposals** (config `anyPlan`, default on): a plan block no
+  longer has to come from a Plan task to be actionable. The plan-block
+  instruction stays visible in the conversation context, so models imitate it
+  and end an *ordinary* reply with a real proposal — raw JSON in the transcript
+  that nobody could act on. Such a reply is now captured exactly like an
+  auto-run's block (the raw text is kept for the parser, the fence is stripped
+  from the TUI transcript per `hidePlan`) and opens the questionnaire under the
+  name `Ad-hoc plan`; confirming sends the selection as the usual execution
+  follow-up. The gate is deliberately narrow — the block must be the very last
+  thing in the reply and must parse to at least one action item — so a plan
+  fence quoted mid-reply (documentation, an example, a discussion of the
+  format) is left alone and a reply that goes on after the block is never
+  hijacked. Chain steps are excluded, as they are for Plan tasks. Set `anyPlan`
+  to `false` (per file, global or project) to restrict proposals to Plan tasks.
+
+## [0.23.0] - 2026-10-22
+
+### Fixed
+
+- **Tiers after a misplaced `]` were silently dropped**: a plan block that
+  closed its `tiers` array early — `…"items":[…]}],{"id":"P1",…` instead of
+  `…"items":[…]},{"id":"P1",…` — was read only up to the first balanced point,
+  so the questionnaire offered the tiers before the stray closer and everything
+  after it vanished, with no warning (the block counted as parsed). Plan blocks
+  are now also read by *mining* the raw body: every balanced `{ … }` object
+  carrying a non-empty `items` array — the plan root and the leaf items
+  excluded — is a tier, outermost first, in document order, and the mined
+  reading wins whenever it finds more tiers than the structured one. The
+  one-line `summary` is recovered from the raw body as well, so a block whose
+  root object never closes still opens a complete questionnaire.
+
 ## [0.22.0] - 2026-10-12
 
 ### Fixed
