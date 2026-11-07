@@ -242,6 +242,12 @@ interface ParsedDoAlwaysConfig {
 	 */
 	aliases: Record<string, string> | undefined;
 	/**
+	 * The glyph set the UI draws with (`markers`): "unicode" (default) or
+	 * "ascii" for terminals/fonts without ⚡ ▶ ► ✓ and friends. undefined when
+	 * the file does not set one.
+	 */
+	markers: MarkerSet | undefined;
+	/**
 	 * Saved chains parsed from the config object: `{ "ship": ["Build", "Tests"] }`
 	 * maps a chain name to its task names in execution order. Invalid entries
 	 * (a non-array, an empty array, a non-string step) are dropped with a
@@ -589,14 +595,14 @@ export function parseConfig(
 		data = JSON.parse(raw);
 	} catch (err) {
 		onError(`do-always: invalid JSON in ${path}: ${err}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined, chains: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined, chains: undefined, markers: undefined };
 	}
 
 	const list = Array.isArray(data) ? data : data?.tasks;
 
 	if (!Array.isArray(list)) {
 		onError(`do-always: ${path} must be a JSON array of tasks or {"tasks": [...]}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined, chains: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined, chains: undefined, markers: undefined };
 	}
 
 	const tasks: DoAlwaysTask[] = [];
@@ -741,7 +747,13 @@ export function parseConfig(
 		}
 	}
 
-	return { tasks, shortcut, merge, report, questionnaire, hidePlan, planNudge, anyPlan, aliases, chains };
+	let markers: MarkerSet | undefined;
+	if (!Array.isArray(data) && "markers" in data) {
+		if (isMarkerSet(data.markers)) markers = data.markers;
+		else onError(`do-always: ignoring invalid "markers" in ${path} (expected one of: ${MARKER_SETS.join(", ")})`);
+	}
+
+	return { tasks, shortcut, merge, report, questionnaire, hidePlan, planNudge, anyPlan, aliases, chains, markers };
 }
 
 const KEY_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -1005,6 +1017,162 @@ export function shouldAutoRun(task: DoAlwaysTask): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Marker palette
+//
+// The UI draws its state with glyphs — run-mode markers, the cursor, the chain
+// widget's step markers, the questionnaire's tier/item marks, the footer's key
+// hints. Several of them (⚡ ▶ ✎ ► ◐ ⊘ ⛓ ─) are ambiguous-width or simply
+// missing from some fonts and terminal locales, and the layouts assume their
+// columns, so a missing glyph shows up as broken alignment. `markers: "ascii"`
+// swaps in a 7-bit palette; the default is the unicode one, unchanged.
+//
+// Scope: markers, status glyphs, rules and key hints — the things that carry a
+// width assumption. Prose punctuation in notifications and reports (—, …, the
+// ✅ summary) is not part of the palette.
+// ---------------------------------------------------------------------------
+
+/** Which glyph set the UI draws with (config `markers`). */
+export type MarkerSet = "unicode" | "ascii";
+
+/** The marker sets, as a flat record so a render site reads `m.cursor`. */
+export const MARKER_SETS: readonly MarkerSet[] = ["unicode", "ascii"];
+
+/** Strict guard for the config values. */
+export function isMarkerSet(value: unknown): value is MarkerSet {
+	return typeof value === "string" && (MARKER_SETS as readonly string[]).includes(value);
+}
+
+export interface Markers {
+	/** Run-mode marker for `plan`, and its padded 3-column marker cell. */
+	plan: string;
+	planCell: string;
+	/** Run-mode marker for `run`, and its padded 3-column marker cell. */
+	run: string;
+	runCell: string;
+	/** Run-mode marker for `fill` — labels only, a fill row carries none. */
+	fill: string;
+	/** The cursor marker (selector, commit browser, questionnaire). */
+	cursor: string;
+	/** An ORDER cell whose task is not in the chain. */
+	orderEmpty: string;
+	/** A commit selected in the browser (with its selection number after it). */
+	commitSelected: string;
+	/** The chain-completion summary's marker (a notification, not the widget). */
+	summaryDone: string;
+	/** Chain status widget: step completed / running or waiting / pending. */
+	stepDone: string;
+	stepRunning: string;
+	stepPending: string;
+	/** Chain status widget: errored / aborted / skipped by guards. */
+	stepError: string;
+	stepAborted: string;
+	stepSkipped: string;
+	/** Chain status widget header. */
+	chainHeader: string;
+	/** The widget note pointing at the report file. */
+	reportNote: string;
+	/** Questionnaire: tier with none / some / all items selected. */
+	tierNone: string;
+	tierSome: string;
+	tierAll: string;
+	/** Questionnaire: an item row's selected / unselected mark. */
+	itemOn: string;
+	itemOff: string;
+	/** An item carries a user note. */
+	note: string;
+	/** Horizontal rule character (repeated to the width). */
+	rule: string;
+	/** Separator between footer hints. */
+	bullet: string;
+	/** Footer key hints. */
+	keyEnter: string;
+	keyLeft: string;
+	keyRight: string;
+	keyBackspace: string;
+	keyUpDown: string;
+	/** Arrow joining steps in a chain listing. */
+	arrow: string;
+}
+
+/** The default palette. */
+export const UNICODE_MARKERS: Markers = {
+	summaryDone: "✅",
+	plan: "⚡",
+	planCell: "⚡ ",
+	run: "▶",
+	runCell: "▶  ",
+	fill: "✎",
+	cursor: "►",
+	orderEmpty: "·",
+	commitSelected: "◉",
+	stepDone: "✓",
+	stepRunning: "▶",
+	stepPending: "○",
+	stepError: "✗",
+	stepAborted: "⊘",
+	stepSkipped: "–",
+	chainHeader: "⛓",
+	reportNote: "📄",
+	tierNone: "·",
+	tierSome: "◐",
+	tierAll: "✓",
+	itemOn: "✓",
+	itemOff: "·",
+	note: "✎",
+	rule: "─",
+	bullet: "•",
+	keyEnter: "⏎",
+	keyLeft: "←",
+	keyRight: "→",
+	keyBackspace: "⌫",
+	keyUpDown: "↑/↓",
+	arrow: "→",
+};
+
+/**
+ * The 7-bit palette: every string is ASCII, and the marker cells keep the same
+ * column widths as their unicode twins so the layouts do not change.
+ */
+export const ASCII_MARKERS: Markers = {
+	summaryDone: "ok:",
+	plan: "*",
+	planCell: "*  ",
+	run: ">",
+	runCell: ">  ",
+	fill: "",
+	cursor: ">",
+	orderEmpty: ".",
+	commitSelected: "*",
+	stepDone: "x",
+	stepRunning: ">",
+	stepPending: "o",
+	stepError: "!",
+	stepAborted: "/",
+	stepSkipped: "-",
+	chainHeader: "#",
+	reportNote: "report:",
+	tierNone: ".",
+	tierSome: "+",
+	tierAll: "x",
+	itemOn: "x",
+	itemOff: ".",
+	note: "n:",
+	rule: "-",
+	bullet: "|",
+	keyEnter: "Enter",
+	keyLeft: "left",
+	keyRight: "right",
+	keyBackspace: "BS",
+	keyUpDown: "up/down",
+	arrow: "->",
+};
+
+/** The palette for a configured marker set (unknown/absent → unicode). */
+export function markersFor(set: MarkerSet | undefined): Markers {
+	return set === "ascii" ? ASCII_MARKERS : UNICODE_MARKERS;
+}
+
+// ---------------------------------------------------------------------------
 // Run modes
 //
 // One knob for the two things a Plan task does by default: sending its prompt
@@ -1071,8 +1239,8 @@ export function resolveRunMode(
 }
 
 /** The bare glyph for a mode: `⚡` plan, `▶` run, nothing for fill. */
-export function runModeGlyph(mode: RunMode): string {
-	return mode === "plan" ? "⚡" : mode === "run" ? "▶" : "";
+export function runModeGlyph(mode: RunMode, m: Markers = UNICODE_MARKERS): string {
+	return mode === "plan" ? m.plan : mode === "run" ? m.run : "";
 }
 
 /**
@@ -1080,11 +1248,8 @@ export function runModeGlyph(mode: RunMode): string {
  * marker occupies so rows with and without a marker stay aligned ("" for
  * fill: no marker, no reserved column).
  */
-export function runModeMarker(mode: RunMode): string {
-	const glyph = runModeGlyph(mode);
-	if (!glyph) return "";
-	// ⚡ is 2 columns wide, ▶ is 1 — pad both to 3 with the trailing space(s).
-	return glyph === "⚡" ? "⚡ " : "▶  ";
+export function runModeMarker(mode: RunMode, m: Markers = UNICODE_MARKERS): string {
+	return mode === "plan" ? m.planCell : mode === "run" ? m.runCell : "";
 }
 
 /** Human-readable mode label for footers and notifications. */
@@ -1102,8 +1267,9 @@ export function runModeLabel(mode: RunMode): string {
  * footer is the one place the mode is spelled out, and a row in `fill` mode
  * carries no marker of its own.
  */
-export function runModeShort(mode: RunMode): string {
-	return mode === "plan" ? "⚡ plan" : mode === "run" ? "▶ run" : "✎ fill";
+export function runModeShort(mode: RunMode, m: Markers = UNICODE_MARKERS): string {
+	const glyph = mode === "plan" ? m.plan : mode === "run" ? m.run : m.fill;
+	return glyph ? `${glyph} ${mode}` : mode;
 }
 
 /**
@@ -1140,6 +1306,7 @@ export function formatRunModes(
 	tasks: DoAlwaysTask[],
 	modeOf: (task: DoAlwaysTask) => RunMode,
 	sourceOf: (task: DoAlwaysTask) => RunModeSource = () => "default",
+	m: Markers = UNICODE_MARKERS,
 ): string {
 	const groups = groupTasksByCategory(tasks);
 	const lines: string[] = [];
@@ -1153,7 +1320,8 @@ export function formatRunModes(
 			const source = sourceOf(t);
 			const note =
 				source === "session" ? " (set in this session)" : source === "config" ? " (config `mode`)" : "";
-			lines.push(`${n}. ${runModeGlyph(mode) ? `${runModeGlyph(mode)} ` : ""}${t.name} — ${mode}${note}`);
+			const glyph = runModeGlyph(mode, m);
+			lines.push(`${n}. ${glyph ? `${glyph} ` : ""}${t.name} — ${mode}${note}`);
 		}
 	}
 	return lines.join("\n");
@@ -1473,7 +1641,8 @@ export function buildTableRows(groups: TaskGroup[], chain: ChainState): TableRow
 export function formatChainSequence(
 	tasks: DoAlwaysTask[],
 	chain: ChainState,
-	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? "⚡" : ""),
+	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? UNICODE_MARKERS.plan : ""),
+	m: Markers = UNICODE_MARKERS,
 ): string {
 	// O(n) index map so find → O(1) lookup.
 	const taskByName = new Map(tasks.map((t) => [t.name, t]));
@@ -1485,7 +1654,7 @@ export function formatChainSequence(
 			return `${i + 1}.${marker}${t.name}`;
 		})
 		.filter((p): p is string => p !== null);
-	return parts.join(" → ");
+	return parts.join(` ${m.arrow} `);
 }
 
 /**
@@ -1524,7 +1693,8 @@ export function resolveNamedChain(
 export function formatNamedChains(
 	chains: Record<string, string[]>,
 	tasks: DoAlwaysTask[],
-	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? "⚡" : ""),
+	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? UNICODE_MARKERS.plan : ""),
+	m: Markers = UNICODE_MARKERS,
 ): string {
 	return Object.keys(chains)
 		.map((name, i) => {
@@ -1533,7 +1703,7 @@ export function formatNamedChains(
 					const t = findTaskByName(tasks, step);
 					return t ? `${markerOf(t)}${t.name}` : `${step} (unknown task)`;
 				})
-				.join(" → ");
+				.join(` ${m.arrow} `);
 			return `${i + 1}. ${name} — ${steps}`;
 		})
 		.join("\n");
@@ -1706,8 +1876,9 @@ export function stepSummary(
 	stepName: string,
 	durationMs: number,
 	fileCount: number,
+	m: Markers = UNICODE_MARKERS,
 ): string {
-	const marker = outcomeToMarker(outcome);
+	const marker = outcomeToMarker(outcome, m);
 	const parts: string[] = [marker, stepName];
 	if (fileCount > 0) {
 		parts.push(`${fileCount} file${fileCount === 1 ? "" : "s"} changed`);
@@ -1728,9 +1899,9 @@ export function stepSummary(
  * completed — the stop paths return early with their own per-step
  * notification, so `completed` always equals `total` here.
  */
-export function chainSummary(completed: number, total: number, totalMs: number): string {
+export function chainSummary(completed: number, total: number, totalMs: number, m: Markers = UNICODE_MARKERS): string {
 	const time = totalMs > 0 ? formatDuration(totalMs) : "";
-	return `✅ ${completed}/${total} steps completed${time ? ` in ${time}` : ""}`;
+	return `${m.summaryDone} ${completed}/${total} steps completed${time ? ` in ${time}` : ""}`;
 }
 
 /** Format milliseconds to a human-readable duration string. Exported for tests. */
@@ -1744,16 +1915,16 @@ export function formatDuration(ms: number): string {
 }
 
 /** Map a step outcome to its display marker character. */
-function outcomeToMarker(outcome: ChainStepOutcome): string {
+function outcomeToMarker(outcome: ChainStepOutcome, m: Markers = UNICODE_MARKERS): string {
 	switch (outcome) {
 		case "completed":
-			return "✓";
+			return m.stepDone;
 		case "aborted":
-			return "⊘";
+			return m.stepAborted;
 		case "error":
-			return "✗";
+			return m.stepError;
 		case "failed-to-start":
-			return "✗";
+			return m.stepError;
 		default:
 			// Exhaustive check: the type is a literal union, so this is unreachable.
 			throw new Error(`unexpected outcome: ${outcome as string}`);

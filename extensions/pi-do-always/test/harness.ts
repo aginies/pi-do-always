@@ -38,6 +38,8 @@ export interface Harness {
 	turn(messages: Msg[]): Promise<void>;
 	/** Every component ui.custom created, in order. */
 	components(): Component[];
+	/** The throwaway dir that is both the agent dir and the project cwd. */
+	dir(): string;
 	/** Drive the last created component's real input handler with raw keys. */
 	drive(keys: string[]): void;
 	/** Render the last created component (stub theme: colors pass through). */
@@ -174,6 +176,7 @@ export function harness(tasks: unknown[], extra: Record<string, unknown> = {}): 
 			await h.settle();
 		},
 		components: () => components,
+		dir: () => dir,
 		drive(keys) {
 			for (const key of keys) last()?.handleInput?.(key);
 			last()?.invalidate?.(); // clear the selector's preview timer

@@ -67,6 +67,7 @@ import {
 	TEST_PLAN_SAMPLE_MALFORMED,
 	TEST_PLAN_SAMPLE_OK,
 	TEST_PLAN_SAMPLE_STRAY_BRACE,
+	UNICODE_MARKERS,
 	assistantText,
 	buildTableRows,
 	chainAdd,
@@ -87,9 +88,11 @@ import {
 	formatRunModes,
 	formatSelectedCommits,
 	groupTasksByCategory,
+	isMarkerSet,
 	isRunMode,
 	isTaskVisible,
 	isValidKeyId,
+	markersFor,
 	mergeTasks,
 	mergeNamedChains,
 	nextRunMode,
@@ -133,6 +136,8 @@ import {
 	type ChainStepOutcome,
 	type CommitInfo,
 	type DoAlwaysTask,
+	type Markers,
+	type MarkerSet,
 	type PlanProposal,
 	type PlanSelection,
 	type PlanSelectionEntry,
@@ -200,6 +205,8 @@ function loadConfig(
 	anyPlan: boolean;
 	/** Saved chains from the config's `chains` object (project wins by name). */
 	chains: Record<string, string[]>;
+	/** The glyph set the UI draws with (default "unicode"). */
+	markers: MarkerSet;
 } {
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
@@ -209,10 +216,10 @@ function loadConfig(
 
 	const global = globalRaw !== null
 		? parseConfig(globalRaw, globalPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, chains: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, chains: undefined, markers: undefined };
 	const project = projectRaw !== null
 		? parseConfig(projectRaw, projectPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, chains: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, chains: undefined, markers: undefined };
 
 	// The project file's merge mode wins; otherwise the global value; otherwise
 	// override (the historical behavior), so existing configs are unaffected.
@@ -250,6 +257,8 @@ function loadConfig(
 		// Saved chains merge by name: a project chain replaces the global one
 		// with the same name, and chains only one file defines are kept.
 		chains: mergeNamedChains(global.chains, project.chains),
+		// Same precedence: project, then global, then the unicode glyphs.
+		markers: project.markers ?? global.markers ?? "unicode",
 	};
 }
 
@@ -419,6 +428,7 @@ async function fetchCommitsPage(
 function browseCommits(
 	ctx: ExtensionContext,
 	initialData?: { commits: CommitInfo[]; hasMore: boolean },
+	m: Markers = UNICODE_MARKERS,
 ): Promise<SelectedCommit[] | null> {
 	return new Promise<SelectedCommit[] | null>((resolve) => {
 		const pageCache = new Map<number, { commits: CommitInfo[]; hasMore: boolean }>();
@@ -536,16 +546,16 @@ function browseCommits(
 						const c = visibleCommits[i];
 						// Show date divider if it's the first commit in window or date changed
 						if (i === winStart || c.date !== visibleCommits[i - 1].date) {
-							lines.push(theme.fg("dim", `  ── ${c.date} ──`));
+							lines.push(theme.fg("dim", `  ${m.rule}${m.rule} ${c.date} ${m.rule}${m.rule}`));
 						}
 
 						const isCursor = cursor.kind === "commit" && cursor.index === i;
 						const isSelected = selectedMap.has(c.hash);
 						const order = isSelected ? [...selectedMap.keys()].indexOf(c.hash) + 1 : 0;
-						const cursorMark = isCursor ? theme.fg("accent", "►") : " ";
+						const cursorMark = isCursor ? theme.fg("accent", m.cursor) : " ";
 						const globalIdx = page * COMMIT_BROWSER_MAX + i + 1;
 						const num = `${cursorMark} ${String(globalIdx).padStart(2)}`;
-						const marker = isSelected ? `${theme.fg("accent", "◉")} [${order}]` : "  ·  ";
+						const marker = isSelected ? `${theme.fg("accent", m.commitSelected)} [${order}]` : `  ${m.orderEmpty}  `;
 						const hash = theme.fg("dim", c.shortHash.slice(0, 7));
 						const statStr = c.filesChanged > 0 ? `${c.filesChanged}f` : "";
 						const statCell = statStr.padStart(3);
@@ -576,12 +586,12 @@ function browseCommits(
 
 				// Run row
 				lines.push("");
-				lines.push(theme.fg("dim", "  " + "─".repeat(Math.max(1, width - 4))));
+				lines.push(theme.fg("dim", "  " + m.rule.repeat(Math.max(1, width - 4))));
 				const runLabel = selectedMap.size === 0
 					? "do on the commits (no commits selected)"
 					: `do on the commits (${selectedMap.size} commit${selectedMap.size !== 1 ? "s" : ""})`;
 				if (cursor.kind === "run") {
-					lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", "►")} ${runLabel}`)));
+					lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", m.cursor)} ${runLabel}`)));
 				} else if (selectedMap.size === 0) {
 					lines.push(theme.fg("dim", `  ${runLabel}`));
 				} else {
@@ -590,16 +600,17 @@ function browseCommits(
 
 				// Footer
 				const pageNavHints: string[] = [];
-				if (page > 0) pageNavHints.push("← prev page");
-				if (currentData.hasMore) pageNavHints.push("→ next page");
-				const pageHintStr = pageNavHints.length > 0 ? `  •  ${pageNavHints.join("  •  ")}` : "";
+				if (page > 0) pageNavHints.push(`${m.keyLeft} prev page`);
+				if (currentData.hasMore) pageNavHints.push(`${m.keyRight} next page`);
+				const sep = `  ${m.bullet}  `;
+				const pageHintStr = pageNavHints.length > 0 ? `${sep}${pageNavHints.join(sep)}` : "";
 
-				let footer = `  space/⏎ select  •  ↑/↓ move${pageHintStr}  •  esc`;
+				let footer = `  space/${m.keyEnter} select${sep}${m.keyUpDown} move${pageHintStr}${sep}esc`;
 				if (selectedMap.size > 0) {
-					footer += "  •  ctrl+u clear";
+					footer += `${sep}ctrl+u clear`;
 				}
 				if (filter) {
-					footer += `  •  filter: "${filter}"`;
+					footer += `${sep}filter: "${filter}"`;
 				}
 				lines.push(theme.fg("dim", truncateToWidth(footer, width - 2, "")));
 
@@ -827,7 +838,8 @@ function pickPlanTaskForCommits(
 	ctx: ExtensionContext,
 	candidates: DoAlwaysTask[],
 	commitCount: number,
-	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? "⚡ " : ""),
+	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? UNICODE_MARKERS.planCell : ""),
+	m: Markers = UNICODE_MARKERS,
 ): Promise<DoAlwaysTask | null> {
 	return new Promise<DoAlwaysTask | null>((resolve) => {
 		ctx.ui.custom<DoAlwaysTask | null>((tui, theme, _kb, done) => {
@@ -886,7 +898,7 @@ function pickPlanTaskForCommits(
 					theme.fg(
 						"dim",
 						truncateToWidth(
-							`  ↑/↓ move  •  ⏎ run  •  esc${filter ? `  •  filter: "${filter}"` : ""}`,
+							`  ${m.keyUpDown} move  ${m.bullet}  ${m.keyEnter} run  ${m.bullet}  esc${filter ? `  ${m.bullet}  filter: "${filter}"` : ""}`,
 							width - 2,
 							"",
 						),
@@ -1170,6 +1182,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// the selector's chain row uses, so guards, the report file and the status
 	// widget all apply. Refreshed whenever the config is (re)loaded.
 	let namedChains: Record<string, string[]> = {};
+	// The glyph set every render site draws with (config `markers`, default
+	// unicode): the selector's markers and cursor, the chain widget, the
+	// questionnaire, the commit browser and the footer key hints. Refreshed
+	// whenever the config is (re)loaded, so a project file can switch a repo to
+	// the ASCII palette.
+	let markers: Markers = UNICODE_MARKERS;
 
 	/**
 	 * The proposal name shown for a plan block captured outside a Plan
@@ -1287,7 +1305,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// the expected outcome.
 		const blockExpected = task !== undefined && enabled;
 		if (!proposal || !enabled) {
-			const base = `do-always: ${stepSummary("completed", captured.taskName, 0, 0)}`;
+			const base = `do-always: ${stepSummary("completed", captured.taskName, 0, 0, markers)}`;
 			if (!blockExpected) {
 				// Questionnaire disabled, or a non-Plan auto-run task: the
 				// prompt never asked for a plan block, so its absence is not a
@@ -1468,7 +1486,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							const ti = row.index;
 							const tier = proposal.tiers[ti];
 							const state = planTierState(proposal, ti, selection);
-							const glyph = state === "all" ? "✓" : state === "partial" ? "◐" : "·";
+							const glyph = state === "all" ? markers.tierAll : state === "partial" ? markers.tierSome : markers.tierNone;
 							const color = state === "all" ? "success" : state === "partial" ? "warning" : "dim";
 							const headerText = `  [${glyph}] ${tier.id} — ${tier.label} (${tierCount(ti)})`;
 							if (cursor === i) {
@@ -1482,10 +1500,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							const ii = row.index;
 							const key = planItemKey(ti, ii);
 							const item = proposal.tiers[ti].items[ii];
-							const mark = selection.has(key) ? theme.fg("success", "✓") : theme.fg("dim", "·");
+							const mark = selection.has(key) ? theme.fg("success", markers.itemOn) : theme.fg("dim", markers.itemOff);
 							const note = notes.get(key);
 							const title = truncateToWidth(
-								note ? `${item.title}  ✎ ${note}` : item.title,
+								note ? `${item.title}  ${markers.note} ${note}` : item.title,
 								Math.max(10, width - 8),
 								"…",
 							);
@@ -1504,11 +1522,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					}
 					// Pinned Confirm row (always visible, outside the scroll window).
 					lines.push("");
-					lines.push(theme.fg("dim", `  ${"─".repeat(Math.max(1, width - 4))}`));
+					lines.push(theme.fg("dim", `  ${markers.rule.repeat(Math.max(1, width - 4))}`));
 					const totalItems = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
 					const confirmLabel = `Confirm (${selection.size}/${totalItems})`;
 					if (cursor === rows.length - 1) {
-						lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", "►")} ${confirmLabel}`)));
+						lines.push(theme.bg("selectedBg", theme.bold(`${theme.fg("accent", markers.cursor)} ${confirmLabel}`)));
 					} else if (selection.size > 0) {
 						lines.push(theme.fg("accent", `  ${confirmLabel}`));
 					} else {
@@ -1518,13 +1536,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					if (noteKey !== null) {
 						// Note editor: replaces the key hint while active.
 						lines.push(theme.fg("accent", truncateToWidth(`  note> ${noteDraft}`, width - 2, "")));
-						lines.push(theme.fg("dim", "  enter save note  •  esc cancel"));
+						lines.push(theme.fg("dim", `  enter save note  ${markers.bullet}  esc cancel`));
 					} else {
 						lines.push(
 							theme.fg(
 								"dim",
 								truncateToWidth(
-									`  space/⏎ toggle  •  a all  •  ctrl+u clear  •  e note  •  ⏎ confirm  •  esc withdraw`,
+									`  space/${markers.keyEnter} toggle  ${markers.bullet}  a all  ${markers.bullet}  ctrl+u clear  ${markers.bullet}  e note  ${markers.bullet}  ${markers.keyEnter} confirm  ${markers.bullet}  esc withdraw`,
 									width - 2,
 									"",
 								),
@@ -1719,20 +1737,20 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	function stepMarker(status: ChainStepStatus, theme: Theme): string {
 		switch (status) {
 			case "completed":
-				return theme.fg("success", "✓");
+				return theme.fg("success", markers.stepDone);
 			case "running":
-				return theme.fg("accent", theme.bold("▶"));
+				return theme.fg("accent", theme.bold(markers.stepRunning));
 			case "waiting":
-				return theme.fg("warning", "▶");
+				return theme.fg("warning", markers.stepRunning);
 			case "aborted":
-				return theme.fg("warning", "⊘");
+				return theme.fg("warning", markers.stepAborted);
 			case "error":
 			case "failed-to-start":
-				return theme.fg("error", "✗");
+				return theme.fg("error", markers.stepError);
 			case "skipped":
-				return theme.fg("muted", "–");
+				return theme.fg("muted", markers.stepSkipped);
 			default:
-				return theme.fg("dim", "○");
+				return theme.fg("dim", markers.stepPending);
 		}
 	}
 
@@ -1810,8 +1828,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`do-always: could not update the report file: ${err}`, "warning");
 			}
 		}
-		const prev = chainStatus.note ? `${chainStatus.note} • ` : "";
-		chainStatus.note = `${prev}📄 ${chainReport.display}`;
+		const prev = chainStatus.note ? `${chainStatus.note} ${markers.bullet} ` : "";
+		chainStatus.note = `${prev}${markers.reportNote} ${chainReport.display}`;
 		// Chain fully done → show the inline report, then clear the
 		// trace widget. Chain stopped early → keep the trace widget.
 		const allDone = statuses.every((s) => s === "completed");
@@ -1926,7 +1944,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				steps.forEach((s, i) => {
 					if (s.status !== "pending") at = i + 1;
 				});
-				lines.push(theme.fg("accent", theme.bold(`⛓ do-always (${at}/${steps.length})`)));
+				lines.push(theme.fg("accent", theme.bold(`${markers.chainHeader} do-always (${at}/${steps.length})`)));
 				for (const s of steps) {
 					lines.push(`  ${stepMarker(s.status, theme)} ${s.name}`);
 				}
@@ -2176,7 +2194,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						pendingProposal = { taskName: pendingSummaryTask, text: pendingPlanRaw };
 						planFollowUpTask = null;
 					} else {
-						const summary = stepSummary(outcome, pendingSummaryTask, 0, 0);
+						const summary = stepSummary(outcome, pendingSummaryTask, 0, 0, markers);
 						lastCtx?.ui.notify(`do-always: ${summary}`, "info");
 						// planFollowUpTask stays armed: this run never produced
 						// the block it was asked for, so the next turn may.
@@ -2357,6 +2375,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		planNudgeEnabled = config.planNudge;
 		anyPlanEnabled = config.anyPlan;
 		namedChains = config.chains;
+		markers = markersFor(config.markers);
 		refreshVisible(ctx.cwd, await getContext(ctx.cwd));
 		registerShortcut(config.shortcut, onError);
 	});
@@ -2424,7 +2443,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					ctx.ui.notify("do-always: no commits found", "info");
 					return;
 				}
-				const result = await browseCommits(ctx, initialData);
+				const result = await browseCommits(ctx, initialData, markers);
 				if (!result) {
 					ctx.ui.notify("do-always: commit browser cancelled", "info");
 					return;
@@ -2453,8 +2472,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			if (/\{\{\s*selected_commits\s*\}\}/.test(task.prompt)) {
 				chosen = task;
 			} else if (ctx.mode === "tui") {
-				const picked = await pickPlanTaskForCommits(ctx, planTasks, selected.length, (t) =>
-					runModeMarker(runModeFor(t)),
+				const picked = await pickPlanTaskForCommits(
+					ctx,
+					planTasks,
+					selected.length,
+					(t) => runModeMarker(runModeFor(t), markers),
+					markers,
 				);
 				if (!picked) {
 					ctx.ui.notify("do-always: no task chosen — commits not used", "info");
@@ -2643,7 +2666,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					nextContext = await getContext(ctx.cwd);
 					fileCount = nextContext.files.length;
 				}
-				const summary = stepSummary(outcome, first.name, chainDurations[0], fileCount);
+				const summary = stepSummary(outcome, first.name, chainDurations[0], fileCount, markers);
 				ctx.ui.notify(`do-always: step 1/${steps.length} — ${summary}`, "info");
 				await runChainSteps(steps, ctx, 1, nextContext);
 			} finally {
@@ -2701,13 +2724,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					context = await getContext(ctx.cwd);
 					fileCount = context.files.length;
 				}
-				const summary = stepSummary(outcome, step.name, stepDuration, fileCount);
+				const summary = stepSummary(outcome, step.name, stepDuration, fileCount, markers);
 				ctx.ui.notify(`do-always: step ${i + 1}/${steps.length} — ${summary}`, "info");
 				continue;
 			}
 			markChainStopped(ctx, i, outcome);
 			await finishReport(ctx);
-			const summary = stepSummary(outcome, step.name, stepDuration, 0);
+			const summary = stepSummary(outcome, step.name, stepDuration, 0, markers);
 			if (outcome === "failed-to-start") {
 				ctx.ui.notify(`${label} — ${summary} (check model/API key); chain stopped`, "error");
 			} else if (outcome === "aborted") {
@@ -2725,7 +2748,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// Chain-end summary.
 		const completed = chainDurations.filter((d) => d > 0).length;
 		const totalMs = chainDurations.reduce((a, b) => a + b, 0);
-		const chainSum = chainSummary(completed, steps.length, totalMs);
+		const chainSum = chainSummary(completed, steps.length, totalMs, markers);
 		if (chainReport) {
 			await finishReport(ctx);
 			ctx.ui.notify(`do-always: ${chainSum} — report: ${reportDisplay}`, "info");
@@ -2928,10 +2951,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				// background alone can be invisible (some themes map selectedBg
 				// to the terminal's default background), so the marker carries
 				// the cursor.
-				const cursorMark = theme.fg("accent", "►");
+				const cursorMark = theme.fg("accent", markers.cursor);
 				// Chain-preview marker: the task's run-mode glyph (⚡/▶/—), so the
 				// footer sequence matches the rows after a ctrl+p toggle.
-				const chainMarker = (t: DoAlwaysTask) => runModeGlyph(runModeFor(t));
+				const chainMarker = (t: DoAlwaysTask) => runModeGlyph(runModeFor(t), markers);
 
 				// Header.
 				lines.push(
@@ -2973,7 +2996,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const task = row.task;
 						// Run mode (session override → config default) drives the row
 						// marker: ⚡ plan, ▶ run, no marker for fill.
-						const marker = runModeMarker(runModeFor(task));
+						const marker = runModeMarker(runModeFor(task), markers);
 						const focused = cursor.kind === "cell" && cursor.row === idx;
 						// Cursor markers: ► in the left gutter = TASK column, ► in the
 						// ORDER cell = ORDER column. The row background is applied too,
@@ -2987,7 +3010,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						const num = inTaskCol
 							? `${cursorMark} ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
 							: inOrderCol && tier === "narrow"
-								? `${theme.fg("warning", "►")} ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
+								? `${theme.fg("warning", markers.cursor)} ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
 								: `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
 						// The marker cell is exactly 3 columns wide (⚡ is 2 columns,
 						// ▶ 1, padded) so marked rows align with the others (the
@@ -3002,8 +3025,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 									? truncateToWidth(`${cursorMark}[${row.order}]`, ORDER_COL_W, "", true)
 									: ` [${row.order}] `
 								: inOrderCol
-									? `${cursorMark}  · `
-									: "  ·  ";
+									? `${cursorMark}  ${markers.orderEmpty} `
+									: `  ${markers.orderEmpty}  `;
 						let line: string;
 						if (tier === "full") {
 							const desc = truncateToWidth(task.description ?? "", descCol, "…", true);
@@ -3026,7 +3049,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					// Narrow tier: the chain gets its own line instead of a column.
 					if (tier === "narrow" && chain.items.length > 0) {
 						lines.push(
-							theme.fg("dim", truncateToWidth(`  chain: ${formatChainSequence(visibleTasks, chain, chainMarker)}`, width - 2, "…")),
+							theme.fg("dim", truncateToWidth(`  chain: ${formatChainSequence(visibleTasks, chain, chainMarker, markers)}`, width - 2, "…")),
 						);
 					}
 				}
@@ -3064,7 +3087,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 				// Pinned Run row (always visible, outside the scroll window).
 				lines.push("");
-				lines.push(theme.fg("dim", "  " + "─".repeat(Math.max(1, width - 4))));
+				lines.push(theme.fg("dim", "  " + markers.rule.repeat(Math.max(1, width - 4))));
 				const runLabel = chainRunLabel(chain.items.length);
 				runLine = lines.length;
 				// No play glyph in the label: the ► cursor marker is the only
@@ -3088,7 +3111,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					for (const entry of segments) {
 						if (!entry) continue;
 						for (const seg of typeof entry === "string" ? [entry] : entry) {
-							const candidate = line === "" ? `  ${seg}` : `${line}  •  ${seg}`;
+							const candidate = line === "" ? `  ${seg}` : `${line}  ${markers.bullet}  ${seg}`;
 							if (visibleWidth(candidate) <= budget) {
 								line = candidate;
 								break;
@@ -3101,27 +3124,41 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				// What ctrl+p cycles, spelled out — `fill` has no row marker of its
 				// own, so the footer is where that state is readable.
 				const modeHint = modeRow
-					? [`ctrl+p ${runModeShort(runModeFor(modeRow.task))}`, "ctrl+p mode", "ctrl+p"]
+					? [`ctrl+p ${runModeShort(runModeFor(modeRow.task), markers)}`, "ctrl+p mode", "ctrl+p"]
 					: null;
 				const clearing = chain.items.length > 0 ? "ctrl+u clear" : null;
 				let footer: string;
 				if (cursor.kind === "run") {
 					footer =
 						chain.items.length > 0
-							? `  ⏎ run: ${formatChainSequence(visibleTasks, chain, chainMarker)}`
-							: "  ⏎ run the chain (chain is empty)";
+							? `  ${markers.keyEnter} run: ${formatChainSequence(visibleTasks, chain, chainMarker, markers)}`
+							: `  ${markers.keyEnter} run the chain (chain is empty)`;
 					lines.push(theme.fg("dim", truncateToWidth(footer, width - 2, "")));
 					return { lines, itemLine, runLine, orderColX };
 				}
 				if (cursor.col === "order") {
 					const inChain = chain.items.includes(modeRow?.task.name ?? "");
 					footer = fitFooter(
-						["← tasks", inChain ? "⏎ remove" : "⏎ add", modeHint, clearing, "esc"],
+						[
+							`${markers.keyLeft} tasks`,
+							inChain ? `${markers.keyEnter} remove` : `${markers.keyEnter} add`,
+							modeHint,
+							clearing,
+							"esc",
+						],
 						width - 2,
 					);
 				} else {
 					footer = fitFooter(
-						["1-9 run now", modeHint, "⏎ select", "→ order", clearing, "⌫ undo", "esc"],
+						[
+							"1-9 run now",
+							modeHint,
+							`${markers.keyEnter} select`,
+							`${markers.keyRight} order`,
+							clearing,
+							`${markers.keyBackspace} undo`,
+							"esc",
+						],
 						width - 2,
 					);
 				}
@@ -3482,6 +3519,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			planNudgeEnabled = config.planNudge;
 			anyPlanEnabled = config.anyPlan;
 			namedChains = config.chains;
+			markers = markersFor(config.markers);
 		}
 
 		// One context per command run: shared by visibility filtering, rendering,
@@ -3511,7 +3549,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// confirm/withdraw behavior is exactly as before.
 		if (arg.toLowerCase() === "replan") {
 			if (!lastProposal) {
-				ctx.ui.notify("do-always: no plan proposal to re-open — run a Plan task (⚡) first", "info");
+				ctx.ui.notify(`do-always: no plan proposal to re-open — run a Plan task (${markers.plan}) first`, "info");
 				return;
 			}
 			void offerPlanProposal(lastProposal, ctx);
@@ -3540,7 +3578,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			if (rest.length === 0) {
 				const head =
 					"do-always run modes — ctrl+p in the selector, or /do-always mode <task> [plan|run|fill|default]:";
-				ctx.ui.notify(`${head}\n${formatRunModes(visible, runModeFor, runModeSourceFor)}`, "info");
+				ctx.ui.notify(`${head}\n${formatRunModes(visible, runModeFor, runModeSourceFor, markers)}`, "info");
 				return;
 			}
 			// The trailing token may be the mode; what precedes it is the task
@@ -3582,8 +3620,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					return;
 				}
 				ctx.ui.notify(
-					`do-always saved chains (run one with /do-always chain <name>):\n${formatNamedChains(namedChains, tasks, (t) =>
-						runModeGlyph(runModeFor(t)),
+					`do-always saved chains (run one with /do-always chain <name>):\n${formatNamedChains(
+						namedChains,
+						tasks,
+						(t) => runModeGlyph(runModeFor(t), markers),
+						markers,
 					)}`,
 					"info",
 				);

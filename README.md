@@ -185,7 +185,8 @@ currently at.
 
 Markers: `✓` completed, `▶` running (or waiting for your Enter on a fill-first step 1),
 `○` pending, `✗` errored / failed to start, `⊘` aborted, `–` skipped because its guards
-no longer hold. The widget is removed when the chain completes; if the chain stops early
+no longer hold. With `"markers": "ascii"` they become `x`, `>`, `o`, `!`, `/`, `-` — see
+[Markers](#markers). The widget is removed when the chain completes; if the chain stops early
 it stays below the prompt as a trace of where it stopped (until your next prompt or a new
 session). Starting a second chain while
 one is running is refused — wait for it to finish or abort the current step with Esc.
@@ -398,6 +399,7 @@ In the object form you can also configure the selector shortcut:
 - `questionnaire` (optional) — whether completed auto-run tasks whose reply carries a plan block offer the selection questionnaire. Default `true`; set `false` to keep the plain summary notification. The project file's value wins over the global one. See [Plan questionnaire](#plan-questionnaire).
 - `hidePlan` (optional) — whether the raw `plan` block is stripped from the transcript after a completed auto-run task (TUI only — in non-TUI modes the block is always kept). Default `true`; set `false` to keep the block visible in the conversation. The project file's value wins over the global one.
 - `planNudge` (optional) — whether a completed auto-run Plan task whose reply has no usable plan block (none at all — the model wrote the plan as plain prose — or malformed JSON) triggers one follow-up asking the agent to emit the block before the plain-summary fallback. At most one nudge per run; the nudge run's reply is parsed like any other. Default `true`; set `false` to keep the old behavior (warn and offer no questionnaire). The project file's value wins over the global one.
+- `markers` (optional) — the glyph set the UI draws with: `"unicode"` (default) or `"ascii"` for terminals and fonts that lack the glyphs, or render them double-width. Covers the run-mode markers, the cursor, the chain widget, the questionnaire marks, the rules and the footer key hints — see [Markers](#markers). The project file's value wins over the global one.
 - `anyPlan` (optional) — whether an **ordinary** turn (no Plan auto-run armed) whose reply *ends* with a parseable plan block is captured, stripped and offered as a proposal too. Models imitate the plan-block instruction that is still visible in the conversation context, so a plain "what should we do?" turn can end with a real proposal; without this the raw JSON just sits in the transcript with no way to act on it. The gate is narrow — the block must be the very last thing in the reply and must parse to at least one action item — so a plan fence quoted mid-reply (documentation, an example) is never touched. Default `true`; set `false` to only ever offer proposals from Plan tasks. The project file's value wins over the global one.
 - `aliases` (optional) — a global alias map: an object that maps short alias strings to task names, e.g. `{ "rc": "Review changes", "bl": "Build" }`. Each alias is case-insensitive and is tried before the task's own name, so `/do-always rc` resolves to the task named `Review changes`. Keys and values are trimmed; entries with empty keys or non-string values are silently dropped. The project file's value wins over the global one.
 - `chains` (optional) — saved chains: an object mapping a chain name to its task names in execution order, e.g. `{ "ship": ["Build", "Tests", "Commit"] }`. Run one with `/do-always chain <name>`, list them with `/do-always chain` (see [Saved chains](#saved-chains)). Steps resolve by task name or alias and are deduplicated; a chain over the 8-task cap, or one naming an unknown task, is refused with a message. The project file's chain wins over the global one with the same name.
@@ -421,6 +423,39 @@ Example project file that only *adds* tasks without overriding the global set:
 ```
 
 Reload Pi (or start a new session) after editing a config file.
+
+## Markers
+
+The UI draws its state with glyphs: the run-mode markers (`⚡` plan, `▶` run), the cursor `►`,
+an ORDER cell that is not in the chain `·`, the chain widget's step markers, the questionnaire's
+tier and item marks, the horizontal rules, and the footer's key hints (`⏎`, `←`, `→`, `⌫`, `•`).
+Several of those are ambiguous-width or simply missing from some fonts and terminal locales, and
+the layouts assume their column counts — so a missing glyph shows up as tofu or a misaligned
+table.
+
+Set `"markers": "ascii"` in either config file (the project file wins) to draw the same UI in
+7-bit:
+
+|Unicode|ASCII|Where|
+|---|---|---|
+|`⚡` `▶` `✎`|`*` `>` —|run-mode markers; a `fill` row carries none in either palette|
+|`►`|`>`|the cursor (selector, commit browser, questionnaire)|
+|`·`|`.`|an ORDER cell not in the chain; an unselected questionnaire row|
+|`◉`|`*`|a commit selected in the browser|
+|`✓` `▶` `○` `✗` `⊘` `–`|`x` `>` `o` `!` `/` `-`|chain widget: completed, running/waiting, pending, errored, aborted, skipped|
+|`⛓`|`#`|the chain widget's header|
+|`📄`|`report:`|the widget note pointing at the report file|
+|`✓` `◐` `·`|`x` `+` `.`|questionnaire tier: all / some / none of its items selected|
+|`✎`|`n:`|an item carries your note|
+|`✅`|`ok:`|the chain-completion summary|
+|`─`|`-`|horizontal rules|
+|`⏎` `←` `→` `⌫` `↑/↓`|`Enter` `left` `right` `BS` `up/down`|footer key hints|
+|`•`|`\|`|the separator between footer hints|
+|`→`|`->`|the arrow joining steps in a chain listing|
+
+The marker cells keep the same column widths in both palettes, so the table geometry — and the
+ORDER cell's mouse hit-testing, which is at a fixed x — is unchanged. Prose punctuation in
+notifications and reports (`—`, `…`) is deliberately not part of the palette.
 
 ## Prompt placeholders
 

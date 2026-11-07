@@ -54,6 +54,11 @@
 					"default": true,
 					"description": "Whether an ordinary turn (no auto-run armed) whose reply ENDS with a parseable plan block is captured, stripped and offered as an \"Ad-hoc plan\" proposal. The project file's value wins."
 				},
+				"markers": {
+					"enum": ["unicode", "ascii"],
+					"default": "unicode",
+					"description": "Glyph set for the UI's markers: the run-mode markers, the cursor, the chain widget's step markers, the questionnaire's tier/item marks, the rules and the footer key hints. Use \"ascii\" when the terminal or font lacks the unicode glyphs (or renders them double-width). Prose punctuation in notifications and reports is unaffected. The project file's value wins."
+				},
 				"aliases": {
 					"type": "object",
 					"description": "Global alias map: short name → task name, e.g. { \"rc\": \"Review changes\" }. Case-insensitive, tried before the task's own name. The project file's value wins.",

@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **An ASCII marker palette** (`"markers": "ascii"`, default `"unicode"`): the UI
+  draws its state with glyphs — the run-mode markers `⚡`/`▶`/`✎`, the cursor `►`,
+  an empty ORDER cell `·`, a selected commit `◉`, the chain widget's
+  `✓ ▶ ○ ✗ ⊘ –`, its `⛓` header and `📄` report note, the questionnaire's
+  `✓ ◐ ·` tiers and `✎` notes, the `✅` completion summary, the `─` rules and the
+  footer's `⏎ ← → ⌫ ↑/↓ •` key hints. Several are ambiguous-width or missing
+  from some fonts and locales, and the layouts assume their column counts, so a
+  missing glyph shows up as tofu or a misaligned table (the ORDER cell's mouse
+  hit-testing is at a fixed x). The new setting swaps in a 7-bit palette
+  (`* > . o ! / - # report: x + n: ok: - Enter left right BS up/down | ->`) with
+  the *same* cell widths, so the geometry is unchanged; the project file's value
+  wins over the global one, and an invalid value warns and is ignored. Prose
+  punctuation in notifications and reports (`—`, `…`) is deliberately out of
+  scope. A new `test/markers.test.ts` asserts both palettes cover the same
+  fields, that the ascii one is pure 7-bit, that every marker cell is the width
+  the layout reserves, and that a selector rendered with `markers: "ascii"`
+  contains no non-ASCII character at any width.
 - **A JSON Schema for `do-always.json`**, shipped in the package
   (`extensions/pi-do-always/do-always.schema.json`) and documented in the
   README: reference it with a `$schema` key — accepted and ignored at runtime —

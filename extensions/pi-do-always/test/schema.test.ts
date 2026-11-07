@@ -47,6 +47,7 @@ const PARSED_CONFIG_KEYS = [
 	"hidePlan",
 	"planNudge",
 	"anyPlan",
+	"markers",
 	"aliases",
 	"chains",
 	"$schema",
@@ -91,6 +92,7 @@ test("the schema's enums match the values the parser accepts", () => {
 		"requireFilePattern",
 	]);
 	assert.deepEqual(schema.$defs.configObject.properties.merge.enum, ["override", "append"]);
+	assert.deepEqual(schema.$defs.configObject.properties.markers.enum, ["unicode", "ascii"]);
 	assert.deepEqual(schema.$defs.when.oneOf[0].enum, ["git", "!git"]);
 	assert.deepEqual(Object.keys(schema.$defs.when.oneOf[1].properties).sort(), ["branch", "file", "git", "repo"]);
 	assert.equal(schema.$defs.chainSteps.maxItems, 8, "the chain cap the parser enforces");
@@ -128,6 +130,7 @@ test("a config using every documented field parses without a warning", () => {
 		hidePlan: true,
 		planNudge: false,
 		anyPlan: true,
+		markers: "ascii",
 		aliases: { rc: "Review changes" },
 		chains: { ship: ["Review changes", "Build"] },
 		tasks: [
@@ -169,6 +172,7 @@ test("a config using every documented field parses without a warning", () => {
 	assert.equal(out.report, false);
 	assert.equal(out.planNudge, false);
 	assert.equal(out.anyPlan, true);
+	assert.equal(out.markers, "ascii");
 });
 
 test("an editor-only $schema key is accepted and ignored", () => {
