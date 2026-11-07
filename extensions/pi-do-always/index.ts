@@ -29,6 +29,8 @@
  *   /do-always review  → fill prompt for task named "review"
  *   /do-always list    → print the task list
  *   /do-always list-details → show the full prompt text each task injects
+ *   /do-always mode [task] [plan|run|fill|default] → show or set how a task
+ *       runs in this session (the command-line twin of the selector's ctrl+p)
  *   /do-always testplan [ok|malformed|last] → dry-run the plan questionnaire
  *       on a sample reply (or the last assistant reply): shows what the
  *       parser concluded and offers the questionnaire; confirming prints
@@ -51,6 +53,7 @@ import {
 	getKeybindings,
 	matchesKey,
 	truncateToWidth,
+	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import {
@@ -72,23 +75,26 @@ import {
 	chainRunLabel,
 	chainSummary,
 	chainUndo,
+	defaultRunMode,
 	evaluateGuards,
 	evaluateWhen,
 	formatChainSequence,
 	formatList,
 	endsWithPlanBlock,
 	formatPlanExecutionPrompt,
+	formatRunModes,
 	formatSelectedCommits,
 	groupTasksByCategory,
-	isPlanTask,
 	isTaskVisible,
 	isValidKeyId,
 	mergeTasks,
+	nextRunMode,
 	parseConfig,
 	parseConfigRegexpValueForKey,
 	parseCommitSubject,
 	parseGitLogOutput,
 	parsePlanProposal,
+	parseRunMode,
 	parseStatusPorcelain,
 	parseStatusStagedUnstaged,
 	orderTasksByCategory,
@@ -107,8 +113,13 @@ import {
 	reportWorthKeeping,
 	renderPrompt,
 	resolveReportPath,
+	resolveRunMode,
 	resolveShortcut,
 	resolveTask,
+	runModeGlyph,
+	runModeLabel,
+	runModeMarker,
+	runModeShort,
 	shouldAutoRun,
 	stepSummary,
 	stripPlanBlocks,
@@ -120,6 +131,7 @@ import {
 	type PlanProposal,
 	type PlanSelection,
 	type PlanSelectionEntry,
+	type RunMode,
 	type SelectedCommit,
 	type TaskContext,
 	type TableRow,
@@ -797,12 +809,14 @@ function isPrintable(data: string): boolean {
  * Task picker shown after a commit selection: proposes the Plan tasks (hidden
  * ones included — e.g. "Review commits" exists to be picked here) to run on
  * the selected commits. Type to filter, ↑/↓ move, Enter runs, Esc cancels.
- * Returns the chosen task, or null on cancel.
+ * Returns the chosen task, or null on cancel. `markerOf` renders the row's
+ * run-mode marker cell (⚡ / ▶ / empty — see runModeMarker).
  */
 function pickPlanTaskForCommits(
 	ctx: ExtensionContext,
 	candidates: DoAlwaysTask[],
 	commitCount: number,
+	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? "⚡ " : ""),
 ): Promise<DoAlwaysTask | null> {
 	return new Promise<DoAlwaysTask | null>((resolve) => {
 		ctx.ui.custom<DoAlwaysTask | null>((tui, theme, _kb, done) => {
@@ -851,9 +865,9 @@ function pickPlanTaskForCommits(
 				} else {
 					for (let i = 0; i < items.length; i++) {
 						const t = items[i];
-						const auto = shouldAutoRun(t);
-						const name = truncateToWidth(t.name, Math.max(10, width - 8 - (auto ? 3 : 0)), "…", true);
-						const rowText = `  ${String(i + 1).padStart(2)}  ${auto ? "⚡ " : ""}${name}`;
+						const marker = markerOf(t);
+						const name = truncateToWidth(t.name, Math.max(10, width - 8 - (marker ? 3 : 0)), "…", true);
+						const rowText = `  ${String(i + 1).padStart(2)}  ${marker}${name}`;
 						lines.push(i === cursor ? theme.bg("selectedBg", theme.bold(rowText)) : rowText);
 					}
 				}
@@ -1153,6 +1167,40 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// and on session start.
 	let adhocPlanRaw: string | null = null;
 
+	// Per-task run-mode overrides for this session (selector `ctrl+p`, or
+	// `/do-always mode <task> [plan|run|fill]`): task name → mode. This is the
+	// runtime knob — the permanent ones are the config's `autoRun` and
+	// `questionnaire` fields, which the override simply replaces while the
+	// session lives.
+	const runModeOverrides = new Map<string, RunMode>();
+
+	/** The mode `task` runs in: its session override, else its config default. */
+	function runModeFor(task: DoAlwaysTask): RunMode {
+		return resolveRunMode(task, runModeOverrides, questionnaireEnabled);
+	}
+
+	/**
+	 * Set a task's mode for this session. Setting the mode it already defaults
+	 * to clears the override instead, so the task follows its config again
+	 * (a later `questionnaire` toggle, a reloaded file).
+	 */
+	function setRunMode(name: string, mode: RunMode): RunMode {
+		const task = tasks.find((t) => t.name === name);
+		if (task && defaultRunMode(task, questionnaireEnabled) === mode) runModeOverrides.delete(name);
+		else runModeOverrides.set(name, mode);
+		return mode;
+	}
+
+	/** Cycle a task to its next mode (fill → run → plan) and return it. */
+	function cycleRunMode(task: DoAlwaysTask): RunMode {
+		return setRunMode(task.name, nextRunMode(runModeFor(task)));
+	}
+
+	/** The names carrying a session override (for `/do-always mode`'s listing). */
+	function overriddenRunModes(): Set<string> {
+		return new Set([...runModeOverrides.keys()].filter((n) => tasks.some((t) => t.name === n)));
+	}
+
 	/** The result of the plan questionnaire: the confirmed selection, or a withdrawal. */
 	type PlanQuestionnaireResult =
 		| { kind: "confirm"; items: PlanSelectionEntry[] }
@@ -1160,18 +1208,19 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 	/**
 	 * Split a task's prompt into its user-facing base and whether the plan
-	 * block instruction will be injected with it. Plan-category tasks get
+	 * block instruction will be injected with it. A task in `plan` mode gets
 	 * PLAN_OUTPUT_INSTRUCTION (once) so the reply carries the machine-readable
-	 * "plan" block the questionnaire parses — but only when the questionnaire
-	 * is actually offered for this task, otherwise the agent would emit a block
-	 * nobody reads. A prompt that already mentions the plan fence keeps its own
-	 * contract; chain-step prompts are rendered with the plain renderPrompt and
-	 * never get it.
+	 * "plan" block the questionnaire parses — and only in that mode, otherwise
+	 * the agent would emit a block nobody reads (see RunMode: the mode is the
+	 * task's session override, else its config-derived default, so `autoRun:
+	 * false` or `questionnaire: false` — and a `ctrl+p` toggle in the selector
+	 * — drop the instruction). A prompt that already mentions the plan fence
+	 * keeps its own contract; chain-step prompts are rendered with the plain
+	 * renderPrompt and never get it.
 	 */
 	function taskPromptParts(task: DoAlwaysTask, ctx: Record<string, string>): { base: string; plan: boolean } {
 		const base = renderPrompt(task.prompt, ctx);
-		const enabled = task.questionnaire ?? questionnaireEnabled;
-		const plan = isPlanTask(task) && enabled && !/(?:```+|~~~+)[^\S\n]*plan\b/i.test(base);
+		const plan = runModeFor(task) === "plan" && !/(?:```+|~~~+)[^\S\n]*plan\b/i.test(base);
 		return { base, plan };
 	}
 
@@ -1206,12 +1255,14 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		const proposal = parsePlanProposal(captured.text);
 		if (!ctx) return;
 		const task = tasks.find((t) => t.name === captured.taskName);
-		const enabled = task?.questionnaire ?? questionnaireEnabled;
-		// The prompt asked for a plan block only for Plan tasks with the
-		// questionnaire enabled (renderTaskPrompt's gate) — only then is a
-		// missing or invalid block a contract violation worth explaining; for
-		// a non-Plan auto-run task its absence is the expected outcome.
-		const blockExpected = task !== undefined && isPlanTask(task) && enabled;
+		// The questionnaire belongs to `plan` mode; an unknown task name (the
+		// testplan dry-run samples) falls back to the global setting.
+		const enabled = task !== undefined ? runModeFor(task) === "plan" : questionnaireEnabled;
+		// The prompt asked for a plan block only in `plan` mode
+		// (renderTaskPrompt's gate) — only then is a missing or invalid block a
+		// contract violation worth explaining; for any other run its absence is
+		// the expected outcome.
+		const blockExpected = task !== undefined && enabled;
 		if (!proposal || !enabled) {
 			const base = `do-always: ${stepSummary("completed", captured.taskName, 0, 0)}`;
 			if (!blockExpected) {
@@ -1943,14 +1994,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * The task `name` when it is a Plan task whose questionnaire is enabled —
-	 * i.e. the tasks whose prompt carries PLAN_OUTPUT_INSTRUCTION (the same
-	 * gate as renderTaskPrompt). null for anything else.
+	 * The task `name` when it runs in `plan` mode — i.e. the tasks whose prompt
+	 * carries PLAN_OUTPUT_INSTRUCTION (the same gate as renderTaskPrompt),
+	 * whether that comes from the config (Plan category, questionnaire on,
+	 * auto-run) or from a session override. null for anything else.
 	 */
 	function planTaskFor(name: string | null): DoAlwaysTask | null {
 		if (!name) return null;
 		const task = tasks.find((t) => t.name === name);
-		if (!task || !isPlanTask(task) || !(task.questionnaire ?? questionnaireEnabled)) return null;
+		if (!task || runModeFor(task) !== "plan") return null;
 		return task;
 	}
 
@@ -1982,7 +2034,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Ad-hoc plan capture: an ORDINARY turn (no Plan auto-run armed, no chain
+	 * Ad-hoc plan capture: an ORDINARY turn (no auto-run summary armed, no chain
 	 * step in flight) whose reply ENDS with a parseable plan block. Models
 	 * imitate the PLAN_OUTPUT_INSTRUCTION that is still visible in the
 	 * conversation context, so a plain "what should we do?" turn can end with a
@@ -2004,6 +2056,13 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		if (!anyPlanEnabled || !questionnaireEnabled) return undefined;
 		// Chain steps never get the questionnaire (see runChainSteps).
 		if (chainWaiter || chainActive) return undefined;
+		// Neither does a reply that belongs to a tracked auto-run: that run is
+		// served by its own summary at agent_end (and, in plan mode, by its own
+		// questionnaire), and the summary branch returns before the ad-hoc one —
+		// so capturing here would strip a block that is then dropped, losing the
+		// proposal from the transcript without ever offering it. It also honors a
+		// task the user switched out of plan mode (ctrl+p → run): no questionnaire.
+		if (pendingSummaryTask || planFollowUpTask) return undefined;
 		const text = assistantText(message.content);
 		if (text.trim() === "") return undefined;
 		if (!endsWithPlanBlock(text) || planBlockDiagnostics(text).kind !== "ok") return undefined;
@@ -2370,7 +2429,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			if (/\{\{\s*selected_commits\s*\}\}/.test(task.prompt)) {
 				chosen = task;
 			} else if (ctx.mode === "tui") {
-				const picked = await pickPlanTaskForCommits(ctx, planTasks, selected.length);
+				const picked = await pickPlanTaskForCommits(ctx, planTasks, selected.length, (t) =>
+					runModeMarker(runModeFor(t)),
+				);
 				if (!picked) {
 					ctx.ui.notify("do-always: no task chosen — commits not used", "info");
 					return;
@@ -2403,6 +2464,18 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				? renderTaskPrompt(chosen, { ...strings, selected_commits: details })
 				: `${renderTaskPrompt(chosen, strings)}\n\nSelected commits:\n${details}`;
 
+			// The chosen task's run mode decides how the commit run starts: in
+			// `fill` mode (e.g. plan mode switched off with ctrl+p) the prompt
+			// lands in the editor for review instead of being sent.
+			if (runModeFor(chosen) === "fill" && ctx.mode === "tui") {
+				ctx.ui.setEditorText(prompt);
+				ctx.ui.notify(
+					`do-always: ${selected.length} commit${selected.length !== 1 ? "s" : ""} → "${chosen.name}" filled — press Enter to run`,
+					"info",
+				);
+				return;
+			}
+
 			armPendingSummary(chosen.name);
 			pi.sendUserMessage(prompt, { deliverAs: 'followUp' });
 			ctx.ui.notify(
@@ -2419,7 +2492,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// Render with the same context the selector/preview used, so what the
 		// user saw is exactly what gets injected.
 		const prompt = renderTaskPrompt(task, toPromptContext(context));
-		if (shouldAutoRun(task)) {
+		// `plan` and `run` both send immediately; only `plan` asked for the plan
+		// block (renderTaskPrompt), so the summary path differs by itself.
+		if (runModeFor(task) !== "fill") {
 			// Fire-and-forget: sendUserMessage returns void; the run proceeds
 			// independently (see the chain control notes for why).
 			// Track the task so we can post a summary after agent_end.
@@ -2441,9 +2516,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	 * steps run strictly one after another. Aborting (or erroring) a step
 	 * stops the chain.
 	 *
-	 * Step 1 follows the task's autoRun semantics: ⚡ tasks (and non-TUI modes)
-	 * are sent immediately; fill tasks put step 1 in the editor and wait for
-	 * its run to settle before starting the remaining steps.
+	 * Step 1 follows the task's run mode: `plan`/`run` tasks (and non-TUI
+	 * modes) are sent immediately; `fill` tasks put step 1 in the editor and
+	 * wait for its run to settle before starting the remaining steps.
 	 */
 	async function runChain(
 		names: string[],
@@ -2495,7 +2570,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			};
 		}
 		const first = steps[0];
-		if (shouldAutoRun(first) || ctx.mode !== "tui") {
+		if (runModeFor(first) !== "fill" || ctx.mode !== "tui") {
 			try {
 				showChainStatus(
 					ctx,
@@ -2830,6 +2905,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				// to the terminal's default background), so the marker carries
 				// the cursor.
 				const cursorMark = theme.fg("accent", "►");
+				// Chain-preview marker: the task's run-mode glyph (⚡/▶/—), so the
+				// footer sequence matches the rows after a ctrl+p toggle.
+				const chainMarker = (t: DoAlwaysTask) => runModeGlyph(runModeFor(t));
 
 				// Header.
 				lines.push(
@@ -2869,7 +2947,9 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 						if (idx === undefined || idx < winStart || idx >= winStart + maxVisible) continue;
 						itemShown++;
 						const task = row.task;
-						const auto = shouldAutoRun(task);
+						// Run mode (session override → config default) drives the row
+						// marker: ⚡ plan, ▶ run, no marker for fill.
+						const marker = runModeMarker(runModeFor(task));
 						const focused = cursor.kind === "cell" && cursor.row === idx;
 						// Cursor markers: ► in the left gutter = TASK column, ► in the
 						// ORDER cell = ORDER column. The row background is applied too,
@@ -2885,11 +2965,11 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 							: inOrderCol && tier === "narrow"
 								? `${theme.fg("warning", "►")} ${String(itemRows[idx].globalIndex + 1).padStart(2)}`
 								: `  ${String(itemRows[idx].globalIndex + 1).padStart(2)}`;
-						// ⚡ is 2 columns wide, so "⚡ " takes 3 — reserve it so
-						// auto-run rows align with the others (ORDER cell is
-						// hit-tested at a fixed x).
-						const name = truncateToWidth(task.name, taskCol - (auto ? 3 : 0), "…", true);
-						const taskCell = (auto ? "⚡ " : "") + name;
+						// The marker cell is exactly 3 columns wide (⚡ is 2 columns,
+						// ▶ 1, padded) so marked rows align with the others (the
+						// ORDER cell is hit-tested at a fixed x).
+						const name = truncateToWidth(task.name, taskCol - (marker ? 3 : 0), "…", true);
+						const taskCell = marker + name;
 						// Every ORDER cell is exactly ORDER_COL_W wide so the column
 						// stays aligned (and mouse hit-testing stays exact).
 						const orderCell =
@@ -2922,7 +3002,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					// Narrow tier: the chain gets its own line instead of a column.
 					if (tier === "narrow" && chain.items.length > 0) {
 						lines.push(
-							theme.fg("dim", truncateToWidth(`  chain: ${formatChainSequence(visibleTasks, chain)}`, width - 2, "…")),
+							theme.fg("dim", truncateToWidth(`  chain: ${formatChainSequence(visibleTasks, chain, chainMarker)}`, width - 2, "…")),
 						);
 					}
 				}
@@ -2973,21 +3053,55 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					lines.push(theme.fg("accent", `  ${runLabel}`));
 				}
 
-				// Context-sensitive footer.
+				// Context-sensitive footer. The segments are listed in priority
+				// order and assembled greedily — one that does not fit is skipped
+				// rather than pushing the rest off the terminal — so the run-mode
+				// hint stays visible at every width instead of being truncated
+				// away with the tail. A segment given as a list uses its first
+				// alternative that fits (the mode hint degrades to the bare key).
+				const fitFooter = (segments: (string | string[] | null)[], budget: number): string => {
+					let line = "";
+					for (const entry of segments) {
+						if (!entry) continue;
+						for (const seg of typeof entry === "string" ? [entry] : entry) {
+							const candidate = line === "" ? `  ${seg}` : `${line}  •  ${seg}`;
+							if (visibleWidth(candidate) <= budget) {
+								line = candidate;
+								break;
+							}
+						}
+					}
+					return line;
+				};
+				const modeRow = cursor.kind === "cell" ? itemRows[cursor.row] : undefined;
+				// What ctrl+p cycles, spelled out — `fill` has no row marker of its
+				// own, so the footer is where that state is readable.
+				const modeHint = modeRow
+					? [`ctrl+p ${runModeShort(runModeFor(modeRow.task))}`, "ctrl+p mode", "ctrl+p"]
+					: null;
+				const clearing = chain.items.length > 0 ? "ctrl+u clear" : null;
 				let footer: string;
 				if (cursor.kind === "run") {
 					footer =
 						chain.items.length > 0
-							? `  ⏎ run: ${formatChainSequence(visibleTasks, chain)}`
+							? `  ⏎ run: ${formatChainSequence(visibleTasks, chain, chainMarker)}`
 							: "  ⏎ run the chain (chain is empty)";
-				} else if (cursor.col === "order") {
-					const inChain = chain.items.includes(itemRows[cursor.row]?.task.name ?? "");
-					footer = inChain ? "  ← tasks  •  ⏎ remove  •  esc" : "  ← tasks  •  ⏎ add  •  esc";
-				} else {
-					footer = "  1-9 run now  •  ⏎ select  •  → order  •  ⌫ undo  •  esc";
+					lines.push(theme.fg("dim", truncateToWidth(footer, width - 2, "")));
+					return { lines, itemLine, runLine, orderColX };
 				}
-				if (chain.items.length > 0 && cursor.kind !== "run") footer += "  •  ctrl+u clear";
-				lines.push(theme.fg("dim", truncateToWidth(footer, width - 2, "")));
+				if (cursor.col === "order") {
+					const inChain = chain.items.includes(modeRow?.task.name ?? "");
+					footer = fitFooter(
+						["← tasks", inChain ? "⏎ remove" : "⏎ add", modeHint, clearing, "esc"],
+						width - 2,
+					);
+				} else {
+					footer = fitFooter(
+						["1-9 run now", modeHint, "⏎ select", "→ order", clearing, "⌫ undo", "esc"],
+						width - 2,
+					);
+				}
+				lines.push(theme.fg("dim", footer));
 
 				return { lines, itemLine, runLine, orderColX };
 			}
@@ -3007,6 +3121,21 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					// so digits pick a visible task by its number.
 					if (!filter && /^[1-9]$/.test(data) && Number(data) <= visibleTasks.length) {
 						finishSingle(visibleTasks[Number(data) - 1]);
+						return;
+					}
+					// Cycle the run mode of the row under the cursor (session
+					// scope): fill → run → plan → fill. The row marker and the
+					// footer show the new mode; `/do-always mode` does the same
+					// from the command line, and the config's `autoRun` /
+					// `questionnaire` fields are the permanent knobs.
+					if (matchesKey(data, "ctrl+p")) {
+						const rows = getVisible().itemRows;
+						const row = cursor.kind === "cell" ? rows[cursor.row] : undefined;
+						if (row) {
+							cycleRunMode(row.task);
+							resetPreview();
+							tui.requestRender();
+						}
 						return;
 					}
 					// Filter typing (Backspace edits the filter; with an empty
@@ -3295,6 +3424,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				{ value: "list-details", label: "list-details" },
 				{ value: "replan", label: "replan" },
 				{ value: "questionnaire", label: "questionnaire (toggle)" },
+			{ value: "mode", label: "mode (per-task run mode: plan/run/fill)" },
 				{ value: "testplan", label: "testplan (dry-run the plan questionnaire)" },
 				...visible.map((t, i) => ({ value: t.name, label: `${i + 1}. ${t.name}` })),
 			].filter((c) => c.value.toLowerCase().includes(p));
@@ -3367,6 +3497,44 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 					: "do-always: questionnaire disabled (plan proposals will not be offered)",
 				"info",
 			);
+			return;
+		}
+
+		// Per-task run mode: how a task runs when it is selected — `plan` (send
+		// + plan questionnaire), `run` (send as-is, plain summary) or `fill`
+		// (put the prompt in the editor). This is the command-line twin of the
+		// selector's ctrl+p; the config's `autoRun` / `questionnaire` fields
+		// are the permanent knobs, an override here lasts for the session.
+		if (arg.split(/\s+/)[0].toLowerCase() === "mode") {
+			const rest = arg.trim().split(/\s+/).slice(1);
+			if (rest.length === 0) {
+				const head =
+					"do-always run modes — ctrl+p in the selector, or /do-always mode <task> [plan|run|fill|default]:";
+				ctx.ui.notify(`${head}\n${formatRunModes(visible, runModeFor, overriddenRunModes())}`, "info");
+				return;
+			}
+			// The trailing token may be the mode; what precedes it is the task
+			// name (names contain spaces: "mode review changes fill").
+			const maybeMode = rest.length > 1 ? parseRunMode(rest[rest.length - 1]) : null;
+			const nameArg = (maybeMode === null ? rest : rest.slice(0, -1)).join(" ");
+			const task = resolveTask(/^\d+$/.test(nameArg) ? visible : tasks, nameArg);
+			if (!task) {
+				const available = visible.map((t, i) => `${i + 1}=${t.name}`).join(", ");
+				ctx.ui.notify(`do-always: unknown task "${nameArg}". Available: ${available}`, "error");
+				return;
+			}
+			if (maybeMode === null) {
+				const next = cycleRunMode(task);
+				ctx.ui.notify(`do-always: "${task.name}" → ${runModeLabel(next)} — this session only`, "info");
+				return;
+			}
+			if (maybeMode === "default") {
+				runModeOverrides.delete(task.name);
+				ctx.ui.notify(`do-always: "${task.name}" → ${runModeLabel(runModeFor(task))} (its default)`, "info");
+				return;
+			}
+			setRunMode(task.name, maybeMode);
+			ctx.ui.notify(`do-always: "${task.name}" → ${runModeLabel(maybeMode)} — this session only`, "info");
 			return;
 		}
 

@@ -6,7 +6,8 @@ repeated "do the usual" prompts.
 Type `/do-always` → a numbered list of tasks appears, grouped by category → press a number,
 type to filter, scroll or click, or navigate with arrows + Enter → the task's prompt is
 **filled into the input editor**. Review it, tweak it, press Enter to run. Tasks marked `⚡`
-(the `Plan` category by default) auto-run on selection instead — see `autoRun` below.
+(the `Plan` category by default) auto-run on selection instead — see `autoRun` below, and
+[Run modes](#run-modes) for switching a task's mode with `ctrl+p`.
 
 
 ![do-always — the numbered task selector](pi.image.png)
@@ -41,6 +42,9 @@ For development you can also load it explicitly: `npm run dev` (runs `pi --exten
 |`/do-always list`|Print the task list|
 |`/do-always list-details`|Show the full rendered prompt text each task will inject|
 |`/do-always replan`|Re-open the plan questionnaire for the last offered proposal (e.g. after an accidental Esc)|
+|`/do-always mode`|List every visible task's run mode (`plan` / `run` / `fill`)|
+|`/do-always mode <task> [plan\|run\|fill\|default]`|Set — or with no mode, cycle — how a task runs for this session (the CLI twin of the selector's `ctrl+p`)|
+|`/do-always questionnaire`|Toggle the plan questionnaire on/off for the rest of the session (all tasks)|
 
 The selector supports direct number-pick (1-9), live type-to-filter, arrow/Enter navigation,
 mouse-wheel scrolling, and click-to-select. The quick number-pick covers keys 1-9 only: rows
@@ -56,6 +60,41 @@ not filled): the `Plan` category does this by default, and any task can opt in o
 
 In non-interactive modes (no TUI) there is no editor to fill, so the selected prompt is sent
 as a user message instead.
+
+## Run modes
+
+Every task runs in one of three **modes**. The row marker shows it, and the footer names it
+for the row under the cursor (`ctrl+p ⚡ plan`):
+
+|Marker|Mode|On selection|
+|---|---|---|
+|`⚡`|`plan`|the prompt is sent with the plan-block instruction prepended; the reply opens the [plan questionnaire](#plan-questionnaire)|
+|`▶`|`run`|the prompt is sent as-is — no plan block, no questionnaire, just the plain summary notification|
+|—|`fill`|nothing is sent: the prompt is filled into the editor, you review/edit it and press Enter|
+
+The default is derived from the config exactly as before: a `Plan`-category task with the
+questionnaire enabled and `autoRun` on is `plan`, any other auto-run task is `run`, and
+everything else is `fill`.
+
+Press **`ctrl+p`** with the cursor on a task row (in either column) to cycle
+`fill → run → plan` **for the rest of the session** — so one press on a Plan task turns its
+plan mode off and the prompt lands in the editor instead. Nothing is written to any config
+file; the permanent knobs remain `autoRun` and `questionnaire`.
+
+The same control from the command line (useful in non-TUI modes, where there is no selector):
+
+```text
+/do-always mode                     # list every visible task's effective mode
+/do-always mode review changes      # cycle that task: fill → run → plan
+/do-always mode cleanup fill        # set it (aliases: on = plan, off/editor = fill)
+/do-always mode cleanup default     # drop the override, back to the config value
+```
+
+A session override applies everywhere the task can start: the selector (number-pick, Enter,
+click), `/do-always <n|name>`, a chain's first step (`fill` → step 1 waits in the editor),
+and the commit-picker run. It can also switch plan mode *on* for a task that is not in the
+`Plan` category. `/do-always questionnaire` remains the global switch: it changes the default
+for every task that has no override of its own.
 
 ## Chains
 
@@ -237,7 +276,9 @@ item numbers — it works because the raw plan block stays in the transcript
 in non-TUI modes (`hidePlan` never strips it there), so the model can map
 your numbers back to the items. The
 questionnaire is offered only on the single auto-run path (selector pick,
-`/do-always <n>`, commit picker) — chain steps never get it.
+`/do-always <n>`, commit picker) — chain steps never get it. A task in `run` or
+`fill` mode (`ctrl+p`, `/do-always mode`, or `questionnaire: false`) never asks
+for a block, so it never offers one — see [Run modes](#run-modes).
 
 A plan block does not have to come from a Plan task to be actionable: the
 plan-block instruction stays visible in the conversation context, so models
@@ -281,11 +322,11 @@ Fields:
 - `category` (optional) — group header the task is shown under in the selector (e.g. `"Plan"`, `"Do"`). Matching is case-insensitive and the header is title-cased, so `"plan"` and `"Plan"` land in the same `Plan` group. Tasks without a category fall under `Other`. The built-in defaults are grouped into `Plan`, `Browse`, `Do`, `Docs`, and `Ops`.
 - `description` (optional) — one-line label shown in the selector
 - `prompt` (required) — the text filled into the editor (supports `{{placeholders}}` — see [Prompt placeholders](#prompt-placeholders))
-- `autoRun` (optional) — when `true`, selecting the task sends its prompt immediately instead of filling the editor; when `false`, it always fills the editor. When omitted, the default is derived from the category: `Plan` tasks auto-run, everything else fills the editor. Auto-run tasks are marked `⚡` in the selector.
+- `autoRun` (optional) — when `true`, selecting the task sends its prompt immediately instead of filling the editor; when `false`, it always fills the editor. When omitted, the default is derived from the category: `Plan` tasks auto-run, everything else fills the editor. Auto-run tasks are marked `⚡` in the selector. Together with `questionnaire` this sets the task's default [run mode](#run-modes), which `ctrl+p` in the selector or `/do-always mode <task>` overrides for the session.
 - `browser` (optional) — a browser to open on selection instead of injecting the prompt. Only `"commits"` is supported: it opens the date-grouped commit browser, and after the selection the task runs on the selected commits — directly when its prompt references `{{selected_commits}}`, otherwise via a picker of `Plan` tasks (see [Commit browser](#commit-browser)). An invalid value is ignored with a warning.
 - `hidden` (optional) — when `true`, the task is not shown in the selector or in `/do-always list` / `list-details`. Unlike a `when` condition, a hidden task can still be run by name (`/do-always <name>`), and it is offered as a candidate by the commit picker. The built-in `Review commits` uses this: it is a pick-after-browse option, not a standalone entry.
 - `notForCommits` (optional) — when `true`, the task is excluded from the commit picker (the “run on the selected commits” list) because it does not operate on a set of commits. The task is otherwise unaffected (selector, lists, CLI). The built-in `Review changes`, `Review code`, and `Propose features` use this.
-- `questionnaire` (optional) — whether the plan questionnaire is offered after this task's completed run (see [Plan questionnaire](#plan-questionnaire)). Default `true`; set `false` to keep the plain summary notification.
+- `questionnaire` (optional) — whether the plan questionnaire is offered after this task's completed run (see [Plan questionnaire](#plan-questionnaire)). Default `true`; set `false` to keep the plain summary notification (the task then runs in `run` mode: no plan block is asked for at all). Overridden for the session by `ctrl+p` / `/do-always mode <task>`.
 - `hidePlan` (optional) — whether the raw `plan` block is hidden from the transcript after this task's completed run: the fenced block is stripped from the finalized reply (TUI only — in non-TUI modes the block is always kept so the model can resolve item-number replies). Default `true`; set `false` to keep the block visible in the conversation.
 - `when` (optional) — a condition that hides the task from the selector and lists when it is not met (see [Conditionals](#conditionals)).
 - `guards` (optional) — an array of selection-time guards that block the task (with a message, not a hide) when a condition is unmet (see [Guards](#guards)). The legacy `requireDirty` (boolean) still works and is combined with any `guards`.

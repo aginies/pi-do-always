@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Per-task run modes — switch plan mode off from the selector**: every task
+  now runs in one of three modes — `plan` (prompt sent with the plan-block
+  instruction, the reply opens the questionnaire), `run` (prompt sent as-is,
+  plain summary notification) or `fill` (prompt goes into the editor for review)
+  — with the default derived from the config exactly as before (`Plan` category
+  with the questionnaire enabled and `autoRun` on → `plan`, any other auto-run
+  task → `run`, everything else → `fill`). Press **ctrl+p** with the cursor on a
+  task row to cycle `fill → run → plan` for the rest of the session: one press
+  on a Plan task disables its plan mode without editing any file. The row marker
+  (`⚡` / `▶` / none) and the footer (`ctrl+p ⚡ plan`) show the current mode,
+  which the prompt preview and `/do-always list-details` follow. From the
+  command line: `/do-always mode` lists the effective modes, `/do-always mode
+  <task>` cycles one, and `/do-always mode <task> plan|run|fill|default` sets it
+  (`default` drops the override; `on`/`off`/`editor` are accepted aliases). The
+  override applies everywhere a task can start — number-pick, Enter, click,
+  `/do-always <n|name>`, a chain's first step (`fill` → step 1 waits in the
+  editor) and the commit-picker run — and it can switch plan mode *on* for a
+  task outside the `Plan` category.
+
+### Changed
+
+- **The plan-block instruction follows the run mode**: it is prepended only for
+  a task in `plan` mode. A Plan task with `autoRun: false` used to carry the
+  instruction even though nothing consumed the block (the questionnaire is only
+  offered on the auto-run path) — it now runs as a plain prompt, and its reply
+  keeps whatever the model wrote instead of a JSON block nobody reads.
+- **The selector footer survives narrow terminals**: its hints are assembled
+  from priority-ordered segments, each one dropped only when it does not fit,
+  instead of a single string truncated at the right edge. The run-mode hint
+  degrades `ctrl+p ⚡ plan` → `ctrl+p mode` → `ctrl+p`, and the ORDER column
+  shows it too.
+
 ## [0.24.0] - 2026-10-26
 
 ### Added

@@ -420,3 +420,20 @@ test("a Plan auto-run's own block is never offered twice as ad-hoc", async () =>
 	assert.equal(h.questionnaireOpened(), true);
 	assert.ok(h.overlayText().includes("Flow Plan"), "offered under the task's name, not as Ad-hoc plan");
 });
+
+test("a tracked auto-run's reply is never captured as ad-hoc", async () => {
+	// The reply belongs to the armed run: agent_end serves that run's summary
+	// first and never reaches the ad-hoc branch, so capturing here would strip
+	// a block that is then dropped — the proposal would vanish from the
+	// transcript without ever being offered. Non-Plan auto-runs hit this too
+	// (anyPlan), not just tasks switched out of plan mode with ctrl+p.
+	const h = harness([{ ...PLAIN_TASK, autoRun: true }]);
+	await h.start();
+	await h.command("flow build");
+	assert.equal(h.sent().length, 1, "the auto-run was sent");
+	const reply = planReply("auto-run-tail");
+	await h.turn([reply]);
+	assert.equal(h.questionnaireOpened(), false, "no ad-hoc questionnaire for a tracked run");
+	assert.equal(hasFence(reply), true, "and its fence stays in the transcript");
+	assert.ok(h.notes().some((n) => n.includes("Flow Build")), "the run's own summary is posted");
+});

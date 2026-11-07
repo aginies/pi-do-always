@@ -945,6 +945,147 @@ export function shouldAutoRun(task: DoAlwaysTask): boolean {
 	return isPlanTask(task);
 }
 
+// ---------------------------------------------------------------------------
+// Run modes
+//
+// One knob for the two things a Plan task does by default: sending its prompt
+// straight away (auto-run) and asking for the machine-readable "plan" block the
+// questionnaire parses. Every task has an effective mode derived from its
+// config (category, `autoRun`, `questionnaire`), and the user can override it
+// per task for the session — `ctrl+p` in the selector, or `/do-always mode` —
+// so plan mode can be dropped for one task without editing any file. All the
+// functions here are pure; the override map lives in index.ts.
+// ---------------------------------------------------------------------------
+
+/**
+ * How a task runs when it is selected:
+ * - `fill` — the prompt goes into the editor (review, tweak, press Enter)
+ * - `run` — the prompt is sent as-is: no plan block requested, so the reply
+ *   gets the plain summary notification
+ * - `plan` — sent with PLAN_OUTPUT_INSTRUCTION prepended; the reply's "plan"
+ *   block is captured, hidden and offered as the selection questionnaire
+ */
+export type RunMode = "fill" | "run" | "plan";
+
+/** The cycle order (least automated first): fill → run → plan → fill. */
+export const RUN_MODE_CYCLE: readonly RunMode[] = ["fill", "run", "plan"];
+
+/**
+ * The mode a task runs in when the user has not overridden it: an auto-run
+ * task is `plan` when a plan block would actually be asked for and read (Plan
+ * category with the questionnaire enabled) and `run` otherwise; anything else
+ * fills the editor. Mirrors the historical behavior exactly.
+ */
+export function defaultRunMode(task: DoAlwaysTask, questionnaireEnabled = true): RunMode {
+	if (!shouldAutoRun(task)) return "fill";
+	return isPlanTask(task) && (task.questionnaire ?? questionnaireEnabled) ? "plan" : "run";
+}
+
+/** The next mode in the cycle (fill → run → plan → fill). */
+export function nextRunMode(mode: RunMode): RunMode {
+	const i = RUN_MODE_CYCLE.indexOf(mode);
+	return RUN_MODE_CYCLE[(i + 1) % RUN_MODE_CYCLE.length];
+}
+
+/**
+ * A task's effective mode: its session override when there is one, its
+ * config-derived default otherwise.
+ */
+export function resolveRunMode(
+	task: DoAlwaysTask,
+	overrides: ReadonlyMap<string, RunMode>,
+	questionnaireEnabled = true,
+): RunMode {
+	return overrides.get(task.name) ?? defaultRunMode(task, questionnaireEnabled);
+}
+
+/** The bare glyph for a mode: `⚡` plan, `▶` run, nothing for fill. */
+export function runModeGlyph(mode: RunMode): string {
+	return mode === "plan" ? "⚡" : mode === "run" ? "▶" : "";
+}
+
+/**
+ * The selector's marker cell for a mode, padded to the 3 columns the `⚡`
+ * marker occupies so rows with and without a marker stay aligned ("" for
+ * fill: no marker, no reserved column).
+ */
+export function runModeMarker(mode: RunMode): string {
+	const glyph = runModeGlyph(mode);
+	if (!glyph) return "";
+	// ⚡ is 2 columns wide, ▶ is 1 — pad both to 3 with the trailing space(s).
+	return glyph === "⚡" ? "⚡ " : "▶  ";
+}
+
+/** Human-readable mode label for footers and notifications. */
+export function runModeLabel(mode: RunMode): string {
+	return mode === "plan"
+		? "plan (send + plan questionnaire)"
+		: mode === "run"
+			? "run (send as-is, no questionnaire)"
+			: "fill (put the prompt in the editor)";
+}
+
+/**
+ * Compact mode label for the selector footer: glyph + name (`⚡ plan`,
+ * `▶ run`, `✎ fill`). Unlike `runModeGlyph`, `fill` gets a glyph here — the
+ * footer is the one place the mode is spelled out, and a row in `fill` mode
+ * carries no marker of its own.
+ */
+export function runModeShort(mode: RunMode): string {
+	return mode === "plan" ? "⚡ plan" : mode === "run" ? "▶ run" : "✎ fill";
+}
+
+/**
+ * Parse a mode name from the command line: `plan`, `run`, `fill` (plus the
+ * friendly aliases `on`/`off`), or `default` to clear the session override.
+ * Returns null for anything else.
+ */
+export function parseRunMode(text: string): RunMode | "default" | null {
+	switch (text.trim().toLowerCase()) {
+		case "plan":
+		case "on":
+			return "plan";
+		case "run":
+			return "run";
+		case "fill":
+		case "off":
+		case "editor":
+			return "fill";
+		case "default":
+		case "reset":
+			return "default";
+		default:
+			return null;
+	}
+}
+
+/**
+ * The `/do-always mode` listing: the visible tasks in selector order, each
+ * with its effective mode. Overridden tasks (set in this session) are marked.
+ */
+export function formatRunModes(
+	tasks: DoAlwaysTask[],
+	modeOf: (task: DoAlwaysTask) => RunMode,
+	overridden: ReadonlySet<string> = new Set(),
+): string {
+	const groups = groupTasksByCategory(tasks);
+	const lines: string[] = [];
+	const showHeaders = groups.length > 1;
+	let n = 0;
+	for (const g of groups) {
+		if (showHeaders) lines.push(g.name.toUpperCase());
+		for (const t of g.items) {
+			n++;
+			const mode = modeOf(t);
+			lines.push(
+				`${n}. ${runModeGlyph(mode) ? `${runModeGlyph(mode)} ` : ""}${t.name} — ${mode}` +
+					(overridden.has(t.name) ? " (set in this session)" : ""),
+			);
+		}
+	}
+	return lines.join("\n");
+}
+
 /**
  * Evaluate a task's guards against the current prompt context. Returns a
  * notification message (caller should notify and abort) when a guard fails, or
@@ -1243,17 +1384,23 @@ export function buildTableRows(groups: TaskGroup[], chain: ChainState): TableRow
 }
 
 /**
- * Footer preview of the chain: "1.⚡ Review changes → 2.Build". Tasks are
- * looked up in `tasks`; unknown names (a stale chain) are skipped.
+ * Footer preview of the chain: "1.⚡Review changes → 2.Build". Tasks are
+ * looked up in `tasks`; unknown names (a stale chain) are skipped. `markerOf`
+ * defaults to the config-derived ⚡ for auto-run tasks; callers that track
+ * session run-mode overrides pass one so the preview matches the selector.
  */
-export function formatChainSequence(tasks: DoAlwaysTask[], chain: ChainState): string {
+export function formatChainSequence(
+	tasks: DoAlwaysTask[],
+	chain: ChainState,
+	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? "⚡" : ""),
+): string {
 	// O(n) index map so find → O(1) lookup.
 	const taskByName = new Map(tasks.map((t) => [t.name, t]));
 	const parts = chain.items
 		.map((name, i) => {
 			const t = taskByName.get(name);
 			if (!t) return null;
-			const marker = shouldAutoRun(t) ? "⚡" : "";
+			const marker = markerOf(t);
 			return `${i + 1}.${marker}${t.name}`;
 		})
 		.filter((p): p is string => p !== null);
