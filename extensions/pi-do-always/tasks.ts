@@ -2197,7 +2197,11 @@ export function parsePlanProposal(text: string): PlanProposal | null {
  * Why (or why not) a reply's plan block is usable for the questionnaire.
  * Mirrors parsePlanProposal's block precedence (last to first), so the
  * reported reason matches what the parser decided: "ok" is exactly the case
- * where parsePlanProposal returns a proposal.
+ * where parsePlanProposal returns a proposal. That includes the blocks only
+ * the tier miner can read (0.23.0): a stray `]` closing the `tiers` array
+ * early, or a root object that never closes, parse to no JSON at all but still
+ * yield their tiers — so the miner is consulted before a block is called
+ * malformed, and the ad-hoc capture gate / `testplan` agree with the parser.
  */
 export type PlanBlockDiagnostic =
 	| { kind: "none" } // no fenced plan block at all
@@ -2213,6 +2217,14 @@ export function planBlockDiagnostics(text: string): PlanBlockDiagnostic {
 	let parsedButEmpty = false;
 	for (let i = fences.length - 1; i >= 0; i--) {
 		const parsed = parseLenientJson(fences[i].body);
+		// One normalization path for both cases: when the JSON did not parse,
+		// `data` is null and normalizePlanData falls back to mining the raw
+		// body — exactly what parsePlanProposal does via normalizePlanJson.
+		const proposal = normalizePlanData(parsed.error === null ? parsed.data : null, fences[i].body);
+		if (proposal) {
+			const count = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
+			if (count > 0) return { kind: "ok", itemCount: count };
+		}
 		if (parsed.error !== null) {
 			// The loop runs last-to-first, so the first error seen is the
 			// last block's — the agent's final answer, which is the one to
@@ -2223,11 +2235,6 @@ export function planBlockDiagnostics(text: string): PlanBlockDiagnostic {
 				lastError = parsed.error.replace(/\s+at\s+position\s+\d+(?:\s*\(line\s+\d+\s+column\s+\d+\))?/, "");
 			}
 			continue;
-		}
-		const proposal = normalizePlanData(parsed.data, fences[i].body);
-		if (proposal) {
-			const count = proposal.tiers.reduce((n, t) => n + t.items.length, 0);
-			if (count > 0) return { kind: "ok", itemCount: count };
 		}
 		parsedButEmpty = true;
 	}

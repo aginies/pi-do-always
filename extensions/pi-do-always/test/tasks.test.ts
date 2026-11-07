@@ -2258,6 +2258,53 @@ test("planBlockDiagnostics agrees with parsePlanProposal", () => {
 	}
 });
 
+test("planBlockDiagnostics reads the blocks only the tier miner can recover", () => {
+	// A stray `]` closes the tiers array early, so the JSON never parses — but
+	// both tiers are readable from the raw body (0.23.0 mining). The diagnostics
+	// must agree with parsePlanProposal: captureAdhocPlan gates on `kind === "ok"`,
+	// so a disagreement leaves a real proposal as raw JSON in the transcript.
+	const strayClose = planText(
+		'{"summary":"Two tiers","tiers":[' +
+			'{"id":"P0","label":"Critical","items":[{"title":"first","detail":"a.ts:1"}]}],' +
+			'{"id":"P1","label":"Important","items":[{"title":"second","detail":"b.ts:2"}]}]}',
+	);
+	assert.deepEqual(planBlockDiagnostics(strayClose), { kind: "ok", itemCount: 2 });
+	assert.equal(parsePlanProposal(strayClose)?.tiers.length, 2, "and the parser agrees");
+
+	// The root object never closes: mining still reads both tiers.
+	const unclosedRoot = planText(
+		'{"summary":"S","tiers":[{"id":"P0","items":[{"title":"a"}]}],{"id":"P1","items":[{"title":"b"}]}',
+	);
+	assert.deepEqual(planBlockDiagnostics(unclosedRoot), { kind: "ok", itemCount: 2 });
+
+	// Genuinely broken JSON is still malformed — there is nothing to mine.
+	const junk = planText("{not json at all");
+	assert.equal(planBlockDiagnostics(junk).kind, "malformed");
+	assert.equal(parsePlanProposal(junk), null);
+});
+
+test("planBlockDiagnostics and parsePlanProposal never disagree", () => {
+	const bodies = [
+		'{"summary":"S","tiers":[{"id":"P0","items":[{"title":"a"}]}]}', // well-formed
+		'{"summary":"S","tiers":[{"id":"P0","items":[{"title":"a"}]}]},', // trailing comma
+		'{"summary":"S","tiers":[{"id":"P0","items":[{"title":"a"}]}],{"id":"P1","items":[{"title":"b"}]}]}', // stray ]
+		'{"summary":"S","tiers":[{"id":"P0","items":[{"title":"a"}]}] {"id":"P1","items":[{"title":"b"}]}', // no comma
+		'{"tiers":[{"id":"P0","items":[{"title":"a"}]}},', // stray closer (0.22.0 sample)
+		"{not json}",
+		"{}",
+		'{"tiers":[]}',
+		'[{"id":"P0","items":[{"title":"a"}]}]', // root is an array
+	];
+	for (const body of bodies) {
+		const text = planText(body);
+		assert.equal(
+			planBlockDiagnostics(text).kind === "ok",
+			parsePlanProposal(text) !== null,
+			`diagnostics and parser disagree on: ${body}`,
+		);
+	}
+});
+
 // ── Plan item notes ────────────────────────────────────────────────────────
 
 test("planSelectedItems carries notes for selected items only", () => {
