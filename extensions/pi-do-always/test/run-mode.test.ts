@@ -22,7 +22,9 @@ import {
 	defaultRunMode,
 	formatChainSequence,
 	formatRunModes,
+	isRunMode,
 	nextRunMode,
+	parseConfig,
 	parseRunMode,
 	resolveRunMode,
 	runModeGlyph,
@@ -48,6 +50,28 @@ test("defaultRunMode derives the mode from category, autoRun and questionnaire",
 	// The global questionnaire switch is the fallback for tasks that set none.
 	assert.equal(defaultRunMode(PLAN_TASK, false), "run", "questionnaire disabled globally → plain auto-run");
 	assert.equal(defaultRunMode({ ...PLAN_TASK, questionnaire: true }, false), "plan", "the task's own flag wins");
+});
+
+test("defaultRunMode prefers the config's own mode field", () => {
+	// `mode` is the direct spelling; it wins over the legacy fields, which is
+	// what makes "run Cleanup in the editor from now on" a one-field change.
+	assert.equal(defaultRunMode({ ...PLAN_TASK, mode: "fill" }), "fill");
+	assert.equal(defaultRunMode({ ...PLAN_TASK, mode: "run" }), "run");
+	assert.equal(defaultRunMode({ ...DO_TASK, mode: "plan" }), "plan");
+	assert.equal(
+		defaultRunMode({ ...PLAN_TASK, mode: "fill", autoRun: true, questionnaire: true }),
+		"fill",
+		"an explicit mode beats autoRun + questionnaire",
+	);
+	assert.equal(defaultRunMode({ ...PLAN_TASK, mode: "plan" }, false), "plan", "and beats the global questionnaire switch");
+	assert.equal(defaultRunMode(PLAN_TASK), "plan", "no mode field → the legacy derivation");
+});
+
+test("isRunMode accepts only the three mode names", () => {
+	for (const ok of ["fill", "run", "plan"]) assert.equal(isRunMode(ok), true, ok);
+	for (const bad of ["off", "on", "default", "editor", "", "PLAN", null, undefined, 3]) {
+		assert.equal(isRunMode(bad), false, String(bad));
+	}
 });
 
 test("nextRunMode cycles fill → run → plan → fill", () => {
@@ -97,16 +121,22 @@ test("parseRunMode reads the mode names and their aliases", () => {
 	}
 });
 
-test("formatRunModes lists tasks in selector order and marks overrides", () => {
+test("formatRunModes lists tasks in selector order and marks the mode's source", () => {
 	const tasks = [PLAN_TASK, DO_TASK];
 	assert.equal(
-		formatRunModes(tasks, (t) => defaultRunMode(t), new Set(["Build"])),
+		formatRunModes(tasks, (t) => defaultRunMode(t), (t) => (t.name === "Build" ? "session" : "default")),
 		["PLAN", "1. ⚡ Review — plan", "DO", "2. Build — fill (set in this session)"].join("\n"),
-		"fill carries no glyph; the override is named",
+		"fill carries no glyph; the session override is named",
 	);
-	// A custom mode source is what index.ts passes (session overrides applied).
-	const forced = formatRunModes(tasks, () => "run");
-	assert.equal(forced, ["PLAN", "1. ▶ Review — run", "DO", "2. ▶ Build — run"].join("\n"));
+	assert.equal(
+		formatRunModes(tasks, () => "run", () => "config"),
+		["PLAN", "1. ▶ Review — run (config `mode`)", "DO", "2. ▶ Build — run (config `mode`)"].join("\n"),
+	);
+	assert.equal(
+		formatRunModes(tasks, (t) => defaultRunMode(t)),
+		["PLAN", "1. ⚡ Review — plan", "DO", "2. Build — fill"].join("\n"),
+		"no source callback → no provenance note",
+	);
 });
 
 test("formatChainSequence honors a custom marker function", () => {
@@ -323,6 +353,45 @@ const lastNote = (h: Harness) => h.notes().at(-1) ?? "";
 
 const MODE_PLAN = { name: "Plan review", category: "Plan", prompt: "Review and propose." };
 const MODE_DO = { name: "Do build", category: "Do", prompt: "Build it." };
+
+test("parseConfig reads a valid mode and rejects an invalid one", () => {
+	const warns: string[] = [];
+	const parse = (raw: string) => parseConfig(raw, "test.json", (m) => warns.push(m));
+	const ok = parse(JSON.stringify([{ name: "x", prompt: "p", mode: "fill" }]));
+	assert.equal(ok.tasks[0].mode, "fill");
+	assert.equal(warns.length, 0, "a valid mode is silent");
+
+	const bad = parse(JSON.stringify([{ name: "y", prompt: "p", mode: "sideways" }]));
+	assert.equal(bad.tasks[0].mode, undefined, "an invalid mode is dropped");
+	assert.ok(
+		warns.some((w) => w.includes('"mode"') && w.includes("y")),
+		"…with a warning naming the task",
+	);
+
+	const absent = parse(JSON.stringify([{ name: "z", prompt: "p" }]));
+	assert.ok(!("mode" in absent.tasks[0]), "the key is omitted when the file does not set one");
+});
+
+test("a config mode is used, and /do-always mode says where it came from", async () => {
+	const h = harness([{ name: "Cfg Plan", category: "Plan", prompt: "Review.", mode: "fill" }]);
+	await h.start();
+	await h.command("mode");
+	assert.ok(lastNote(h).includes("Cfg Plan — fill (config `mode`)"), lastNote(h));
+
+	await h.command("Cfg Plan");
+	assert.equal(h.sent().length, 0, "the config mode is honored on select");
+	assert.deepEqual(h.editor(), ["Review."], "…the prompt went to the editor");
+
+	// A session override still wins over the config field…
+	await h.command("mode Cfg Plan plan");
+	await h.command("mode");
+	assert.ok(lastNote(h).includes("Cfg Plan — plan (set in this session)"), lastNote(h));
+	// …and `default` drops the override, landing back on the config value.
+	await h.command("mode Cfg Plan default");
+	assert.ok(lastNote(h).includes("(its config `mode`)"), lastNote(h));
+	await h.command("mode");
+	assert.ok(lastNote(h).includes("Cfg Plan — fill (config `mode`)"), lastNote(h));
+});
 
 test("default: a Plan task is sent with the plan-block instruction", async () => {
 	const h = harness([MODE_PLAN]);

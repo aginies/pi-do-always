@@ -72,23 +72,28 @@ for the row under the cursor (`ctrl+p ⚡ plan`):
 |`▶`|`run`|the prompt is sent as-is — no plan block, no questionnaire, just the plain summary notification|
 |—|`fill`|nothing is sent: the prompt is filled into the editor, you review/edit it and press Enter|
 
-The default is derived from the config exactly as before: a `Plan`-category task with the
-questionnaire enabled and `autoRun` on is `plan`, any other auto-run task is `run`, and
-everything else is `fill`.
+A task can state its mode directly with the `mode` field (`"plan"` / `"run"` / `"fill"`),
+which wins over the legacy derivation: a `Plan`-category task with the questionnaire enabled
+and `autoRun` on defaults to `plan`, any other auto-run task to `run`, and everything else to
+`fill`.
 
 Press **`ctrl+p`** with the cursor on a task row (in either column) to cycle
 `fill → run → plan` **for the rest of the session** — so one press on a Plan task turns its
 plan mode off and the prompt lands in the editor instead. Nothing is written to any config
-file; the permanent knobs remain `autoRun` and `questionnaire`.
+file; to keep a mode permanently, set the task's `mode` field.
 
 The same control from the command line (useful in non-TUI modes, where there is no selector):
 
 ```text
-/do-always mode                     # list every visible task's effective mode
+/do-always mode                     # list every visible task's effective mode (and its source)
 /do-always mode review changes      # cycle that task: fill → run → plan
 /do-always mode cleanup fill        # set it (aliases: on = plan, off/editor = fill)
-/do-always mode cleanup default     # drop the override, back to the config value
+/do-always mode cleanup default     # drop the session override, back to the config value
 ```
+
+The listing says where each mode comes from — `(config `mode`)` for a task that sets the
+field, `(set in this session)` for a `ctrl+p` / `/do-always mode` override, and no note for
+the default derived from `category` / `autoRun` / `questionnaire`.
 
 A session override applies everywhere the task can start: the selector (number-pick, Enter,
 click), `/do-always <n|name>`, a chain's first step (`fill` → step 1 waits in the editor),
@@ -323,6 +328,7 @@ Fields:
 - `description` (optional) — one-line label shown in the selector
 - `prompt` (required) — the text filled into the editor (supports `{{placeholders}}` — see [Prompt placeholders](#prompt-placeholders))
 - `autoRun` (optional) — when `true`, selecting the task sends its prompt immediately instead of filling the editor; when `false`, it always fills the editor. When omitted, the default is derived from the category: `Plan` tasks auto-run, everything else fills the editor. Auto-run tasks are marked `⚡` in the selector. Together with `questionnaire` this sets the task's default [run mode](#run-modes), which `ctrl+p` in the selector or `/do-always mode <task>` overrides for the session.
+- `mode` (optional) — the task's [run mode](#run-modes) spelled out directly: `"plan"` (send with the plan-block instruction, then offer the questionnaire), `"run"` (send as-is, plain summary) or `"fill"` (put the prompt in the editor). When set it wins over `autoRun` and `questionnaire`, which are the older way to express the same thing; when omitted the mode is derived from them as before. An invalid value is ignored with a warning. `ctrl+p` / `/do-always mode <task>` still override it for the session, and `/do-always mode` reports which of the two decided.
 - `browser` (optional) — a browser to open on selection instead of injecting the prompt. Only `"commits"` is supported: it opens the date-grouped commit browser, and after the selection the task runs on the selected commits — directly when its prompt references `{{selected_commits}}`, otherwise via a picker of `Plan` tasks (see [Commit browser](#commit-browser)). An invalid value is ignored with a warning.
 - `hidden` (optional) — when `true`, the task is not shown in the selector or in `/do-always list` / `list-details`. Unlike a `when` condition, a hidden task can still be run by name (`/do-always <name>`), and it is offered as a candidate by the commit picker. The built-in `Review commits` uses this: it is a pick-after-browse option, not a standalone entry.
 - `notForCommits` (optional) — when `true`, the task is excluded from the commit picker (the “run on the selected commits” list) because it does not operate on a set of commits. The task is otherwise unaffected (selector, lists, CLI). The built-in `Review changes`, `Review code`, and `Propose features` use this.

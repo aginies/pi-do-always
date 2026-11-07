@@ -20,6 +20,15 @@ export interface DoAlwaysTask {
 	 */
 	autoRun?: boolean;
 	/**
+	 * How the task runs when it is selected: "plan" (send the prompt with the
+	 * plan-block instruction, then offer the questionnaire), "run" (send it
+	 * as-is, plain summary notification) or "fill" (put it in the editor).
+	 * This is the direct spelling of what `autoRun` + `questionnaire` express
+	 * indirectly, and it wins over both when set. `/do-always mode` shows which
+	 * field decided, and ctrl+p in the selector overrides it for the session.
+	 */
+	mode?: RunMode;
+	/**
 	 * Whether the task should be blocked when the working tree is clean
 	 * (`files_changed_count === 0`). When set and unmet, the extension notifies
 	 * instead of injecting, avoiding a no-op round-trip. Guards are evaluated
@@ -589,6 +598,10 @@ export function parseConfig(
 			if (typeof t.description === "string") task.description = t.description;
 			if (typeof t.category === "string" && t.category.trim() !== "") task.category = t.category.trim();
 			if (typeof t.autoRun === "boolean") task.autoRun = t.autoRun;
+			if (t.mode !== undefined) {
+				if (isRunMode(t.mode)) task.mode = t.mode;
+				else onError(`do-always: ignoring invalid "mode" for task "${t.name}" in ${path} (expected "plan", "run" or "fill")`);
+			}
 			if (typeof t.requireDirty === "boolean") task.requireDirty = t.requireDirty;
 			if (typeof t.hidden === "boolean") task.hidden = t.hidden;
 			if (typeof t.notForCommits === "boolean") task.notForCommits = t.notForCommits;
@@ -950,11 +963,12 @@ export function shouldAutoRun(task: DoAlwaysTask): boolean {
 //
 // One knob for the two things a Plan task does by default: sending its prompt
 // straight away (auto-run) and asking for the machine-readable "plan" block the
-// questionnaire parses. Every task has an effective mode derived from its
-// config (category, `autoRun`, `questionnaire`), and the user can override it
-// per task for the session — `ctrl+p` in the selector, or `/do-always mode` —
-// so plan mode can be dropped for one task without editing any file. All the
-// functions here are pure; the override map lives in index.ts.
+// questionnaire parses. A task's mode comes from its own `mode` field when it
+// sets one, otherwise it is derived from the legacy fields (category, `autoRun`,
+// `questionnaire`); on top of that the user can override it per task for the
+// session — `ctrl+p` in the selector, or `/do-always mode` — so plan mode can be
+// dropped for one task without editing any file. All the functions here are
+// pure; the override map lives in index.ts.
 // ---------------------------------------------------------------------------
 
 /**
@@ -970,16 +984,27 @@ export type RunMode = "fill" | "run" | "plan";
 /** The cycle order (least automated first): fill → run → plan → fill. */
 export const RUN_MODE_CYCLE: readonly RunMode[] = ["fill", "run", "plan"];
 
+/** Strict guard for the three mode names (config values — no CLI aliases). */
+export function isRunMode(value: unknown): value is RunMode {
+	return typeof value === "string" && (RUN_MODE_CYCLE as readonly string[]).includes(value);
+}
+
 /**
- * The mode a task runs in when the user has not overridden it: an auto-run
- * task is `plan` when a plan block would actually be asked for and read (Plan
- * category with the questionnaire enabled) and `run` otherwise; anything else
- * fills the editor. Mirrors the historical behavior exactly.
+ * The mode a task runs in when the user has not overridden it in this session:
+ * its own `mode` field when it sets one, otherwise the legacy derivation — an
+ * auto-run task is `plan` when a plan block would actually be asked for and read
+ * (Plan category with the questionnaire enabled) and `run` otherwise; anything
+ * else fills the editor. An explicit `mode` wins over `autoRun` and
+ * `questionnaire`, which are the older way to spell the same thing.
  */
 export function defaultRunMode(task: DoAlwaysTask, questionnaireEnabled = true): RunMode {
+	if (isRunMode(task.mode)) return task.mode;
 	if (!shouldAutoRun(task)) return "fill";
 	return isPlanTask(task) && (task.questionnaire ?? questionnaireEnabled) ? "plan" : "run";
 }
+
+/** Where a task's effective mode comes from (shown by `/do-always mode`). */
+export type RunModeSource = "default" | "config" | "session";
 
 /** The next mode in the cycle (fill → run → plan → fill). */
 export function nextRunMode(mode: RunMode): RunMode {
@@ -1061,12 +1086,14 @@ export function parseRunMode(text: string): RunMode | "default" | null {
 
 /**
  * The `/do-always mode` listing: the visible tasks in selector order, each
- * with its effective mode. Overridden tasks (set in this session) are marked.
+ * with its effective mode and where that mode comes from — the config's `mode`
+ * field, a session override (ctrl+p / `/do-always mode <task>`), or the default
+ * derived from the legacy fields.
  */
 export function formatRunModes(
 	tasks: DoAlwaysTask[],
 	modeOf: (task: DoAlwaysTask) => RunMode,
-	overridden: ReadonlySet<string> = new Set(),
+	sourceOf: (task: DoAlwaysTask) => RunModeSource = () => "default",
 ): string {
 	const groups = groupTasksByCategory(tasks);
 	const lines: string[] = [];
@@ -1077,10 +1104,10 @@ export function formatRunModes(
 		for (const t of g.items) {
 			n++;
 			const mode = modeOf(t);
-			lines.push(
-				`${n}. ${runModeGlyph(mode) ? `${runModeGlyph(mode)} ` : ""}${t.name} — ${mode}` +
-					(overridden.has(t.name) ? " (set in this session)" : ""),
-			);
+			const source = sourceOf(t);
+			const note =
+				source === "session" ? " (set in this session)" : source === "config" ? " (config `mode`)" : "";
+			lines.push(`${n}. ${runModeGlyph(mode) ? `${runModeGlyph(mode)} ` : ""}${t.name} — ${mode}${note}`);
 		}
 	}
 	return lines.join("\n");

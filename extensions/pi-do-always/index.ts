@@ -85,6 +85,7 @@ import {
 	formatRunModes,
 	formatSelectedCommits,
 	groupTasksByCategory,
+	isRunMode,
 	isTaskVisible,
 	isValidKeyId,
 	mergeTasks,
@@ -132,6 +133,7 @@ import {
 	type PlanSelection,
 	type PlanSelectionEntry,
 	type RunMode,
+	type RunModeSource,
 	type SelectedCommit,
 	type TaskContext,
 	type TableRow,
@@ -1196,9 +1198,15 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		return setRunMode(task.name, nextRunMode(runModeFor(task)));
 	}
 
-	/** The names carrying a session override (for `/do-always mode`'s listing). */
-	function overriddenRunModes(): Set<string> {
-		return new Set([...runModeOverrides.keys()].filter((n) => tasks.some((t) => t.name === n)));
+	/**
+	 * Where a task's effective mode comes from (for `/do-always mode`): a
+	 * session override, the config's own `mode` field, or the default derived
+	 * from the legacy fields. setRunMode drops an override that equals the
+	 * default, so any entry left in the map is a real session change.
+	 */
+	function runModeSourceFor(task: DoAlwaysTask): RunModeSource {
+		if (runModeOverrides.has(task.name)) return "session";
+		return isRunMode(task.mode) ? "config" : "default";
 	}
 
 	/** The result of the plan questionnaire: the confirmed selection, or a withdrawal. */
@@ -3510,7 +3518,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			if (rest.length === 0) {
 				const head =
 					"do-always run modes — ctrl+p in the selector, or /do-always mode <task> [plan|run|fill|default]:";
-				ctx.ui.notify(`${head}\n${formatRunModes(visible, runModeFor, overriddenRunModes())}`, "info");
+				ctx.ui.notify(`${head}\n${formatRunModes(visible, runModeFor, runModeSourceFor)}`, "info");
 				return;
 			}
 			// The trailing token may be the mode; what precedes it is the task
@@ -3530,7 +3538,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			}
 			if (maybeMode === "default") {
 				runModeOverrides.delete(task.name);
-				ctx.ui.notify(`do-always: "${task.name}" → ${runModeLabel(runModeFor(task))} (its default)`, "info");
+				const from = runModeSourceFor(task) === "config" ? "its config `mode`" : "its default";
+				ctx.ui.notify(`do-always: "${task.name}" → ${runModeLabel(runModeFor(task))} (${from})`, "info");
 				return;
 			}
 			setRunMode(task.name, maybeMode);

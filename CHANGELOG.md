@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **A `mode` field on tasks**: the run mode the selector's `ctrl+p` cycles can
+  now be stated permanently in the config — `"mode": "plan" | "run" | "fill"` —
+  instead of being expressed indirectly through `autoRun` and `questionnaire`.
+  When set it wins over both (and over the global `questionnaire` switch); when
+  omitted, the mode is derived from them exactly as before, so existing configs
+  are untouched. An invalid value is ignored with a warning naming the task.
+  `/do-always mode` now reports where each task's mode comes from —
+  `(config `mode`)`, `(set in this session)`, or nothing for the derived
+  default — and `/do-always mode <task> default` says whether it fell back to
+  the config field or to the derivation.
+
+### Fixed
+
+- **`planBlockDiagnostics` called mine-recoverable plan blocks malformed**: the
+  0.23.0 tier miner lets `parsePlanProposal` read a block whose containers were
+  closed out of order (a stray `]` closing `tiers` early, a root object that
+  never closes), but the diagnostics still reported `malformed` as soon as the
+  lenient JSON parse failed — so the two disagreed on exactly the blocks mining
+  exists for. That was user-visible twice over: `anyPlan`'s capture gate
+  requires `kind === "ok"`, so a mine-recoverable block trailing an ordinary
+  turn stayed in the transcript as raw JSON with no questionnaire, and
+  `/do-always testplan` — the tool that explains parser behavior — misreported
+  the same block as unusable. Both now share one normalization path: when the
+  JSON does not parse, the miner is consulted before the block is called
+  malformed. Genuinely broken JSON still reports `malformed`. The ad-hoc
+  capture is thereby widened (a trailing block that was ignored can now open
+  the questionnaire); `anyPlan: false` still turns the whole path off.
+
 ## [0.25.0] - 2026-11-07
 
 ### Added
