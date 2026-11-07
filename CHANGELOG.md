@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A JSON Schema for `do-always.json`**, shipped in the package
+  (`extensions/pi-do-always/do-always.schema.json`) and documented in the
+  README: reference it with a `$schema` key — accepted and ignored at runtime —
+  and an editor completes and validates the config as you write it. It covers
+  both config forms, every task field (`name`, `prompt`, `description`,
+  `category`, `aliases`, `mode`, `autoRun`, `questionnaire`, `hidePlan`,
+  `browser`, `hidden`, `notForCommits`, `requireDirty`, `guards`, `when`), the
+  object-form keys (`shortcut`, `merge`, `report`, `questionnaire`, `hidePlan`,
+  `planNudge`, `anyPlan`, `aliases`, `chains`) and the value enums, including
+  the conditional `value` requirement on guards. It is deliberately stricter
+  than the loader: an unknown key is ignored silently at runtime but rejected by
+  the schema, so a typo surfaces in the editor instead of quietly doing nothing.
+  A new `test/schema.test.ts` fails the build on drift in either direction — the
+  schema's property sets must match what `parseConfig` reads, the shipped sample
+  config must be schema-clean, and a config exercising every documented field
+  must parse without a single warning.
 - **Saved chains**: the config's object form accepts a `chains` object mapping a
   name to its task names in execution order (`{"ship": ["Build", "Tests",
   "Commit"]}`), so a pipeline no longer has to be rebuilt by hand in the

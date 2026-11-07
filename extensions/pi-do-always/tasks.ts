@@ -574,6 +574,10 @@ export const DEFAULT_TASKS: DoAlwaysTask[] = [
  * Accepts a bare array of tasks or {"tasks": [...], "shortcut": "f4" | null}.
  * Invalid entries are skipped with a warning.
  * Returns empty results when the JSON is malformed or the shape is wrong.
+ *
+ * Only the keys this function reads are recognized; anything else is ignored
+ * silently, which includes the editor-only `$schema` key pointing at the
+ * shipped do-always.schema.json (see test/schema.test.ts for the drift check).
  */
 export function parseConfig(
 	raw: string,

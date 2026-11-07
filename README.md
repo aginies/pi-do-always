@@ -335,6 +335,30 @@ Tasks are read from JSON files (an array of tasks, or the object form `{"tasks":
 |`<project>/.pi/do-always.json`|Project-local; overrides global tasks with the same `name`|
 
 If neither file exists, the built-in defaults (Review changes, Review code, Cleanup, Security, Performance, Propose features, Review commits, Browse commits, Build, Tests, Readme, Release, Commit) are used.
+
+### Schema
+
+The package ships a JSON Schema for the config —
+[`do-always.schema.json`](./extensions/pi-do-always/do-always.schema.json) — so an editor can
+complete and validate `do-always.json` as you write it. Reference it with a `$schema` key, which
+the runtime accepts and ignores (the object form only; a bare array has nowhere to put it):
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/aginies/pi-do-always/master/extensions/pi-do-always/do-always.schema.json",
+  "tasks": [ … ]
+}
+```
+
+To stay offline, point at the installed copy instead —
+`~/.pi/agent/npm/node_modules/pi-do-always/extensions/pi-do-always/do-always.schema.json`
+(`pi list` shows where a package lives).
+
+The schema is deliberately **stricter than the runtime**: a key the parser does not read is
+ignored silently when the config loads, while the schema rejects it (`additionalProperties:
+false`), so a typo surfaces in the editor instead of quietly doing nothing. Invalid *values*
+for known fields warn at load time in both cases. `test/schema.test.ts` fails the build if the
+schema and the parser drift apart in either direction.
 This repo ships a sample in [`do-always.json`](./extensions/pi-do-always/do-always.json) — copy it to one of the
 locations above to make it your own:
 

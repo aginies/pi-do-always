@@ -29,6 +29,7 @@
 		"extensions/pi-do-always/index.ts",
 		"extensions/pi-do-always/tasks.ts",
 		"extensions/pi-do-always/do-always.json",
+		"extensions/pi-do-always/do-always.schema.json",
 		"extensions/pi-do-always/test/*.test.ts",
 		"README.md",
 		"pi.image.png"
