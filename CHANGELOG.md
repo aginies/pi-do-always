@@ -37,6 +37,13 @@ All notable changes to this project will be documented in this file.
   instead of a single string truncated at the right edge. The run-mode hint
   degrades `ctrl+p ⚡ plan` → `ctrl+p mode` → `ctrl+p`, and the ORDER column
   shows it too.
+- **The npm package now ships its test suite**
+  (`extensions/pi-do-always/test/*.test.ts`, +156 kB unpacked). 0.23.0 and
+  0.24.0 were published from a working copy that was never committed, and
+  because the tests were not part of the tarball, the only surviving record of
+  what those two releases were supposed to do was their source — the expected
+  behavior had to be reconstructed from the published code. A release can now
+  be verified, or its tests read, from the registry alone.
 
 ### Fixed
 

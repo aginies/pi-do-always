@@ -465,3 +465,13 @@ npm test           # run the unit tests (node:test + tsx, in test/)
 The pure task logic (`parseConfig`, `mergeTasks`, `renderPrompt`, `resolveTask`, `formatList`) lives in
 [`tasks.ts`](./extensions/pi-do-always/tasks.ts) with no Pi dependencies, so it is unit-tested independently of the
 Pi runtime. The extension (`extensions/pi-do-always/index.ts`) imports that logic and adds only the Pi UI.
+
+The published package ships the test suite as well (`extensions/pi-do-always/test/*.test.ts` is in the
+manifest's `files`), so a release can be verified — or its expected behavior read — from the installed
+copy alone, with no git checkout:
+
+```bash
+cd "$(npm root -g)/pi-do-always"     # or ~/.pi/agent/npm/node_modules/pi-do-always
+npm install --no-save tsx @types/node @earendil-works/pi-coding-agent @earendil-works/pi-tui
+node --import tsx --test extensions/pi-do-always/test/*.test.ts
+```
