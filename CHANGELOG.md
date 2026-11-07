@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.25.0] - 2026-11-07
 
 ### Added
 
@@ -37,6 +37,18 @@ All notable changes to this project will be documented in this file.
   instead of a single string truncated at the right edge. The run-mode hint
   degrades `ctrl+p ⚡ plan` → `ctrl+p mode` → `ctrl+p`, and the ORDER column
   shows it too.
+
+### Fixed
+
+- **A tracked auto-run's reply lost a plan block nobody offered**: the ad-hoc
+  capture (`anyPlan`, 0.24.0) fired for *any* reply ending with a plan block,
+  including the reply of an auto-run that was already being tracked — a
+  non-Plan auto-run (e.g. `Build` with `autoRun: true`) or a Plan task switched
+  out of plan mode. `agent_end` serves such a run's own summary first and never
+  reaches the ad-hoc branch, so the fence was stripped from the transcript and
+  the proposal dropped without ever being offered. The ad-hoc capture now skips
+  a reply that belongs to an armed auto-run: the block stays visible and the
+  run's summary is all you get — which is also what `run` mode promises.
 
 ## [0.24.0] - 2026-10-26
 
