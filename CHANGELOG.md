@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Saved chains**: the config's object form accepts a `chains` object mapping a
+  name to its task names in execution order (`{"ship": ["Build", "Tests",
+  "Commit"]}`), so a pipeline no longer has to be rebuilt by hand in the
+  selector's ORDER column every time — and can now be run at all in non-TUI
+  modes, where there is no selector. `/do-always chain` lists them with their
+  steps and run-mode glyphs, `/do-always chain <name>` runs one through the
+  *same* runner as the selector's chain row (guards and fail-fast, one chain at
+  a time, the status widget, the report file, a `fill`-mode step 1 waiting in
+  the editor), and both the subcommand and each chain name autocomplete. Names
+  match case-insensitively, steps resolve by task name or alias, and the project
+  file's chain replaces the global one with the same name. Malformed config is
+  refused with a warning rather than half-run: steps are deduplicated (a repeat
+  is a mistake, not a loop), a chain over the 8-task cap is dropped, and a chain
+  naming a task that does not exist is refused outright, naming the step — the
+  runner would otherwise skip it silently and run a shorter chain.
 - **A `mode` field on tasks**: the run mode the selector's `ctrl+p` cycles can
   now be stated permanently in the config — `"mode": "plan" | "run" | "fill"` —
   instead of being expressed indirectly through `autoRun` and `questionnaire`.

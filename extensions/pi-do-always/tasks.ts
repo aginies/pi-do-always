@@ -241,6 +241,14 @@ interface ParsedDoAlwaysConfig {
 	 * undefined when the file does not set one.
 	 */
 	aliases: Record<string, string> | undefined;
+	/**
+	 * Saved chains parsed from the config object: `{ "ship": ["Build", "Tests"] }`
+	 * maps a chain name to its task names in execution order. Invalid entries
+	 * (a non-array, an empty array, a non-string step) are dropped with a
+	 * warning, and a chain longer than CHAIN_MAX is refused the same way.
+	 * undefined when the file defines none.
+	 */
+	chains: Record<string, string[]> | undefined;
 }
 
 import { existsSync } from "node:fs";
@@ -577,14 +585,14 @@ export function parseConfig(
 		data = JSON.parse(raw);
 	} catch (err) {
 		onError(`do-always: invalid JSON in ${path}: ${err}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined, chains: undefined };
 	}
 
 	const list = Array.isArray(data) ? data : data?.tasks;
 
 	if (!Array.isArray(list)) {
 		onError(`do-always: ${path} must be a JSON array of tasks or {"tasks": [...]}`);
-		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined };
+		return { tasks: [], shortcut: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, aliases: undefined, chains: undefined };
 	}
 
 	const tasks: DoAlwaysTask[] = [];
@@ -695,7 +703,41 @@ export function parseConfig(
 		}
 	}
 
-	return { tasks, shortcut, merge, report, questionnaire, hidePlan, planNudge, anyPlan, aliases };
+	// Saved chains: { "<name>": ["<task>", ...] }. Validated structurally here;
+	// whether the task names exist is checked when the chain is listed or run,
+	// because the two files' tasks are only known after the merge.
+	let chains: Record<string, string[]> | undefined;
+	if (!Array.isArray(data) && "chains" in data) {
+		const raw = data.chains;
+		if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+			const map: Record<string, string[]> = {};
+			for (const [k, v] of Object.entries(raw)) {
+				const name = k.trim();
+				if (name === "") continue;
+				if (!Array.isArray(v) || v.length === 0 || !v.every((s) => typeof s === "string" && s.trim() !== "")) {
+					onError(`do-always: ignoring invalid chain "${name}" in ${path} (expected a non-empty array of task names)`);
+					continue;
+				}
+				// Dedupe: a repeated step is a mistake, not a loop, and the
+				// selector's chain state is duplicate-free too.
+				const steps: string[] = [];
+				for (const s of v) {
+					const step = s.trim();
+					if (!steps.includes(step)) steps.push(step);
+				}
+				if (steps.length > CHAIN_MAX) {
+					onError(`do-always: ignoring chain "${name}" in ${path} (${steps.length} steps — the maximum is ${CHAIN_MAX})`);
+					continue;
+				}
+				map[name] = steps;
+			}
+			if (Object.keys(map).length > 0) chains = map;
+		} else {
+			onError(`do-always: ignoring invalid "chains" in ${path} (expected an object mapping a chain name to task names)`);
+		}
+	}
+
+	return { tasks, shortcut, merge, report, questionnaire, hidePlan, planNudge, anyPlan, aliases, chains };
 }
 
 const KEY_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -1243,11 +1285,19 @@ export function resolveTask(tasks: DoAlwaysTask[], arg: string): DoAlwaysTask | 
 		const n = Number(a);
 		return n >= 1 && n <= tasks.length ? tasks[n - 1] : undefined;
 	}
-	// Try aliases first (case-insensitive), then the task's own name.
-	const lower = a.toLowerCase();
+	return findTaskByName(tasks, a);
+}
+
+/**
+ * Find a task by name or alias (case-insensitive, aliases first) — the name
+ * half of `resolveTask`, split out for callers that must not accept a positional
+ * number (a saved chain lists task names, and "1" is a plausible task name).
+ */
+export function findTaskByName(tasks: DoAlwaysTask[], name: string): DoAlwaysTask | undefined {
+	const lower = name.trim().toLowerCase();
+	if (!lower) return undefined;
 	const aliasMatch = tasks.find((t) => t.aliases?.some((alias) => alias.toLowerCase() === lower));
-	if (aliasMatch) return aliasMatch;
-	return tasks.find((t) => t.name.toLowerCase() === lower);
+	return aliasMatch ?? tasks.find((t) => t.name.toLowerCase() === lower);
 }
 
 /** Matches a `{{key}}` placeholder: key is [A-Za-z0-9_]+, optional inner whitespace. */
@@ -1432,6 +1482,57 @@ export function formatChainSequence(
 		})
 		.filter((p): p is string => p !== null);
 	return parts.join(" → ");
+}
+
+/**
+ * Saved chains (the config's `chains` object): chain name → task names in
+ * execution order. Merged like tasks — the project file's chain replaces the
+ * global one with the same name, chains only one file defines are kept.
+ */
+export function mergeNamedChains(
+	globalChains: Record<string, string[]> | undefined,
+	projectChains: Record<string, string[]> | undefined,
+): Record<string, string[]> {
+	return { ...(globalChains ?? {}), ...(projectChains ?? {}) };
+}
+
+/**
+ * Look a saved chain up by name (case-insensitive). Returns the chain under its
+ * configured spelling — the listing and the error messages use it — or undefined
+ * when no chain has that name.
+ */
+export function resolveNamedChain(
+	chains: Record<string, string[]>,
+	name: string,
+): { name: string; steps: string[] } | undefined {
+	const lower = name.trim().toLowerCase();
+	if (!lower) return undefined;
+	const key = Object.keys(chains).find((k) => k.toLowerCase() === lower);
+	return key === undefined ? undefined : { name: key, steps: chains[key] };
+}
+
+/**
+ * The `/do-always chain` listing: one line per saved chain, its steps in
+ * execution order with their run-mode glyph. A step that names no known task is
+ * flagged instead of dropped — the runner skips unknown names silently, and a
+ * renamed task should not quietly shorten a saved chain.
+ */
+export function formatNamedChains(
+	chains: Record<string, string[]>,
+	tasks: DoAlwaysTask[],
+	markerOf: (task: DoAlwaysTask) => string = (t) => (shouldAutoRun(t) ? "⚡" : ""),
+): string {
+	return Object.keys(chains)
+		.map((name, i) => {
+			const steps = chains[name]
+				.map((step) => {
+					const t = findTaskByName(tasks, step);
+					return t ? `${markerOf(t)}${t.name}` : `${step} (unknown task)`;
+				})
+				.join(" → ");
+			return `${i + 1}. ${name} — ${steps}`;
+		})
+		.join("\n");
 }
 
 /**

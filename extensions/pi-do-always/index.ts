@@ -80,6 +80,8 @@ import {
 	evaluateWhen,
 	formatChainSequence,
 	formatList,
+	formatNamedChains,
+	findTaskByName,
 	endsWithPlanBlock,
 	formatPlanExecutionPrompt,
 	formatRunModes,
@@ -89,6 +91,7 @@ import {
 	isTaskVisible,
 	isValidKeyId,
 	mergeTasks,
+	mergeNamedChains,
 	nextRunMode,
 	parseConfig,
 	parseConfigRegexpValueForKey,
@@ -115,6 +118,7 @@ import {
 	renderPrompt,
 	resolveReportPath,
 	resolveRunMode,
+	resolveNamedChain,
 	resolveShortcut,
 	resolveTask,
 	runModeGlyph,
@@ -194,6 +198,8 @@ function loadConfig(
 	planNudge: boolean;
 	/** Whether an ordinary turn's trailing plan block is offered too (default true). */
 	anyPlan: boolean;
+	/** Saved chains from the config's `chains` object (project wins by name). */
+	chains: Record<string, string[]>;
 } {
 	const globalPath = join(getAgentDir(), "do-always.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "do-always.json");
@@ -203,10 +209,10 @@ function loadConfig(
 
 	const global = globalRaw !== null
 		? parseConfig(globalRaw, globalPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, chains: undefined };
 	const project = projectRaw !== null
 		? parseConfig(projectRaw, projectPath, onError)
-		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined };
+		: { tasks: [], shortcut: undefined, merge: undefined, report: undefined, questionnaire: undefined, hidePlan: undefined, planNudge: undefined, anyPlan: undefined, chains: undefined };
 
 	// The project file's merge mode wins; otherwise the global value; otherwise
 	// override (the historical behavior), so existing configs are unaffected.
@@ -241,6 +247,9 @@ function loadConfig(
 		// Same precedence: project, then global, then on (a trailing plan block
 		// in an ordinary turn is offered as a proposal too).
 		anyPlan: project.anyPlan ?? global.anyPlan ?? true,
+		// Saved chains merge by name: a project chain replaces the global one
+		// with the same name, and chains only one file defines are kept.
+		chains: mergeNamedChains(global.chains, project.chains),
 	};
 }
 
@@ -1155,6 +1164,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 	// raw JSON in the transcript and no way to act on it. Refreshed whenever
 	// the config is (re)loaded.
 	let anyPlanEnabled = true;
+	// Saved chains from the config's `chains` object (name → task names in
+	// execution order), merged across the global and project files. Listed by
+	// `/do-always chain` and run by `/do-always chain <name>` — the same runner
+	// the selector's chain row uses, so guards, the report file and the status
+	// widget all apply. Refreshed whenever the config is (re)loaded.
+	let namedChains: Record<string, string[]> = {};
 
 	/**
 	 * The proposal name shown for a plan block captured outside a Plan
@@ -2341,6 +2356,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		hidePlanEnabled = config.hidePlan;
 		planNudgeEnabled = config.planNudge;
 		anyPlanEnabled = config.anyPlan;
+		namedChains = config.chains;
 		refreshVisible(ctx.cwd, await getContext(ctx.cwd));
 		registerShortcut(config.shortcut, onError);
 	});
@@ -3432,7 +3448,12 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				{ value: "list-details", label: "list-details" },
 				{ value: "replan", label: "replan" },
 				{ value: "questionnaire", label: "questionnaire (toggle)" },
-			{ value: "mode", label: "mode (per-task run mode: plan/run/fill)" },
+				{ value: "mode", label: "mode (per-task run mode: plan/run/fill)" },
+				{ value: "chain", label: "chain (list the saved chains)" },
+				...Object.entries(namedChains).map(([name, steps]) => ({
+					value: `chain ${name}`,
+					label: `chain ${name} — ${steps.join(" → ")}`,
+				})),
 				{ value: "testplan", label: "testplan (dry-run the plan questionnaire)" },
 				...visible.map((t, i) => ({ value: t.name, label: `${i + 1}. ${t.name}` })),
 			].filter((c) => c.value.toLowerCase().includes(p));
@@ -3460,6 +3481,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			hidePlanEnabled = config.hidePlan;
 			planNudgeEnabled = config.planNudge;
 			anyPlanEnabled = config.anyPlan;
+			namedChains = config.chains;
 		}
 
 		// One context per command run: shared by visibility filtering, rendering,
@@ -3544,6 +3566,57 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			}
 			setRunMode(task.name, maybeMode);
 			ctx.ui.notify(`do-always: "${task.name}" → ${runModeLabel(maybeMode)} — this session only`, "info");
+			return;
+		}
+
+		// Saved chains (the config's `chains` object): list them, or run one
+		// through the same runner the selector's chain row uses — guards, the
+		// report file, the status widget and the one-chain-at-a-time rule all
+		// apply unchanged, and it works in non-TUI modes too (where the
+		// selector's ORDER column is not available at all).
+		if (arg.toLowerCase() === "chain" || arg.toLowerCase().startsWith("chain ")) {
+			const name = arg.trim().slice("chain".length).trim();
+			if (name === "") {
+				if (Object.keys(namedChains).length === 0) {
+					ctx.ui.notify('do-always: no saved chains — add a "chains" object to do-always.json', "info");
+					return;
+				}
+				ctx.ui.notify(
+					`do-always saved chains (run one with /do-always chain <name>):\n${formatNamedChains(namedChains, tasks, (t) =>
+						runModeGlyph(runModeFor(t)),
+					)}`,
+					"info",
+				);
+				return;
+			}
+			const found = resolveNamedChain(namedChains, name);
+			if (!found) {
+				const available = Object.keys(namedChains).join(", ");
+				ctx.ui.notify(
+					available === ""
+						? `do-always: unknown chain "${name}" — no saved chains are configured`
+						: `do-always: unknown chain "${name}". Available: ${available}`,
+					"error",
+				);
+				return;
+			}
+			// Resolve every step to its canonical task name (by name or alias):
+			// the runner matches names exactly and skips what it cannot find, so
+			// a renamed task would silently shorten the chain. Report it instead.
+			const steps = found.steps.map((s) => findTaskByName(tasks, s));
+			const missing = found.steps.filter((s, i) => steps[i] === undefined);
+			if (missing.length > 0) {
+				ctx.ui.notify(
+					`do-always: chain "${found.name}" refers to unknown task${missing.length !== 1 ? "s" : ""}: ${missing.join(", ")}`,
+					"error",
+				);
+				return;
+			}
+			await runChain(
+				steps.map((t) => (t as DoAlwaysTask).name),
+				ctx,
+				cache,
+			);
 			return;
 		}
 

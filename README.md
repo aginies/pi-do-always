@@ -44,6 +44,8 @@ For development you can also load it explicitly: `npm run dev` (runs `pi --exten
 |`/do-always replan`|Re-open the plan questionnaire for the last offered proposal (e.g. after an accidental Esc)|
 |`/do-always mode`|List every visible task's run mode (`plan` / `run` / `fill`)|
 |`/do-always mode <task> [plan\|run\|fill\|default]`|Set — or with no mode, cycle — how a task runs for this session (the CLI twin of the selector's `ctrl+p`)|
+|`/do-always chain`|List the saved chains (the config's `chains` object)|
+|`/do-always chain <name>`|Run a saved chain — also works in non-TUI modes|
 |`/do-always questionnaire`|Toggle the plan questionnaire on/off for the rest of the session (all tasks)|
 
 The selector supports direct number-pick (1-9), live type-to-filter, arrow/Enter navigation,
@@ -129,6 +131,33 @@ Building a chain in the selector:
 Chains are capped at 8 tasks. Reordering is done by removing a task and re-adding it. On narrow terminals the ORDER
 column is dropped and the chain is shown on its own line below the list (keyboard
 chaining still works).
+
+### Saved chains
+
+A chain you build often does not have to be rebuilt: the config's `chains` object saves it
+under a name, and `/do-always chain <name>` runs it — which is also the only way to run a
+chain in a non-TUI mode, where there is no selector to build one in.
+
+```json
+{
+  "tasks": [ … ],
+  "chains": {
+    "ship": ["Build", "Tests", "Commit"],
+    "review": ["Review changes"]
+  }
+}
+```
+
+`/do-always chain` lists them with their steps in order (`1. ship — ▶Build → ▶Tests → Commit`),
+and the names autocomplete after `/do-always chain `. Names are matched case-insensitively and
+steps resolve by task name *or alias*. A saved chain goes through the same runner as the
+selector's chain row, so everything below applies to it unchanged: guards, one chain at a
+time, the status widget, the report file, and a `fill`-mode step 1 waiting in the editor.
+
+Rules: steps are deduplicated (a repeated name is a mistake, not a loop), a chain longer than
+the 8-task cap is refused with a warning, a chain naming a task that does not exist is refused
+outright and says which step (the runner would otherwise drop it silently and run a shorter
+chain), and the project file's chain replaces the global one with the same name.
 
 Running a chain sends each step as its own turn, strictly one after another — the next
 step starts only after the previous run has fully finished. Before anything is sent,
@@ -347,6 +376,7 @@ In the object form you can also configure the selector shortcut:
 - `planNudge` (optional) — whether a completed auto-run Plan task whose reply has no usable plan block (none at all — the model wrote the plan as plain prose — or malformed JSON) triggers one follow-up asking the agent to emit the block before the plain-summary fallback. At most one nudge per run; the nudge run's reply is parsed like any other. Default `true`; set `false` to keep the old behavior (warn and offer no questionnaire). The project file's value wins over the global one.
 - `anyPlan` (optional) — whether an **ordinary** turn (no Plan auto-run armed) whose reply *ends* with a parseable plan block is captured, stripped and offered as a proposal too. Models imitate the plan-block instruction that is still visible in the conversation context, so a plain "what should we do?" turn can end with a real proposal; without this the raw JSON just sits in the transcript with no way to act on it. The gate is narrow — the block must be the very last thing in the reply and must parse to at least one action item — so a plan fence quoted mid-reply (documentation, an example) is never touched. Default `true`; set `false` to only ever offer proposals from Plan tasks. The project file's value wins over the global one.
 - `aliases` (optional) — a global alias map: an object that maps short alias strings to task names, e.g. `{ "rc": "Review changes", "bl": "Build" }`. Each alias is case-insensitive and is tried before the task's own name, so `/do-always rc` resolves to the task named `Review changes`. Keys and values are trimmed; entries with empty keys or non-string values are silently dropped. The project file's value wins over the global one.
+- `chains` (optional) — saved chains: an object mapping a chain name to its task names in execution order, e.g. `{ "ship": ["Build", "Tests", "Commit"] }`. Run one with `/do-always chain <name>`, list them with `/do-always chain` (see [Saved chains](#saved-chains)). Steps resolve by task name or alias and are deduplicated; a chain over the 8-task cap, or one naming an unknown task, is refused with a message. The project file's chain wins over the global one with the same name.
 
 ```json
 {
