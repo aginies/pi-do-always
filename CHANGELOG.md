@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`/do-always task <name|number>`** — an escape hatch for a task whose name (or
+  alias) is spelled exactly like a subcommand keyword. The keywords (`list`,
+  `list-details`, `replan`, `questionnaire`, `mode`, `chain`, `testplan`) are
+  matched before task names and keep that priority, so nothing that works today
+  changes meaning; but such a task used to be unreachable by name, silently.
+  The collision is now reported when the config loads, naming the keyword and
+  the escape hatch, and `task` resolves numbers, names and aliases exactly like
+  the bare form does (including the `when` check and the guards).
+- **Quoted arguments**: `"double quotes"` keep a multi-word name in one token, so
+  `/do-always mode "Review run"` cycles that task instead of looking for a task
+  named `Review` in mode `run`, and `/do-always task "my list"` reaches a task
+  whose name contains a keyword. Argument splitting is the new pure `splitArgs`
+  helper (an unclosed quote simply runs to the end of the string).
 - **An ASCII marker palette** (`"markers": "ascii"`, default `"unicode"`): the UI
   draws its state with glyphs — the run-mode markers `⚡`/`▶`/`✎`, the cursor `►`,
   an empty ORDER cell `·`, a selected commit `◉`, the chain widget's

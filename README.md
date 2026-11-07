@@ -46,7 +46,15 @@ For development you can also load it explicitly: `npm run dev` (runs `pi --exten
 |`/do-always mode <task> [plan\|run\|fill\|default]`|Set — or with no mode, cycle — how a task runs for this session (the CLI twin of the selector's `ctrl+p`)|
 |`/do-always chain`|List the saved chains (the config's `chains` object)|
 |`/do-always chain <name>`|Run a saved chain — also works in non-TUI modes|
+|`/do-always task <name\|number>`|Run a task by name, bypassing the subcommand keywords (for a task named `list`, `mode`, …)|
 |`/do-always questionnaire`|Toggle the plan questionnaire on/off for the rest of the session (all tasks)|
+
+The subcommand keywords (`list`, `list-details`, `replan`, `questionnaire`, `mode`, `chain`,
+`testplan`, `task`) are matched **before** task names, so a task or alias spelled exactly like
+one is shadowed — `/do-always list` lists. That collision is reported when the config loads,
+and `/do-always task <name>` always reaches the task. Double quotes keep a multi-word name in
+one piece where an argument would otherwise be read as two (`/do-always mode "Review run"`
+cycles that task instead of looking for a task named `Review` in mode `run`).
 
 The selector supports direct number-pick (1-9), live type-to-filter, arrow/Enter navigation,
 mouse-wheel scrolling, and click-to-select. The quick number-pick covers keys 1-9 only: rows
@@ -91,6 +99,7 @@ The same control from the command line (useful in non-TUI modes, where there is 
 /do-always mode review changes      # cycle that task: fill → run → plan
 /do-always mode cleanup fill        # set it (aliases: on = plan, off/editor = fill)
 /do-always mode cleanup default     # drop the session override, back to the config value
+/do-always mode "Review run"        # quote a name whose last word would read as a mode
 ```
 
 The listing says where each mode comes from — `(config `mode`)` for a task that sets the

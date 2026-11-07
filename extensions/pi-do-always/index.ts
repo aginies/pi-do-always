@@ -128,7 +128,9 @@ import {
 	runModeLabel,
 	runModeMarker,
 	runModeShort,
+	shadowingSubcommand,
 	shouldAutoRun,
+	splitArgs,
 	stepSummary,
 	stripPlanBlocks,
 	toPromptContext,
@@ -231,6 +233,20 @@ function loadConfig(
 	// Deprecation: the commit browser used to also open for any task named
 	// "Review commits" (configs predating the `browser` field). The name-based
 	// trigger is removed — warn so old configs adopt the explicit field.
+	// A task (or alias) spelled exactly like a subcommand keyword is shadowed by
+	// it: `/do-always list` lists instead of running the task named "list". The
+	// collision is otherwise silent, so say so and point at the escape hatch.
+	for (const t of merged) {
+		for (const name of [t.name, ...(t.aliases ?? [])]) {
+			const keyword = shadowingSubcommand(name);
+			if (keyword) {
+				onError(
+					`do-always: task "${t.name}" collides with the /do-always ${keyword} subcommand — run it with "/do-always task ${t.name}"`,
+				);
+				break;
+			}
+		}
+	}
 	for (const t of merged) {
 		if (t.name === "Review commits" && t.browser !== "commits") {
 			onError(
@@ -3487,6 +3503,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 				{ value: "questionnaire", label: "questionnaire (toggle)" },
 				{ value: "mode", label: "mode (per-task run mode: plan/run/fill)" },
 				{ value: "chain", label: "chain (list the saved chains)" },
+				{ value: "task", label: "task <name> (run a task, bypassing the subcommand keywords)" },
 				...Object.entries(namedChains).map(([name, steps]) => ({
 					value: `chain ${name}`,
 					label: `chain ${name} — ${steps.join(" → ")}`,
@@ -3530,6 +3547,22 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 
 		const arg = args.trim();
 
+		// `/do-always task <name|n>` is the escape hatch for a task whose name (or
+		// alias) collides with a subcommand keyword: the keywords below are matched
+		// against `cmdArg`, which is empty when a task was forced, while the task
+		// tail resolves `taskArg`. Double quotes keep a multi-word name in one
+		// piece, so a name ending in a mode word stays addressable.
+		const forced = /^task(?:\s|$)/i.test(arg);
+		const cmdArg = forced ? "" : arg;
+		const taskArg = forced ? splitArgs(arg.replace(/^task\s*/i, "")).join(" ") : arg;
+		if (forced && taskArg === "") {
+			ctx.ui.notify(
+				"do-always: /do-always task <name|number> — run a task by name, bypassing the subcommand keywords",
+				"info",
+			);
+			return;
+		}
+
 		if (!arg) {
 			if (ctx.mode === "tui") {
 				await showSelector(ctx, context, cache);
@@ -3539,7 +3572,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		if (arg.toLowerCase() === "list") {
+		if (cmdArg.toLowerCase() === "list") {
 			ctx.ui.notify(formatList(visible), "info");
 			return;
 		}
@@ -3547,7 +3580,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// Re-open the questionnaire for the last offered plan proposal (e.g.
 		// after an accidental esc). Re-offers the same captured reply, so the
 		// confirm/withdraw behavior is exactly as before.
-		if (arg.toLowerCase() === "replan") {
+		if (cmdArg.toLowerCase() === "replan") {
 			if (!lastProposal) {
 				ctx.ui.notify(`do-always: no plan proposal to re-open — run a Plan task (${markers.plan}) first`, "info");
 				return;
@@ -3557,7 +3590,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		}
 
 		// Toggle the questionnaire on/off for the rest of this session.
-		if (arg.toLowerCase() === "questionnaire") {
+		if (cmdArg.toLowerCase() === "questionnaire") {
 			questionnaireEnabled = !questionnaireEnabled;
 			ctx.ui.notify(
 				questionnaireEnabled
@@ -3573,8 +3606,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// (put the prompt in the editor). This is the command-line twin of the
 		// selector's ctrl+p; the config's `autoRun` / `questionnaire` fields
 		// are the permanent knobs, an override here lasts for the session.
-		if (arg.split(/\s+/)[0].toLowerCase() === "mode") {
-			const rest = arg.trim().split(/\s+/).slice(1);
+		if (cmdArg.split(/\s+/)[0].toLowerCase() === "mode") {
+			const rest = splitArgs(cmdArg.trim().slice("mode".length));
 			if (rest.length === 0) {
 				const head =
 					"do-always run modes — ctrl+p in the selector, or /do-always mode <task> [plan|run|fill|default]:";
@@ -3612,8 +3645,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// report file, the status widget and the one-chain-at-a-time rule all
 		// apply unchanged, and it works in non-TUI modes too (where the
 		// selector's ORDER column is not available at all).
-		if (arg.toLowerCase() === "chain" || arg.toLowerCase().startsWith("chain ")) {
-			const name = arg.trim().slice("chain".length).trim();
+		if (cmdArg.toLowerCase() === "chain" || cmdArg.toLowerCase().startsWith("chain ")) {
+			const name = cmdArg.trim().slice("chain".length).trim();
 			if (name === "") {
 				if (Object.keys(namedChains).length === 0) {
 					ctx.ui.notify('do-always: no saved chains — add a "chains" object to do-always.json', "info");
@@ -3672,8 +3705,8 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// check why the questionnaire was or wasn't offered after a real Plan
 		// run. Confirming never sends anything: the execution prompt is
 		// printed instead.
-		if (arg.toLowerCase().startsWith("testplan")) {
-			const [, sub = "ok"] = arg.toLowerCase().split(/\s+/);
+		if (cmdArg.toLowerCase().startsWith("testplan")) {
+			const [, sub = "ok"] = cmdArg.toLowerCase().split(/\s+/);
 			let text: string;
 			let label: string;
 			if (sub === "last") {
@@ -3719,7 +3752,7 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		if (arg.toLowerCase() === "list-details") {
+		if (cmdArg.toLowerCase() === "list-details") {
 			// Display only — the description is metadata; selecting a task injects just its prompt.
 			// Render with the current context so what is shown is what gets injected.
 			const strings = toPromptContext(context);
@@ -3743,10 +3776,10 @@ export default function doAlwaysExtension(pi: ExtensionAPI) {
 		// Numbers index the VISIBLE list (what the user sees in the selector and
 		// `list`); names resolve against the full set so picking a hidden task by
 		// name gets an explanatory message below instead of "unknown task".
-		const task = resolveTask(/^\d+$/.test(arg) ? visible : tasks, arg);
+		const task = resolveTask(/^\d+$/.test(taskArg) ? visible : tasks, taskArg);
 		if (!task) {
 			const available = visible.map((t, i) => `${i + 1}=${t.name}`).join(", ");
-			ctx.ui.notify(`do-always: unknown task "${arg}". Available: ${available}`, "error");
+			ctx.ui.notify(`do-always: unknown task "${taskArg}". Available: ${available}`, "error");
 			return;
 		}
 		// Respect the task's `when` condition: never inject a task hidden for the

@@ -1472,6 +1472,54 @@ export function findTaskByName(tasks: DoAlwaysTask[], name: string): DoAlwaysTas
 	return aliasMatch ?? tasks.find((t) => t.name.toLowerCase() === lower);
 }
 
+/**
+ * The `/do-always` subcommand keywords. They are matched before task names, so
+ * a task (or alias) spelled exactly like one is shadowed — reachable only
+ * through `/do-always task <name>`. `loadConfig` warns when that happens.
+ */
+export const SUBCOMMAND_KEYWORDS: readonly string[] = [
+	"list",
+	"list-details",
+	"replan",
+	"questionnaire",
+	"mode",
+	"chain",
+	"testplan",
+	"task",
+];
+
+/** The subcommand keyword a task name or alias collides with, if any. */
+export function shadowingSubcommand(name: string): string | undefined {
+	const lower = name.trim().toLowerCase();
+	return SUBCOMMAND_KEYWORDS.find((k) => k === lower);
+}
+
+/**
+ * Split a command's argument string on whitespace, honoring "double quotes" —
+ * the quotes are dropped, so `mode "Review run" fill` yields two tokens and a
+ * task name that ends in a mode word stays addressable. Empty input yields no
+ * tokens; a quote left open simply runs to the end of the string.
+ */
+export function splitArgs(text: string): string[] {
+	const out: string[] = [];
+	let current = "";
+	let inQuotes = false;
+	for (const ch of text) {
+		if (ch === '"') {
+			inQuotes = !inQuotes;
+			continue;
+		}
+		if (!inQuotes && /\s/.test(ch)) {
+			if (current !== "") out.push(current);
+			current = "";
+			continue;
+		}
+		current += ch;
+	}
+	if (current !== "") out.push(current);
+	return out;
+}
+
 /** Matches a `{{key}}` placeholder: key is [A-Za-z0-9_]+, optional inner whitespace. */
 const PLACEHOLDER_RE = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
 
